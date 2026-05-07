@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.log
+.DS_Store
+
+# pogo creates a search index inside any visited project — not source
+.pogo/
