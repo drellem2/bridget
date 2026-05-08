@@ -54,7 +54,7 @@ All config lives in `~/.pogo/bridget.env`. See
 | `POGO_BIN`           | no  | Absolute path to `pogo`. Default: resolved via `PATH`. |
 | `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. |
 | `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs. Required for `next`. |
-| `POGO_INBOX_REPO`    | no  | Repo where `idea:` and `next` file new ideas. Required for those commands. |
+| `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Required for those commands. |
 
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
@@ -70,6 +70,8 @@ launchd/systemd unit can inject overrides without editing the file.
 - `read mg-XXXX` — print the latest mail referencing this id.
 - `idea: <text>` — file a new idea. *(Requires `POGO_INBOX_REPO`.)*
 - `idea: [tag] <text>` — file with an extra scope tag (e.g. `[bridget]`).
+- `bug: <text>` — file a new bug (existing software is broken, not a new feature). *(Requires `POGO_INBOX_REPO`.)*
+- `bug: [tag] <text>` — file a bug with an extra scope tag (e.g. `[discord-bridge]`).
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).

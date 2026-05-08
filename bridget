@@ -223,6 +223,8 @@ async def watch_mailbox(user: discord.User):
                 "• `revise mg-XXXX <feedback>` — request changes (auto-unshelves if needed)\n"
                 "• `idea: <text>` — file a new idea\n"
                 "• `idea: [tag] <text>` — file with an extra scope tag (e.g. `[bridget]`)\n"
+                "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
+                "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
                 "• `status` — global pull view (unread mail + in-flight work)"
             )
         except discord.HTTPException as e:
@@ -569,6 +571,8 @@ def handle_command(text: str) -> str:
             "• `read mg-XXXX` — print the latest mail referencing this id\n"
             "• `idea: <text>` — file a new idea\n"
             "• `idea: [tag] <text>` — file with extra scope tag (e.g. `[bridget]`)\n"
+            "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
+            "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
             "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
             "• `dismiss all` — inbox-zero everything\n"
             "• `status` — global pull view (unread mail + in-flight work)\n"
@@ -606,6 +610,36 @@ def handle_command(text: str) -> str:
             args.append(f'--tag={t}')
         rc, out, err = run_mg(args)
         return f"✓ idea filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
+
+    if low.startswith('bug:'):
+        body = text[4:].strip()
+        if not body:
+            return "Usage: `bug: [optional-tag] <description>`"
+        if INBOX_REPO is None:
+            return (
+                "✗ `bug:` is unavailable: set `POGO_INBOX_REPO` in "
+                "`~/.pogo/bridget.env` to the repo where new bugs should be filed."
+            )
+        extra_tags = []
+        m = re.match(r'^\[([^\]]+)\]\s*(.*)$', body, re.DOTALL)
+        if m:
+            extra_tags.append(m.group(1).strip())
+            body = m.group(2).strip()
+        if not body:
+            return "Usage: `bug: [optional-tag] <description>`"
+        title = body.splitlines()[0][:60]
+        args = [
+            'new', '--type=bug',
+            f'--title={title}',
+            f'--body={body}',
+            '--assignee=architect',
+            '--tag=pogo-inbox',
+            f'--repo={INBOX_REPO}',
+        ]
+        for t in extra_tags:
+            args.append(f'--tag={t}')
+        rc, out, err = run_mg(args)
+        return f"✓ bug filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
 
     if low == 'quiet' or low.startswith('quiet '):
         rest = text.split()[1:]
