@@ -51,6 +51,7 @@ All config lives in `~/.pogo/bridget.env`. See
 | `DISCORD_USER_ID`    | yes | Your Discord user ID — bridget DMs and only listens to this user. |
 | `DISCORD_SERVER_ID`  | yes | Guild the bot is installed in. |
 | `MG_BIN`             | no  | Absolute path to `mg`. Default: resolved via `PATH`. |
+| `POGO_BIN`           | no  | Absolute path to `pogo`. Default: resolved via `PATH`. |
 | `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. |
 | `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs. Required for `next`. |
 | `POGO_INBOX_REPO`    | no  | Repo where `idea:` and `next` file new ideas. Required for those commands. |
@@ -72,6 +73,7 @@ launchd/systemd unit can inject overrides without editing the file.
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
+- `nudge <agent> [reason]` — wake a stalled agent.
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `help` (or `?`) — print this list inside Discord.
 
