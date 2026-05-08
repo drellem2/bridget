@@ -24,6 +24,7 @@ re-deliver the entire backlog.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from pathlib import Path
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
+QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 INSTALL_DOCS_URL = 'https://github.com/CloverRoss/bridget#readme'
 
 POLL_INTERVAL = 5  # seconds
@@ -166,6 +168,41 @@ def load_seen() -> set:
 
 def save_seen(seen: set) -> None:
     SEEN_FILE.write_text('\n'.join(sorted(seen)))
+
+
+QUIET_DEFAULTS = {'enabled': False, 'start': '23:00', 'end': '06:00'}
+TIME_RE = re.compile(r'^[0-2]\d:[0-5]\d$')
+
+
+def load_quiet() -> dict:
+    """Read ~/.pogo/quiet.json. Missing/unreadable file → defaults."""
+    if not QUIET_FILE.exists():
+        return {**QUIET_DEFAULTS, 'updated_at': ''}
+    try:
+        d = json.loads(QUIET_FILE.read_text())
+    except Exception as e:
+        print(f'load_quiet parse error: {e}', file=sys.stderr)
+        return {**QUIET_DEFAULTS, 'updated_at': ''}
+    return {
+        'enabled': bool(d.get('enabled', False)),
+        'start': d.get('start') or QUIET_DEFAULTS['start'],
+        'end': d.get('end') or QUIET_DEFAULTS['end'],
+        'updated_at': d.get('updated_at', ''),
+    }
+
+
+def save_quiet(state: dict) -> None:
+    """Atomically write ~/.pogo/quiet.json with all schema keys populated."""
+    QUIET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    out = {
+        'enabled': bool(state.get('enabled', False)),
+        'start': state.get('start') or QUIET_DEFAULTS['start'],
+        'end': state.get('end') or QUIET_DEFAULTS['end'],
+        'updated_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+    }
+    tmp = QUIET_FILE.parent / (QUIET_FILE.name + '.tmp')
+    tmp.write_text(json.dumps(out, indent=2) + '\n')
+    os.replace(tmp, QUIET_FILE)
 
 
 async def watch_mailbox(user: discord.User):
@@ -507,6 +544,7 @@ def handle_command(text: str) -> str:
             "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
             "• `dismiss all` — inbox-zero everything\n"
             "• `status` — global pull view (unread mail + in-flight work)\n"
+            "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
             "• `help` (or `?`) — this list"
         )
 
@@ -539,6 +577,33 @@ def handle_command(text: str) -> str:
             args.append(f'--tag={t}')
         rc, out, err = run_mg(args)
         return f"✓ idea filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
+
+    if low == 'quiet' or low.startswith('quiet '):
+        rest = text.split()[1:]
+        if not rest or (len(rest) == 1 and rest[0].lower() == 'status'):
+            state = load_quiet()
+            if state['enabled']:
+                return f"🌙 quiet hours: enabled, {state['start']}–{state['end']} (local)."
+            return f"quiet hours: disabled. (window {state['start']}–{state['end']})"
+        if len(rest) == 2 and TIME_RE.match(rest[0]) and TIME_RE.match(rest[1]):
+            return "Usage: `quiet <true|false> [HH:MM HH:MM]`"
+        flag = rest[0].lower()
+        if flag not in ('true', 'false'):
+            return "Usage: `quiet <true|false> [HH:MM HH:MM]`"
+        state = load_quiet()
+        times = rest[1:]
+        if times:
+            if len(times) != 2 or not TIME_RE.match(times[0]) or not TIME_RE.match(times[1]):
+                return "Usage: `quiet <true|false> [HH:MM HH:MM]` (times must match HH:MM)"
+            state['start'] = times[0]
+            state['end'] = times[1]
+        if flag == 'true':
+            state['enabled'] = True
+            save_quiet(state)
+            return f"✓ quiet hours: enabled, {state['start']}–{state['end']} (local)."
+        state['enabled'] = False
+        save_quiet(state)
+        return f"✓ quiet hours: disabled. (window {state['start']}–{state['end']} preserved for next enable)"
 
     if low == 'status' or low.startswith('status'):
         summary = get_status_summary()

@@ -72,10 +72,31 @@ launchd/systemd unit can inject overrides without editing the file.
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
+- `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `help` (or `?`) — print this list inside Discord.
 
 bridget only acts on DMs from the user whose ID is in `DISCORD_USER_ID`;
 messages from anyone else are ignored.
+
+## Quiet hours
+
+Quiet hours are a shared signal to crew agents (architect, mayor, etc.) that
+they should skip polling during a configured window — e.g. so background
+sweeps don't churn overnight. bridget owns the toggle; agents read the same
+state file and decide what to do with it.
+
+Toggle from Discord:
+
+- `quiet` (or `quiet status`) — show the current state.
+- `quiet true` — enable, using the previously-stored window (default
+  23:00–06:00).
+- `quiet false` — disable; the window is preserved for next enable.
+- `quiet true 23:00 06:00` — enable with an explicit window. Times must match
+  `HH:MM` (24-hour).
+
+State lives at `~/.pogo/quiet.json`. This file is **shared with crew agents**,
+not bridget-private — don't move or rename it. It's runtime state; not
+committed to the repo.
 
 ## Running as a service
 
