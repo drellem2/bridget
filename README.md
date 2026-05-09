@@ -67,8 +67,8 @@ All config lives in `~/.pogo/bridget.env`. See
 | `MG_BIN`             | no  | Absolute path to `mg`. Default: resolved via `PATH`. |
 | `POGO_BIN`           | no  | Absolute path to `pogo`. Default: resolved via `PATH`. |
 | `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. |
-| `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs. Required for `next`. |
-| `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Required for those commands. |
+| `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs (read by `next`). Default: `~/.pogo/designs`. |
+| `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Default: `~/.pogo/inbox`. |
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
 | `BRIDGET_REPO_DIR`   | no  | Override for the bridget git checkout. Default: self-detected from the script's location (works for the install.sh-managed symlink). |
 
@@ -214,9 +214,6 @@ Common failure modes:
 - **No mail notifications** — verify `~/.macguffin/mail/human/new/` exists
   (or whatever you set `POGO_MAIL_DIR` to). bridget skips mail-watching
   silently when the directory is missing.
-- **`next` / `idea:` / `bug:` say they're unavailable** — set
-  `POGO_DESIGNS_DIR` and/or `POGO_INBOX_REPO` in `~/.pogo/bridget.env`. The
-  error message names the missing key.
 - **`restart` says git pull failed** — the bridget checkout has uncommitted
   changes or a divergent branch. Resolve manually in the repo; bridget keeps
   running on the old code in the meantime.

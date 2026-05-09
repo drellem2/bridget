@@ -15,8 +15,10 @@ Required keys:
 Optional keys:
     MG_BIN           — full path to the mg binary (otherwise resolved on PATH)
     POGO_MAIL_DIR    — parent of new/ and cur/ (default: ~/.macguffin/mail/human)
-    POGO_DESIGNS_DIR — directory containing mg-XXXX.md design docs (no default)
-    POGO_INBOX_REPO  — repo to file new ideas into via mg new (no default)
+    POGO_DESIGNS_DIR — directory containing mg-XXXX.md design docs
+                       (default: ~/.pogo/designs)
+    POGO_INBOX_REPO  — repo to file new ideas into via mg new
+                       (default: ~/.pogo/inbox)
 
 Tracks already-delivered mails in ~/.pogo/bridget.seen so a restart doesn't
 re-deliver the entire backlog.
@@ -120,10 +122,12 @@ def load_config() -> dict:
         else HOME / '.macguffin' / 'mail' / 'human'
 
     designs_str = lookup('POGO_DESIGNS_DIR')
-    designs_dir = Path(designs_str).expanduser() if designs_str else None
+    designs_dir = Path(designs_str).expanduser() if designs_str \
+        else HOME / '.pogo' / 'designs'
 
     inbox_str = lookup('POGO_INBOX_REPO')
-    inbox_repo = str(Path(inbox_str).expanduser()) if inbox_str else None
+    inbox_repo = str(Path(inbox_str).expanduser()) if inbox_str \
+        else str(HOME / '.pogo' / 'inbox')
 
     mail_recipient = lookup('POGO_MAIL_RECIPIENT') or 'mayor'
 
@@ -764,17 +768,6 @@ def handle_command(text: str) -> str:
         parts = text.split(None, 1)
         if len(parts) < 2:
             return "Usage: `next mg-XXXX`"
-        if DESIGNS_DIR is None:
-            return (
-                "✗ `next` is unavailable: set `POGO_DESIGNS_DIR` in "
-                "`~/.pogo/bridget.env` to the directory containing your "
-                "`mg-XXXX.md` design docs."
-            )
-        if INBOX_REPO is None:
-            return (
-                "✗ `next` is unavailable: set `POGO_INBOX_REPO` in "
-                "`~/.pogo/bridget.env` to the repo where new ideas should be filed."
-            )
         parent_id = parts[1].strip()
         design_path = DESIGNS_DIR / f"{parent_id}.md"
         if not design_path.exists():
@@ -966,11 +959,6 @@ def handle_command(text: str) -> str:
         body = text[5:].strip()
         if not body:
             return "Usage: `idea: [optional-tag] <description>`"
-        if INBOX_REPO is None:
-            return (
-                "✗ `idea:` is unavailable: set `POGO_INBOX_REPO` in "
-                "`~/.pogo/bridget.env` to the repo where new ideas should be filed."
-            )
         extra_tags = []
         m = re.match(r'^\[([^\]]+)\]\s*(.*)$', body, re.DOTALL)
         if m:
@@ -996,11 +984,6 @@ def handle_command(text: str) -> str:
         body = text[4:].strip()
         if not body:
             return "Usage: `bug: [optional-tag] <description>`"
-        if INBOX_REPO is None:
-            return (
-                "✗ `bug:` is unavailable: set `POGO_INBOX_REPO` in "
-                "`~/.pogo/bridget.env` to the repo where new bugs should be filed."
-            )
         extra_tags = []
         m = re.match(r'^\[([^\]]+)\]\s*(.*)$', body, re.DOTALL)
         if m:
