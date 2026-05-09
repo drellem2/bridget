@@ -78,6 +78,7 @@ launchd/systemd unit can inject overrides without editing the file.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
 - `agents` — list crew agents and health.
+- `balance` — check whether any agent is hitting credit balance errors.
 - `nudge <agent> [reason]` — wake a stalled agent.
 - `restart` — git pull + restart bridget (after merging a PR; see [Remote restart](#remote-restart)).
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).

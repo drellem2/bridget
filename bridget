@@ -47,6 +47,11 @@ BRIDGET_REPO = Path(os.environ.get(
     str(Path(__file__).resolve().parent),
 ))
 
+CREDIT_BALANCE_RE = re.compile(
+    r'credit_balance_too_low|credit balance is too low|Your credit balance',
+    re.IGNORECASE,
+)
+
 POLL_INTERVAL = 5  # seconds
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
 STATUS_OUTPUT_BUDGET = 1700
@@ -361,6 +366,7 @@ async def watch_mailbox(user: discord.User):
                 "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
                 "• `status` — global pull view (unread mail + in-flight work)\n"
                 "• `agents` — list crew agents and health\n"
+                "• `balance` — check whether any agent is hitting credit balance errors\n"
                 "• `restart` — git pull + restart bridget (after merging a PR)"
             )
         except discord.HTTPException as e:
@@ -823,6 +829,43 @@ def handle_command(text: str) -> str:
             lines.append(f'  • {name:<12} — {status}, {health:<10} {cycle}')
         return '\n'.join(lines)
 
+    if low == 'balance':
+        rc, out, err = run_pogo(['agent', 'list', '--json'])
+        if rc != 0:
+            return f'✗ pogo agent list failed: {(err or out).strip()[:200]}'
+        try:
+            agents_list = json.loads(out)
+        except json.JSONDecodeError as e:
+            return f'✗ failed to parse agent list: {e}'
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        hits = []
+        for a in agents_list:
+            name = a.get('name', '?')
+            rc2, dout, _ = run_pogo(['agent', 'diagnose', name, '--json'])
+            if rc2 != 0:
+                continue
+            try:
+                diag = json.loads(dout)
+            except json.JSONDecodeError:
+                continue
+            tail = diag.get('recent_output_tail') or ''
+            if not CREDIT_BALANCE_RE.search(tail):
+                continue
+            last_activity = diag.get('last_activity') or ''
+            try:
+                ts = _parse_iso_utc(last_activity)
+                ago = humanize_ago((now_utc - ts).total_seconds())
+            except Exception:
+                ago = '?'
+            hits.append((name, ago))
+        if not hits:
+            return '✅ no credit balance errors detected in recent agent activity.'
+        lines = ['🚨 credit balance errors detected:']
+        for name, ago in hits:
+            lines.append(f'  • {name} — last seen {ago}')
+        lines.append('Refuel at console.anthropic.com.')
+        return '\n'.join(lines)
+
     if low.startswith('nudge '):
         parts = text.split(None, 2)
         if len(parts) < 2:
@@ -893,6 +936,7 @@ def handle_command(text: str) -> str:
             "• `dismiss all` — inbox-zero everything\n"
             "• `status` — global pull view (unread mail + in-flight work)\n"
             "• `agents` — list crew agents and health\n"
+            "• `balance` — check whether any agent is hitting credit balance errors\n"
             "• `nudge <agent> [reason]` — wake a stalled agent\n"
             "• `restart` — git pull + restart bridget (after merging a PR)\n"
             "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
