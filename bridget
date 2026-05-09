@@ -614,6 +614,18 @@ def get_status_summary() -> str:
     unread = sorted(MAIL_DIR.iterdir()) if MAIL_DIR.exists() else []
     parts.append(f"📬 Unread mail to human: **{len(unread)}**")
 
+    if unread:
+        for p in unread:
+            try:
+                mail = parse_mail(p.read_text())
+                haystack = (mail['subject'] + ' ' + mail['body']).lower()
+                ids = sorted(set(re.findall(r'mg-[0-9a-f]+', haystack)))
+                id_str = ', '.join(ids) if ids else '(no mg-id)'
+                subj = mail['subject'][:60]
+                parts.append(f'  • [{id_str}] {mail["from"]}: {subj}')
+            except Exception:
+                parts.append(f'  • (parse error: {p.name})')
+
     approvals = scan_pending_approvals()
     if approvals:
         parts.append("\n**Pending approvals:**")
