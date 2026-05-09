@@ -58,6 +58,29 @@ POLL_INTERVAL = 5  # seconds
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
 STATUS_OUTPUT_BUDGET = 1700
 
+COMMAND_LIST = (
+    "• `approve mg-XXXX` — approve a design (auto-clears related mails)\n"
+    "• `reject mg-XXXX <reason>` — shelve idea + clear mails\n"
+    "• `revise mg-XXXX <feedback>` — request changes (auto-unshelves; clears mails)\n"
+    "• `explain mg-XXXX <what>` — ask architect to elaborate without redesigning\n"
+    "• `next mg-XXXX` — file the next Roadmap task from this design as a new idea\n"
+    "• `read mg-XXXX` — print the latest mail referencing this id\n"
+    "• `idea: <text>` — file a new idea\n"
+    "• `idea: [tag] <text>` — file with extra scope tag (e.g. `[bridget]`)\n"
+    "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
+    "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
+    "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
+    "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
+    "• `dismiss all` — inbox-zero everything\n"
+    "• `status` — global pull view (unread mail + in-flight work)\n"
+    "• `agents` — list crew agents and health\n"
+    "• `balance` — check whether any agent is hitting credit balance errors\n"
+    "• `nudge <agent> [reason]` — wake a stalled agent\n"
+    "• `restart` — git pull + restart bridget (after merging a PR)\n"
+    "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
+    "• `help` (or `?`) — this list"
+)
+
 
 def die(msg: str, code: int = 1) -> None:
     print(f"bridget: {msg}", file=sys.stderr)
@@ -359,19 +382,7 @@ async def watch_mailbox(user: discord.User):
         try:
             await user.send(
                 "🔔 bridget online. I'll DM you when new mail arrives in "
-                "`human/new/`. Recognized replies:\n"
-                "• `approve mg-XXXX` — approve a design\n"
-                "• `reject mg-XXXX <reason>` — shelve it\n"
-                "• `revise mg-XXXX <feedback>` — request changes (auto-unshelves if needed)\n"
-                "• `idea: <text>` — file a new idea\n"
-                "• `idea: [tag] <text>` — file with an extra scope tag (e.g. `[bridget]`)\n"
-                "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
-                "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
-                "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
-                "• `status` — global pull view (unread mail + in-flight work)\n"
-                "• `agents` — list crew agents and health\n"
-                "• `balance` — check whether any agent is hitting credit balance errors\n"
-                "• `restart` — git pull + restart bridget (after merging a PR)"
+                "`human/new/`. Recognized replies:\n" + COMMAND_LIST
             )
         except discord.HTTPException as e:
             print(f"startup DM failed: {e}", file=sys.stderr)
@@ -931,29 +942,7 @@ def handle_command(text: str) -> str:
         return f'✗ mail failed: {(err or out).strip()[:200]}'
 
     if low in ('help', '?', 'commands'):
-        return (
-            "**Commands:**\n"
-            "• `approve mg-XXXX` — approve a design (auto-clears related mails)\n"
-            "• `reject mg-XXXX <reason>` — shelve idea + clear mails\n"
-            "• `revise mg-XXXX <feedback>` — request changes (auto-unshelves; clears mails)\n"
-            "• `explain mg-XXXX <what>` — ask architect to elaborate without redesigning\n"
-            "• `next mg-XXXX` — file the next Roadmap task from this design as a new idea\n"
-            "• `read mg-XXXX` — print the latest mail referencing this id\n"
-            "• `idea: <text>` — file a new idea\n"
-            "• `idea: [tag] <text>` — file with extra scope tag (e.g. `[bridget]`)\n"
-            "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
-            "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
-            "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
-            "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
-            "• `dismiss all` — inbox-zero everything\n"
-            "• `status` — global pull view (unread mail + in-flight work)\n"
-            "• `agents` — list crew agents and health\n"
-            "• `balance` — check whether any agent is hitting credit balance errors\n"
-            "• `nudge <agent> [reason]` — wake a stalled agent\n"
-            "• `restart` — git pull + restart bridget (after merging a PR)\n"
-            "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
-            "• `help` (or `?`) — this list"
-        )
+        return "**Commands:**\n" + COMMAND_LIST
 
     if low.startswith('idea:'):
         body = text[5:].strip()
