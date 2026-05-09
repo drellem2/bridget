@@ -25,20 +25,34 @@ nohup, or whatever supervisor you like.
   In Discord, enable Developer Mode (Settings → Advanced → Developer Mode),
   then right-click your name / the server icon → "Copy ID".
 
-## Install
+## Quick start
 
-```bash
-git clone https://github.com/CloverRoss/bridget.git
-cd bridget
-./install.sh
-$EDITOR ~/.pogo/bridget.env   # fill in DISCORD_BOT_TOKEN, DISCORD_USER_ID, DISCORD_SERVER_ID
-~/.pogo/bin/bridget
-```
-
-`install.sh` is idempotent — it creates `~/.pogo/venv-bridget/`, installs
-`discord.py`, symlinks `~/.pogo/bin/bridget` to the script in your clone, and
-seeds `~/.pogo/bridget.env` from `bridget.env.example` (if no env file exists
-yet). Re-running it after a `git pull` is the supported upgrade path.
+1. Clone and run the installer:
+   ```bash
+   git clone https://github.com/CloverRoss/bridget.git
+   cd bridget
+   ./install.sh
+   ```
+   `install.sh` is idempotent — it creates `~/.pogo/venv-bridget/`, installs
+   `discord.py`, symlinks `~/.pogo/bin/bridget` to the script in your clone,
+   and seeds `~/.pogo/bridget.env` from `bridget.env.example` (if no env file
+   exists yet). Re-running it after a `git pull` is the supported upgrade path.
+2. Edit your config:
+   ```bash
+   $EDITOR ~/.pogo/bridget.env
+   ```
+   At minimum, fill in `DISCORD_BOT_TOKEN`, `DISCORD_USER_ID`, and
+   `DISCORD_SERVER_ID`. See [Configuration](#configuration) for optional keys.
+3. Smoke-test in the foreground:
+   ```bash
+   ~/.pogo/bin/bridget
+   ```
+   You should see `logged in as <bot> (id=…)` and a startup DM in Discord.
+   Stop with Ctrl-C once that works.
+4. Run under a supervisor for the long term — launchd on macOS, systemd on
+   Linux, or `nohup` for quick-and-dirty. See
+   [Running as a service](#running-as-a-service) for templates.
+5. If something goes wrong, see [Troubleshooting](#troubleshooting).
 
 ## Configuration
 
@@ -56,6 +70,7 @@ All config lives in `~/.pogo/bridget.env`. See
 | `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs. Required for `next`. |
 | `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Required for those commands. |
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
+| `BRIDGET_REPO_DIR`   | no  | Override for the bridget git checkout. Default: self-detected from the script's location (works for the install.sh-managed symlink). |
 
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
@@ -171,11 +186,47 @@ you'd supervise any other foreground service. A few options:
 Bundled launchd / systemd templates and an `install.sh --service=...` flag are
 on the roadmap; for now, write the unit yourself. PRs welcome.
 
+## Troubleshooting
+
+When bridget is running under a supervisor, stderr is the first place to look.
+With the launchd / systemd templates in [Running as a service](#running-as-a-service),
+that's whatever path you set for `StandardErrorPath` (launchd) or whatever
+`journalctl --user -u bridget` returns (systemd). Foreground runs print
+straight to your terminal.
+
+Common failure modes:
+
+- **`could not find the mg binary on PATH`** — pogo isn't installed, or its
+  `bin/` isn't on the PATH that bridget sees (this is common under launchd,
+  which runs with a minimal PATH). Set `MG_BIN` (and optionally `POGO_BIN`)
+  in `~/.pogo/bridget.env` to absolute paths.
+- **`config file not found: ~/.pogo/bridget.env`** — re-run `./install.sh`
+  from the repo, or copy `bridget.env.example` to `~/.pogo/bridget.env`
+  manually.
+- **`missing required key(s) in ~/.pogo/bridget.env`** — fill in the three
+  `DISCORD_*` values; they're all required.
+- **`DISCORD_USER_ID and DISCORD_SERVER_ID must be integers`** — these are
+  Discord *snowflake IDs*, not usernames. Enable Developer Mode in Discord,
+  right-click the user / server, and "Copy ID".
+- **Bot logs in but never DMs you** — most likely the "Message Content"
+  privileged intent isn't enabled on the bot in the Discord developer portal,
+  or the bot isn't a member of the server in `DISCORD_SERVER_ID`.
+- **No mail notifications** — verify `~/.macguffin/mail/human/new/` exists
+  (or whatever you set `POGO_MAIL_DIR` to). bridget skips mail-watching
+  silently when the directory is missing.
+- **`next` / `idea:` / `bug:` say they're unavailable** — set
+  `POGO_DESIGNS_DIR` and/or `POGO_INBOX_REPO` in `~/.pogo/bridget.env`. The
+  error message names the missing key.
+- **`restart` says git pull failed** — the bridget checkout has uncommitted
+  changes or a divergent branch. Resolve manually in the repo; bridget keeps
+  running on the old code in the meantime.
+
 ## Project status
 
-**v0.1 — works for the original author; PRs welcome.** Expect rough edges if
-your pogo install diverges from the canonical macOS layout. Issues and patches
-that improve portability or add platform support are particularly welcome.
+**v1.0 — feature parity with the original author's personal install.** Should
+work on any macOS or Linux machine with Python 3.10+, pogo installed, and a
+Discord bot. Issues and patches that improve portability or add platform
+support are welcome.
 
 ## License
 
