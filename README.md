@@ -77,6 +77,7 @@ launchd/systemd unit can inject overrides without editing the file.
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
+- `agents` — list crew agents and health.
 - `nudge <agent> [reason]` — wake a stalled agent.
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `help` (or `?`) — print this list inside Discord.
