@@ -738,6 +738,13 @@ def handle_command(text: str) -> str:
             f"{mail['body']}"
             f"{rest_note}"
         )
+        if dir_name == 'new':
+            cur_dir = MAIL_DIR.parent / 'cur'
+            cur_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                p.rename(cur_dir / p.name)
+            except Exception as e:
+                print(f'auto-mark-read failed for {p.name}: {e}', file=sys.stderr)
         return out
 
     if low.startswith('dismiss '):
