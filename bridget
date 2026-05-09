@@ -36,9 +36,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover — fallback for 3.10
+    tomllib = None
+
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
+CHANNELS_FILE = HOME / '.pogo' / 'bridget.channels.toml'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
@@ -57,6 +63,8 @@ CREDIT_BALANCE_RE = re.compile(
 
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
 STATUS_OUTPUT_BUDGET = 1700
+
+UNRECOGNIZED_REPLY = "Unrecognized. Send `help` for the full command list."
 
 COMMAND_LIST = (
     "• `approve mg-XXXX` — approve a design (auto-clears related mails)\n"
@@ -208,6 +216,119 @@ def load_config() -> dict:
     }
 
 
+VALID_DIRECTIONS = frozenset({'inbound', 'outbound', 'both'})
+VALID_KINDS = frozenset({'mail', 'task-transitions', 'idea-claims'})
+
+
+def load_channels(path: Path = CHANNELS_FILE) -> tuple[dict, dict, dict]:
+    """Read ~/.pogo/bridget.channels.toml. Returns (by_name, by_snowflake,
+    outbound_by_agent) where:
+
+    - by_name        {channel_name: entry}             — every well-formed entry
+    - by_snowflake   {snowflake_int: entry}            — only direction in {inbound, both}
+    - outbound_by_agent {agent_name: [entry, ...]}     — only direction in {outbound, both}
+
+    Each entry is a dict {name, snowflake, agent, direction, kinds}. `kinds` is a
+    frozenset over VALID_KINDS controlling which outbound classes fan out to that
+    channel; defaults to all kinds.
+
+    Missing file → three empty dicts (P1 mode). Malformed entries are logged and
+    skipped; we never raise so a single typo can't take bridget down."""
+    if not path.exists():
+        return {}, {}, {}
+    if tomllib is None:
+        print(
+            f'bridget.channels.toml present but tomllib unavailable '
+            f'(needs Python 3.11+); per-channel routing disabled.',
+            file=sys.stderr,
+        )
+        return {}, {}, {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        print(f'bridget.channels.toml parse error: {e}', file=sys.stderr)
+        return {}, {}, {}
+
+    raw = data.get('channels')
+    if raw is None:
+        return {}, {}, {}
+    if not isinstance(raw, dict):
+        print('bridget.channels.toml: [channels] must be a table', file=sys.stderr)
+        return {}, {}, {}
+
+    by_name: dict = {}
+    by_snowflake: dict = {}
+    outbound_by_agent: dict = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            print(
+                f'bridget.channels.toml: skipping [channels.{name}]: not a table',
+                file=sys.stderr,
+            )
+            continue
+        try:
+            snowflake_raw = entry.get('snowflake')
+            if snowflake_raw is None:
+                raise ValueError('missing snowflake')
+            snowflake = int(str(snowflake_raw).strip())
+            agent = str(entry.get('agent', '')).strip()
+            if not agent:
+                raise ValueError('missing or empty agent')
+            direction = str(entry.get('direction', 'both')).strip().lower()
+            if direction not in VALID_DIRECTIONS:
+                raise ValueError(
+                    f'invalid direction {direction!r} (expected one of '
+                    f'{sorted(VALID_DIRECTIONS)})'
+                )
+            kinds_raw = entry.get('kinds')
+            if kinds_raw is None:
+                kinds = frozenset(VALID_KINDS)
+            elif not isinstance(kinds_raw, list):
+                raise ValueError('kinds must be a list of strings')
+            else:
+                kinds_set = {str(k).strip().lower() for k in kinds_raw}
+                bad = kinds_set - VALID_KINDS
+                if bad:
+                    raise ValueError(
+                        f'invalid kinds {sorted(bad)} (expected subset of '
+                        f'{sorted(VALID_KINDS)})'
+                    )
+                kinds = frozenset(kinds_set)
+        except (ValueError, TypeError) as e:
+            print(
+                f'bridget.channels.toml: skipping [channels.{name}]: {e}',
+                file=sys.stderr,
+            )
+            continue
+
+        ch = {
+            'name': name,
+            'snowflake': snowflake,
+            'agent': agent,
+            'direction': direction,
+            'kinds': kinds,
+        }
+        by_name[name] = ch
+        if direction in ('inbound', 'both'):
+            existing = by_snowflake.get(snowflake)
+            if existing is not None:
+                # Two inbound entries pointing at the same Discord channel would
+                # silently collide on routing; reject the later one and keep the
+                # first so config order determines precedence.
+                print(
+                    f'bridget.channels.toml: duplicate inbound snowflake '
+                    f'{snowflake} on [channels.{name}] (already used by '
+                    f'[channels.{existing["name"]}]); dropping',
+                    file=sys.stderr,
+                )
+            else:
+                by_snowflake[snowflake] = ch
+        if direction in ('outbound', 'both'):
+            outbound_by_agent.setdefault(agent, []).append(ch)
+
+    return by_name, by_snowflake, outbound_by_agent
+
+
 CONFIG = load_config()
 TOKEN = CONFIG['token']
 USER_ID = CONFIG['user_id']
@@ -224,12 +345,27 @@ APPROVAL_RE = CONFIG['approval_re']
 RESTART_CMD = CONFIG['restart_cmd']
 CREW_PATTERN = CONFIG['crew_pattern']
 
+# Per-channel routing config. Empty dicts when ~/.pogo/bridget.channels.toml is
+# missing — bridget then falls back to v1.0.0 DM-only behavior.
+CHANNELS, CHANNELS_BY_SNOWFLAKE, OUTBOUND_BY_AGENT = load_channels()
+
+# Mail root for per-agent watchers. MAIL_DIR is "<root>/<recipient>/new"; the
+# parent of the recipient dir is the multi-agent mail root.
+MAIL_ROOT = MAIL_DIR.parent.parent
+
 
 import discord  # noqa: E402  (deferred so config errors don't require the venv)
 
+# Intents.default() already enables `guilds` and `guild_messages` (both are
+# non-privileged). We turn them on explicitly here so it's obvious what bridget
+# expects from a Discord bot setup. The bot must additionally be a member of the
+# guild containing each [channels.X] entry and have read/send permission on
+# those channels — see the README's "Per-channel routing" section.
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
+intents.guilds = True
+intents.guild_messages = True
 
 client = discord.Client(intents=intents)
 
@@ -505,6 +641,114 @@ async def watch_mailbox(user: discord.User):
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def agent_mail_dir(agent: str) -> Path:
+    """Return ~/.macguffin/mail/<agent>/new/ derived from MAIL_ROOT so
+    POGO_MAIL_DIR overrides keep their parent layout."""
+    return MAIL_ROOT / agent / 'new'
+
+
+def agent_seen_file(agent: str) -> Path:
+    """Per-agent seen-state file. Separate from `bridget.seen` so the human
+    DM watcher and the channel watchers don't fight over each other's state."""
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', agent)
+    return HOME / '.pogo' / f'bridget.seen.{safe}'
+
+
+def load_agent_seen(agent: str) -> set:
+    p = agent_seen_file(agent)
+    if p.exists():
+        return set(p.read_text().splitlines())
+    return set()
+
+
+def save_agent_seen(agent: str, seen: set) -> None:
+    p = agent_seen_file(agent)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('\n'.join(sorted(seen)))
+
+
+def format_agent_mail_msg(mail: dict) -> str:
+    body_preview = mail['body']
+    if len(body_preview) > 1200:
+        body_preview = body_preview[:1200] + '\n…[truncated]'
+    msg = (
+        f"📬 **{mail['from']}** — {mail['subject']}\n"
+        f"```\n{body_preview}\n```"
+    )
+    if len(msg) > DISCORD_MSG_LIMIT:
+        msg = msg[:DISCORD_MSG_LIMIT] + '…'
+    return msg
+
+
+async def watch_agent_mailbox(channel_entry: dict):
+    """Outbound fan-out for an agent's mailbox into a Discord channel.
+
+    Polls ~/.macguffin/mail/<agent>/new/ for new mails and posts each one to
+    the mapped Discord text channel. Independent seen-state per agent so this
+    doesn't intersect the human-DM watcher's `bridget.seen` file.
+
+    Skipped silently if `kinds` doesn't include 'mail' for this entry."""
+    if 'mail' not in channel_entry['kinds']:
+        return
+    agent = channel_entry['agent']
+    snowflake = channel_entry['snowflake']
+    mail_dir = agent_mail_dir(agent)
+    seen_file = agent_seen_file(agent)
+
+    seen = load_agent_seen(agent)
+    # Prime on first run so we don't flood the channel with backlog.
+    if not seen_file.exists() and mail_dir.exists():
+        for p in mail_dir.iterdir():
+            seen.add(p.name)
+        save_agent_seen(agent, seen)
+
+    while not client.is_closed():
+        try:
+            channel = client.get_channel(snowflake)
+            if channel is None:
+                # The bot may not have joined the guild yet, or the channel
+                # snowflake is wrong. Don't churn — just wait and retry.
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            if not mail_dir.exists():
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            current = {p.name for p in mail_dir.iterdir()}
+            quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
+            for fname in sorted(current - seen):
+                fpath = mail_dir / fname
+                try:
+                    mail = parse_mail(fpath.read_text())
+                except Exception as e:
+                    print(f"agent-mail parse error {agent}/{fname}: {e}",
+                          file=sys.stderr)
+                    seen.add(fname)
+                    continue
+                if quiet_outbound:
+                    seen.add(fname)
+                    continue
+                try:
+                    await channel.send(format_agent_mail_msg(mail))
+                    seen.add(fname)
+                except discord.HTTPException as e:
+                    print(f"agent-mail send failed for {agent}/{fname}: {e}",
+                          file=sys.stderr)
+            save_agent_seen(agent, seen)
+        except Exception as e:
+            print(f"watch_agent_mailbox({agent}) loop error: {e}",
+                  file=sys.stderr)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+def outbound_targets(agent: str, kind: str) -> list[dict]:
+    """Channel entries that should receive `kind` events for `agent`. Empty
+    list means no channel mapping — caller should fall back to user DM."""
+    return [
+        ch for ch in OUTBOUND_BY_AGENT.get(agent, [])
+        if kind in ch['kinds']
+    ]
+
+
 async def watch_idea_claims(user: discord.User):
     claimed, file_existed = load_idea_claims()
     primed = file_existed
@@ -518,6 +762,7 @@ async def watch_idea_claims(user: discord.User):
 
             fresh = set()
             titles = {}
+            assignees = {}
             for line in out.splitlines():
                 line = line.strip()
                 if not line:
@@ -533,6 +778,7 @@ async def watch_idea_claims(user: discord.User):
                     continue
                 fresh.add(iid)
                 titles[iid] = (item.get('title') or '?')[:80]
+                assignees[iid] = (item.get('assignee') or '').strip()
 
             new_ids = fresh - claimed
             claimed = fresh
@@ -544,11 +790,28 @@ async def watch_idea_claims(user: discord.User):
                 for iid in sorted(new_ids):
                     if quiet_outbound:
                         continue
-                    msg = f'🧠 architect claimed {iid}: {titles.get(iid, "?")}'
-                    try:
-                        await user.send(msg)
-                    except discord.HTTPException as e:
-                        print(f'idea-claim send failed: {e}', file=sys.stderr)
+                    assignee = assignees.get(iid, '') or 'architect'
+                    targets = outbound_targets(assignee, 'idea-claims')
+                    # Preserve v1.0.0 message format for the DM-fallback path
+                    # (no channel mapping for assignee). Channel-routed messages
+                    # use the actual assignee name so a non-architect claim
+                    # routed to a channel isn't mislabeled.
+                    if targets:
+                        ch_msg = f'🧠 {assignee} claimed {iid}: {titles.get(iid, "?")}'
+                        for ch in targets:
+                            chan = client.get_channel(ch['snowflake'])
+                            if chan is None:
+                                continue
+                            try:
+                                await chan.send(ch_msg)
+                            except discord.HTTPException as e:
+                                print(f'idea-claim channel send failed: {e}', file=sys.stderr)
+                    else:
+                        msg = f'🧠 architect claimed {iid}: {titles.get(iid, "?")}'
+                        try:
+                            await user.send(msg)
+                        except discord.HTTPException as e:
+                            print(f'idea-claim send failed: {e}', file=sys.stderr)
 
             save_idea_claims(claimed)
         except Exception as e:
@@ -568,7 +831,7 @@ async def watch_task_transitions(user: discord.User):
                 continue
 
             seen_ids = set()
-            transitions = []
+            transitions: list[tuple[str, str]] = []  # (msg, assignee)
             for line in out.splitlines():
                 line = line.strip()
                 if not line:
@@ -588,7 +851,8 @@ async def watch_task_transitions(user: discord.User):
                 if primed and prev != status and status in _TRANSITION_FORMATS:
                     msg = format_transition(task, status)
                     if msg:
-                        transitions.append(msg)
+                        assignee = (task.get('assignee') or '').strip()
+                        transitions.append((msg, assignee))
                 states[tid] = status
 
             for stale in set(states.keys()) - seen_ids:
@@ -598,13 +862,25 @@ async def watch_task_transitions(user: discord.User):
                 primed = True
             else:
                 quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
-                for msg in transitions:
+                for msg, assignee in transitions:
                     if quiet_outbound:
                         continue
-                    try:
-                        await user.send(msg)
-                    except discord.HTTPException as e:
-                        print(f'task-transition send failed: {e}', file=sys.stderr)
+                    targets = outbound_targets(assignee, 'task-transitions') if assignee else []
+                    if targets:
+                        for ch in targets:
+                            chan = client.get_channel(ch['snowflake'])
+                            if chan is None:
+                                continue
+                            try:
+                                await chan.send(msg)
+                            except discord.HTTPException as e:
+                                print(f'task-transition channel send failed: {e}',
+                                      file=sys.stderr)
+                    else:
+                        try:
+                            await user.send(msg)
+                        except discord.HTTPException as e:
+                            print(f'task-transition send failed: {e}', file=sys.stderr)
 
             save_task_states(states)
         except Exception as e:
@@ -1123,9 +1399,44 @@ def handle_command(text: str) -> str:
             print(f'mayor nudge failed: {e}', file=sys.stderr)
         return summary
 
-    return (
-        "Unrecognized. Send `help` for the full command list."
-    )
+    return UNRECOGNIZED_REPLY
+
+
+def send_channel_chat_mail(text: str, agent: str) -> str:
+    """Plain-text message in a mapped guild channel becomes a mail to that
+    channel's agent. Splits on the first newline to mimic the `mail` verb's
+    subject/body convention so the recipient sees a proper subject line."""
+    text = text.strip()
+    if not text:
+        return ''
+    if '\n' in text:
+        subject, body = text.split('\n', 1)
+        subject = subject.strip()
+        body = body.rstrip()
+    else:
+        subject = text
+        body = '(no body)'
+    rc, out, err = run_mg([
+        'mail', 'send', agent,
+        '--from=human',
+        f'--subject={subject[:200]}',
+        f'--body={body}',
+    ])
+    if rc == 0:
+        return f'✓ mailed `{agent}`: "{subject[:60]}"'
+    return f'✗ mail failed: {(err or out).strip()[:200]}'
+
+
+def handle_channel_message(text: str, channel_entry: dict) -> str:
+    """Route an inbound guild-channel message. Workflow verbs (approve/reject/
+    revise/idea:/etc.) keep routing through `POGO_WORKFLOW_AGENT` exactly like
+    they do in DMs — design coordination shouldn't change identity based on
+    where the human typed. Anything else (free-form chat) becomes a mail to the
+    channel's mapped agent."""
+    reply = handle_command(text)
+    if reply == UNRECOGNIZED_REPLY:
+        return send_channel_chat_mail(text, channel_entry['agent'])
+    return reply
 
 
 @client.event
@@ -1141,6 +1452,23 @@ async def on_ready():
     client.loop.create_task(watch_task_transitions(user))
     client.loop.create_task(watch_idea_claims(user))
 
+    # Per-channel mailbox fan-out: one watcher per outbound channel mapping
+    # whose `kinds` includes 'mail'. Each watcher uses ~/.pogo/bridget.seen.<agent>
+    # for its own in-memory seen-state copy; if two channels map the same
+    # agent's mail, they each deliver one copy and overwrite the same seen
+    # file with the same contents — both channels still receive every mail.
+    started_agents: set[str] = set()
+    for entry in CHANNELS.values():
+        if entry['direction'] not in ('outbound', 'both'):
+            continue
+        if 'mail' not in entry['kinds']:
+            continue
+        client.loop.create_task(watch_agent_mailbox(entry))
+        started_agents.add(entry['agent'])
+    if started_agents:
+        print(f"spawned per-channel mailbox watchers for: "
+              f"{', '.join(sorted(started_agents))}", flush=True)
+
 
 @client.event
 async def on_message(message: discord.Message):
@@ -1148,9 +1476,20 @@ async def on_message(message: discord.Message):
         return
     if message.author.id != USER_ID:
         return
-    if not isinstance(message.channel, discord.DMChannel):
+
+    if isinstance(message.channel, discord.DMChannel):
+        reply = handle_command(message.content)
+    else:
+        # Guild text channel: only respond if it's mapped for inbound routing.
+        # Unmapped channels are ignored silently — bridget shouldn't chat in
+        # arbitrary guild channels just because the bot is in the server.
+        channel_entry = CHANNELS_BY_SNOWFLAKE.get(message.channel.id)
+        if channel_entry is None:
+            return
+        reply = handle_channel_message(message.content, channel_entry)
+
+    if not reply:
         return
-    reply = handle_command(message.content)
     if len(reply) > DISCORD_MSG_LIMIT:
         reply = reply[:DISCORD_MSG_LIMIT] + '…'
     try:

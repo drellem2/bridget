@@ -178,6 +178,67 @@ current status without DMing, so you don't get a flood of notifications for
 work that's already in flight. Only ideas/bugs/etc. with `type=task` trigger
 notifications; other types are filtered out.
 
+## Per-channel agent routing (optional)
+
+By default, bridget is DM-only: every command and every notification flows
+through DMs with the user named in `DISCORD_USER_ID`. If you want one Discord
+*channel* per agent — `#mayor` for mayor, `#architect` for architect, etc., the
+"open-claw" shape — add `~/.pogo/bridget.channels.toml` and bridget will route
+inbound messages and outbound notifications per channel. Without that file,
+bridget behaves bit-identically to v1.0.0.
+
+A starter config looks like:
+
+```toml
+# ~/.pogo/bridget.channels.toml
+[channels.mayor]
+snowflake = "1234567890123456789"   # right-click the channel → Copy ID
+agent     = "mayor"
+direction = "both"                   # "both" | "inbound" | "outbound"
+
+[channels.architect]
+snowflake = "9876543210987654321"
+agent     = "architect"
+direction = "both"
+
+[channels.pm-pogo-digest]
+snowflake = "5555555555555555555"
+agent     = "pm-pogo"
+direction = "outbound"
+kinds     = ["mail", "task-transitions"]   # default: all kinds
+```
+
+Schema:
+
+| Field | Required | Purpose |
+|---|---|---|
+| `snowflake` | yes | Discord channel ID (string of digits — Developer Mode → right-click → Copy ID). |
+| `agent` | yes | Pogo agent name. Inbound non-verb messages are mailed to this agent; outbound events for this agent fan out to the channel. |
+| `direction` | no (default `both`) | `inbound`, `outbound`, or `both`. |
+| `kinds` | no (default all) | Subset of `["mail", "task-transitions", "idea-claims"]`. Controls which outbound classes fan out to this channel. |
+
+Routing rules:
+
+- **Inbound (channel → agent).** Workflow verbs (`approve`/`reject`/`revise`/
+  `explain`/`next`/`idea:`/`bug:`) keep routing through `POGO_WORKFLOW_AGENT`
+  exactly as they do in DMs — design coordination doesn't change identity based
+  on which channel you typed in. Free-form text in a mapped channel becomes
+  `mg mail send <channel-agent>` with the first line as subject.
+- **Outbound (agent → channel).** When a watcher would normally DM the user
+  about an event involving an agent that has an outbound mapping, bridget posts
+  to the mapped channel *instead of* DM'ing — so channels declutter your DMs
+  rather than duplicate them. Events whose agent has no mapping continue to DM
+  as today.
+- **Bot setup.** The bot must be a member of the guild containing each mapped
+  channel and have permission to read history and send messages there. The
+  required Discord intents (`guilds`, `guild_messages`) are non-privileged and
+  bridget enables them automatically. The author check still pins to
+  `DISCORD_USER_ID` — only that user's messages are processed in mapped
+  channels.
+
+A more detailed operator guide (with channel-snowflake-finding tips and a
+copy-paste example file) is on the roadmap.
+
 ## Idea claim notifications
 
 bridget pushes a Discord DM when the architect claims an idea:
