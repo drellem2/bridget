@@ -37,6 +37,7 @@ HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
+TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
 INSTALL_DOCS_URL = 'https://github.com/CloverRoss/bridget#readme'
@@ -213,6 +214,50 @@ def save_quiet(state: dict) -> None:
     os.replace(tmp, QUIET_FILE)
 
 
+def load_task_states() -> tuple[dict, bool]:
+    """Read the task-state cache. Returns (states, file_existed). Missing or
+    malformed → empty dict + False so callers can prime silently."""
+    if not TASK_STATES_FILE.exists():
+        return {}, False
+    try:
+        d = json.loads(TASK_STATES_FILE.read_text())
+        if not isinstance(d, dict):
+            raise ValueError('not a dict')
+        return {k: str(v) for k, v in d.items()}, True
+    except Exception as e:
+        print(f'load_task_states parse error: {e}', file=sys.stderr)
+        return {}, True
+
+
+def save_task_states(states: dict) -> None:
+    """Atomically write the task-state cache."""
+    TASK_STATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TASK_STATES_FILE.parent / (TASK_STATES_FILE.name + '.tmp')
+    tmp.write_text(json.dumps(states, indent=2, sort_keys=True) + '\n')
+    os.replace(tmp, TASK_STATES_FILE)
+
+
+_TRANSITION_FORMATS = {
+    'claimed': '🚀 claimed {id}{by}: {title}',
+    'done': '✅ done {id}: {title}',
+    'shelved': '📦 shelved {id}: {title}',
+}
+_NON_POLECAT_ASSIGNEES = {'architect', 'mayor', 'human', ''}
+
+
+def format_transition(task: dict, new_status: str):
+    fmt = _TRANSITION_FORMATS.get(new_status)
+    if fmt is None:
+        return None
+    title = (task.get('title') or '?')[:80]
+    by = ''
+    if new_status == 'claimed':
+        assignee = (task.get('assignee') or '').strip()
+        if assignee and assignee.lower() not in _NON_POLECAT_ASSIGNEES:
+            by = f' by {assignee}'
+    return fmt.format(id=task.get('id', '?'), by=by, title=title)
+
+
 def humanize_ago(seconds: float) -> str:
     """Compact 'time ago' formatter."""
     s = int(seconds)
@@ -316,6 +361,59 @@ async def watch_mailbox(user: discord.User):
                 save_seen(seen)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def watch_task_transitions(user: discord.User):
+    states, file_existed = load_task_states()
+    primed = file_existed  # if cache file existed, treat first tick as a normal diff
+    while not client.is_closed():
+        try:
+            rc, out, err = run_mg(['list', '--json', '--all'])
+            if rc != 0:
+                print(f'watch_task_transitions mg list failed: {err.strip()[:200]}', file=sys.stderr)
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            seen_ids = set()
+            transitions = []
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    task = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if task.get('type') != 'task':
+                    continue
+                tid = task.get('id')
+                status = task.get('status')
+                if not tid or not status:
+                    continue
+                seen_ids.add(tid)
+                prev = states.get(tid)
+                if primed and prev != status and status in _TRANSITION_FORMATS:
+                    msg = format_transition(task, status)
+                    if msg:
+                        transitions.append(msg)
+                states[tid] = status
+
+            for stale in set(states.keys()) - seen_ids:
+                del states[stale]
+
+            if not primed:
+                primed = True
+            else:
+                for msg in transitions:
+                    try:
+                        await user.send(msg)
+                    except discord.HTTPException as e:
+                        print(f'task-transition send failed: {e}', file=sys.stderr)
+
+            save_task_states(states)
+        except Exception as e:
+            print(f'watch_task_transitions loop error: {e}', file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -795,6 +893,7 @@ async def on_ready():
         await client.close()
         return
     client.loop.create_task(watch_mailbox(user))
+    client.loop.create_task(watch_task_transitions(user))
 
 
 @client.event

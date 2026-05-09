@@ -105,6 +105,21 @@ State lives at `~/.pogo/quiet.json`. This file is **shared with crew agents**,
 not bridget-private — don't move or rename it. It's runtime state; not
 committed to the repo.
 
+## Task transition notifications
+
+bridget pushes a Discord DM when a polecat task transitions to one of the
+notable statuses:
+
+- `🚀 claimed mg-XXXX [by <assignee>]: <title>`
+- `✅ done mg-XXXX: <title>`
+- `📦 shelved mg-XXXX: <title>`
+
+State lives at `~/.pogo/bridget.task-states.json` (runtime; not committed).
+The first run after deleting the cache silently re-primes — bridget records
+current status without DMing, so you don't get a flood of notifications for
+work that's already in flight. Only ideas/bugs/etc. with `type=task` trigger
+notifications; other types are filtered out.
+
 ## Running as a service
 
 For v0.1, bridget is just a long-running Python process — supervise it however
