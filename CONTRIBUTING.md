@@ -25,3 +25,12 @@ configured. Before opening a PR, run `./test.sh` from the repo root; it's a
 `py_compile` smoke check that catches import-time syntax errors. There's no
 real test suite yet, so manual verification against a live Discord bot is
 expected for behavior changes.
+
+After `./test.sh` passes, you can also run
+`./tests/smoke-fresh-install.sh` to exercise every Discord command
+path against a fresh-install env fixture. It boots bridget with only
+the three required Discord vars set, calls `handle_command` for
+each command, and asserts that no result matches the deleted
+"is unavailable: set ..." config-error pattern. Recommended
+before merging anything that touches `handle_command` or
+`load_config`.
