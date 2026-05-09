@@ -55,10 +55,12 @@ Open bugs against `bridget` that are deferred to v2 design. Maintained alongside
 
 1. Clone and run the installer:
    ```bash
-   git clone https://github.com/CloverRoss/bridget.git
+   git clone https://github.com/drellem2/bridget.git
    cd bridget
    ./install.sh
    ```
+   (This is a fork of [cloverross/bridget](https://github.com/cloverross/bridget)
+   — see [Fork status](#fork-status) below for what differs and why.)
    `install.sh` is idempotent — it creates `~/.pogo/venv-bridget/`, installs
    `discord.py`, symlinks `~/.pogo/bin/bridget` to the script in your clone,
    and seeds `~/.pogo/bridget.env` from `bridget.env.example` (if no env file
@@ -185,59 +187,113 @@ through DMs with the user named in `DISCORD_USER_ID`. If you want one Discord
 *channel* per agent — `#mayor` for mayor, `#architect` for architect, etc., the
 "open-claw" shape — add `~/.pogo/bridget.channels.toml` and bridget will route
 inbound messages and outbound notifications per channel. Without that file,
-bridget behaves bit-identically to v1.0.0.
+bridget behaves bit-identically to v1.0.0 — this is purely opt-in.
 
-A starter config looks like:
+### Where the config lives
+
+`~/.pogo/bridget.channels.toml`. **Outside** the bridget checkout, alongside
+your `bridget.env` — `install.sh` never touches it, and re-running the
+installer or pulling new code can't clobber your channel mappings.
+
+A copy-pasteable starter ships in the repo as
+[`bridget.channels.toml.example`](bridget.channels.toml.example) — copy it to
+`~/.pogo/bridget.channels.toml`, swap in your real channel snowflakes and
+agent names, and restart bridget.
+
+### Finding a channel snowflake
+
+Snowflakes are the 18–20 digit numeric IDs Discord uses internally. To get
+one:
+
+1. Discord → User Settings → Advanced → enable **Developer Mode**.
+2. Right-click the channel name in the sidebar → **Copy Channel ID**.
+3. Paste it as a quoted string in the TOML (`"1234567890123456789"`). Quote
+   it to avoid integer-precision quirks in TOML parsers.
+
+Server-wide IDs and user IDs use the same Copy ID gesture — those are what
+fill `DISCORD_SERVER_ID` and `DISCORD_USER_ID` in `bridget.env`.
+
+### Schema
 
 ```toml
-# ~/.pogo/bridget.channels.toml
-[channels.mayor]
-snowflake = "1234567890123456789"   # right-click the channel → Copy ID
+[channels.<name>]
+snowflake = "1234567890123456789"
 agent     = "mayor"
-direction = "both"                   # "both" | "inbound" | "outbound"
-
-[channels.architect]
-snowflake = "9876543210987654321"
-agent     = "architect"
-direction = "both"
-
-[channels.pm-pogo-digest]
-snowflake = "5555555555555555555"
-agent     = "pm-pogo"
-direction = "outbound"
-kinds     = ["mail", "task-transitions"]   # default: all kinds
+direction = "both"                            # optional
+kinds     = ["mail", "task-transitions"]      # optional
 ```
-
-Schema:
 
 | Field | Required | Purpose |
 |---|---|---|
-| `snowflake` | yes | Discord channel ID (string of digits — Developer Mode → right-click → Copy ID). |
+| `snowflake` | yes | Discord channel ID, as a quoted string of digits. |
 | `agent` | yes | Pogo agent name. Inbound non-verb messages are mailed to this agent; outbound events for this agent fan out to the channel. |
 | `direction` | no (default `both`) | `inbound`, `outbound`, or `both`. |
 | `kinds` | no (default all) | Subset of `["mail", "task-transitions", "idea-claims"]`. Controls which outbound classes fan out to this channel. |
 
-Routing rules:
+The `<name>` in `[channels.<name>]` is a local label used only in error
+messages — it does not have to match the agent name or the channel name.
 
-- **Inbound (channel → agent).** Workflow verbs (`approve`/`reject`/`revise`/
-  `explain`/`next`/`idea:`/`bug:`) keep routing through `POGO_WORKFLOW_AGENT`
-  exactly as they do in DMs — design coordination doesn't change identity based
-  on which channel you typed in. Free-form text in a mapped channel becomes
-  `mg mail send <channel-agent>` with the first line as subject.
+### Routing rules
+
+- **Inbound (channel → agent).** Workflow verbs (`approve` / `reject` /
+  `revise` / `explain` / `next` / `idea:` / `bug:`) keep routing through
+  `POGO_WORKFLOW_AGENT` exactly as they do in DMs — design coordination
+  doesn't change identity based on which channel you typed in. Free-form text
+  in an inbound-mapped channel becomes `mg mail send <channel-agent>` with
+  the first line as subject and the rest as body.
 - **Outbound (agent → channel).** When a watcher would normally DM the user
-  about an event involving an agent that has an outbound mapping, bridget posts
-  to the mapped channel *instead of* DM'ing — so channels declutter your DMs
-  rather than duplicate them. Events whose agent has no mapping continue to DM
-  as today.
+  about an event involving an agent that has an outbound mapping, bridget
+  posts to the mapped channel *instead of* DMing — so channels declutter your
+  DMs rather than duplicate them. Events whose agent has no mapping (or whose
+  `kind` is excluded) fall back to DM, exactly as in v1.0.0.
 - **Bot setup.** The bot must be a member of the guild containing each mapped
-  channel and have permission to read history and send messages there. The
-  required Discord intents (`guilds`, `guild_messages`) are non-privileged and
-  bridget enables them automatically. The author check still pins to
-  `DISCORD_USER_ID` — only that user's messages are processed in mapped
-  channels.
+  channel and have permission to read message history and send messages
+  there. The required Discord intents (`guilds`, `guild_messages`) are
+  non-privileged and bridget enables them automatically. The author check
+  still pins to `DISCORD_USER_ID` — only your messages are processed in
+  mapped channels; messages from anyone else in the same channel are
+  ignored.
+- **Fallback when config is missing.** No `bridget.channels.toml` (or a file
+  that fails to parse / contains no valid entries) means bridget runs in
+  pure DM mode — every notification DMs `DISCORD_USER_ID`, no channel is
+  read, and the bot ignores all guild messages. Errors during load are
+  printed to stderr and never crash bridget.
+- **Python version.** Per-channel routing requires Python 3.11+ (for
+  `tomllib`). On 3.10 the file is ignored with a one-line stderr warning;
+  bridget keeps running in DM mode.
 
-A more detailed operator guide (with channel-snowflake-finding tips and a
-copy-paste example file) is on the roadmap.
+### Worked example: adding a new agent → channel pair
+
+Say you want messages typed in `#mayor` to reach the `mayor` agent, and
+mayor's mail / task-transition notifications to land in the same channel.
+
+1. Create `#mayor` in your guild and enable Developer Mode in Discord.
+2. Right-click `#mayor` → **Copy Channel ID** → say it gives you
+   `987654321098765432`.
+3. Append to `~/.pogo/bridget.channels.toml` (creating the file from the
+   `.example` if it doesn't exist):
+
+   ```toml
+   [channels.mayor]
+   snowflake = "987654321098765432"
+   agent     = "mayor"
+   direction = "both"
+   ```
+
+4. Make sure the bot is a member of the same guild and has *Read Message
+   History* + *Send Messages* on `#mayor`. (Bot membership is set in
+   the [Discord developer portal](https://discord.com/developers/applications);
+   permissions can be granted via the channel's settings or the bot's role.)
+5. Restart bridget (`restart` from a DM, or kick the supervisor).
+6. Verify: type "hello" in `#mayor`. You should see it land in mayor's
+   mailbox as `mg mail send mayor --from=human --subject=hello`. Conversely,
+   `mg mail send mayor --from=human --subject="test"` from another shell
+   should produce a `📬 mail to mayor: test` post in the channel within
+   `BRIDGET_POLL_INTERVAL` seconds.
+
+If the channel stays silent in either direction, check stderr — bridget
+prints a clear line for parse errors, missing intents, and permission
+failures.
 
 ## Idea claim notifications
 
@@ -327,6 +383,64 @@ work on any macOS or Linux machine with Python 3.10+, pogo installed, and a
 Discord bot. Issues and patches that improve portability or add platform
 support are welcome.
 
+## Fork status
+
+This repository is a maintained fork of
+[cloverross/bridget](https://github.com/cloverross/bridget). It exists so that
+operators whose pogo installs diverge from cloverross's defaults — different
+agent names, additional notification channels, generalized config — can run a
+consistent build without each holding a private fork. Upstream is the
+authoritative source for the core single-user DM bridge; this fork layers
+configurable defaults and an optional channel-routing mode on top.
+
+### What differs from upstream
+
+- **P1 — env-key generalizations** (commit `f6ef795`, tag `p1-fork-layer`).
+  Seven optional env keys with defaults that exactly reproduce upstream
+  behavior, so operators with non-default agent names / tags / build scripts
+  can diverge via overrides instead of patches:
+  `POGO_WORKFLOW_AGENT`, `POGO_INBOX_TAG`, `BRIDGET_POLL_INTERVAL`,
+  `BRIDGET_QUIET_RESPECTS_OUTBOUND`, `BRIDGET_APPROVAL_RE`,
+  `BRIDGET_RESTART_CMD`, `BRIDGET_CREW_PATTERN`. See
+  [Behavioural knobs](#behavioural-knobs) for the table.
+- **P2 — per-channel agent routing** (commit `08532ce`, tag
+  `p2-fork-layer`). Optional `~/.pogo/bridget.channels.toml` enabling the
+  "open-claw" shape — one Discord channel per agent — with bidirectional
+  fan-out and a `kinds` filter. See [Per-channel agent
+  routing](#per-channel-agent-routing-optional) for the schema and a worked
+  walkthrough.
+
+Both layers are strictly additive: empty/missing config = exactly the
+upstream behavior. The intent is to land each upstream once it's baked in
+operationally; until then, the fork is the staging ground.
+
+### Where the design lives
+
+The architectural rationale (why an env-key layer, why a TOML routing file,
+why fork-then-PR rather than PR-first) is in
+`docs/bridget-integration-design.md` in the maintainer's pogo repository, not
+here — it's design correspondence, not a project artifact for downstream
+operators. If you've adopted the fork and want context, request access from
+the maintainer (see [AUTHORS](AUTHORS)).
+
+### Upstreaming
+
+The intended trajectory is to PR each layer back to cloverross/bridget once
+it's seen a few weeks of operator use. P1 (env-key generalizations) is the
+near-term candidate; P2 (channel routing) follows after operational
+evidence. Until then, fork divergence is bounded — see git tags
+`p1-fork-layer` / `p2-fork-layer` for the cumulative set of fork-only
+commits at each layer.
+
+### License compatibility
+
+bridget is GPL-3.0-or-later (see [LICENSE](LICENSE)) and this fork
+preserves both the upstream license and the original copyright header in
+the `bridget` script. Any redistribution — fork-of-fork or otherwise — must
+remain GPL-compatible. Original authorship is recorded in
+[AUTHORS](AUTHORS).
+
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). Authorship and fork lineage in
+[AUTHORS](AUTHORS).

@@ -337,5 +337,26 @@ class BackwardsCompatTest(unittest.TestCase):
         self.assertIn('Unrecognized', b.UNRECOGNIZED_REPLY)
 
 
+class ShippedExampleTest(unittest.TestCase):
+    """The bridget.channels.toml.example shipped at the repo root must be a
+    valid config — operators copy-paste it as their starting point."""
+
+    def test_example_parses_and_exercises_all_directions(self):
+        example = (REPO / 'bridget.channels.toml.example').read_text()
+        b = load_bridget(channels_toml=example)
+        # All three directions should show up: at least one inbound-only,
+        # one outbound-only, and one both. The example loses its teaching
+        # value if any direction goes missing.
+        directions = {entry['direction'] for entry in b.CHANNELS.values()}
+        self.assertEqual(directions, {'inbound', 'outbound', 'both'},
+                         f'example must cover every direction; got {directions}')
+        # 'both' and 'inbound' entries should appear in the snowflake index;
+        # 'outbound' and 'both' entries should appear in the agent index.
+        self.assertTrue(b.CHANNELS_BY_SNOWFLAKE,
+                        'example must include at least one inbound channel')
+        self.assertTrue(b.OUTBOUND_BY_AGENT,
+                        'example must include at least one outbound channel')
+
+
 if __name__ == '__main__':
     unittest.main()

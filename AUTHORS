@@ -1,0 +1,47 @@
+bridget — authorship and fork lineage
+=====================================
+
+bridget is a Pogo ↔ Discord bridge, originally written by Clover Ross and
+licensed under GPL-3.0-or-later. This file records the lineage so downstream
+forks-of-forks can trace authorship; the LICENSE file holds the legal text.
+
+Original author and upstream
+----------------------------
+
+  Clover Ross  <cloverross@dreamuniversegames.com>
+  https://github.com/cloverross/bridget
+
+Copyright (C) 2026 Clover Ross. The `bridget` script's file header carries
+the canonical GPL-3.0-or-later notice.
+
+Fork maintainer (this repository)
+---------------------------------
+
+  Daniel Miller  <gate46dmiller@gmail.com>
+  https://github.com/drellem2/bridget
+
+This fork layers two additive features on top of upstream:
+
+  - P1: env-key generalizations (commit f6ef795, tag p1-fork-layer)
+  - P2: per-channel agent routing (commit 08532ce, tag p2-fork-layer)
+
+Each layer is intended to PR back to upstream once it has seen enough
+operator use. See the README's "Fork status" section for the upstream
+trajectory. Architectural rationale lives in
+`docs/bridget-integration-design.md` in the maintainer's pogo repository
+(not redistributed here — request access from the fork maintainer for
+context).
+
+Contributors
+------------
+
+Beyond the original author and the fork maintainer, contributors to either
+the upstream or this fork are recorded in the git history. To list them:
+
+  git log --format='%aN <%aE>' | sort -u
+
+License
+-------
+
+GPL-3.0-or-later. See LICENSE. All contributions to either upstream or this
+fork are accepted under the same license.

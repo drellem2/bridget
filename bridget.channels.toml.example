@@ -1,0 +1,71 @@
+# bridget.channels.toml — per-channel agent routing for bridget.
+#
+# Copy this file to ~/.pogo/bridget.channels.toml and edit the snowflakes /
+# agent names to match your install. With this file present, bridget treats
+# Discord channels as per-agent inboxes / outboxes — type in #ops to mail the
+# `ops` agent, see `pm-product`'s digests in #pm-product, etc. Without it,
+# bridget is DM-only and behaves identically to v1.0.0.
+#
+# To find a channel snowflake: in Discord, enable Developer Mode (User Settings
+# → Advanced → Developer Mode), right-click the channel name, then "Copy
+# Channel ID". Snowflakes are 18–20 digit strings; quote them as TOML strings
+# so JSON-style integer-precision quirks don't trim digits.
+#
+# The bot must be a member of each channel's guild and have permission to read
+# message history and send messages there. Required Discord intents (`guilds`,
+# `guild_messages`) are non-privileged and bridget enables them automatically.
+#
+# Schema (per [channels.<name>] entry):
+#   snowflake  required  — Discord channel ID, as a quoted string of digits.
+#   agent      required  — Pogo agent name. Inbound free-form text is mailed
+#                          to this agent; outbound events involving this agent
+#                          fan out to the channel.
+#   direction  optional  — "inbound" | "outbound" | "both". Default: "both".
+#   kinds      optional  — Subset of ["mail", "task-transitions",
+#                          "idea-claims"]. Filters which outbound classes
+#                          fan out to this channel. Default: all three.
+#
+# The <name> in [channels.<name>] is a local label used only in error
+# messages — it doesn't have to match the agent name or the channel name.
+
+# ── Example 1: a two-way operator channel ────────────────────────────────────
+# Type in #general → goes to mayor's mailbox. Mayor's outbound mail and task
+# transitions fan out here instead of cluttering your DMs.
+[channels.general]
+snowflake = "111111111111111111"
+agent     = "mayor"
+direction = "both"
+
+# ── Example 2: outbound-only digest channel ──────────────────────────────────
+# pm-product's mail and idea-claims show up here, but typing in this channel
+# does *nothing* — it's a read-only fan-out target. Use this shape when you
+# want a notification feed without giving operators a way to reply.
+[channels.pm-product-digest]
+snowflake = "222222222222222222"
+agent     = "pm-product"
+direction = "outbound"
+kinds     = ["mail", "idea-claims"]
+
+# ── Example 3: inbound-only ops channel ──────────────────────────────────────
+# Messages typed here go to the `ops` agent's mailbox, but ops's notifications
+# stay in DMs (or wherever else they're routed). Useful when you want a team
+# to be able to file work without subscribing them to ops's outbound chatter.
+[channels.ops]
+snowflake = "333333333333333333"
+agent     = "ops"
+direction = "inbound"
+
+# ── Notes on routing ─────────────────────────────────────────────────────────
+# - Workflow verbs (`approve`, `reject`, `revise`, `explain`, `next mg-XXXX`,
+#   `idea:`, `bug:`) keep routing through POGO_WORKFLOW_AGENT (default
+#   `architect`) regardless of which channel you typed them in — design
+#   coordination shouldn't change identity based on channel.
+# - Free-form (non-verb) text in an inbound-mapped channel is mailed to the
+#   channel's `agent` with the first line as the subject and the rest as the
+#   body.
+# - Outbound events for an agent with no mapping (or an agent whose mapping
+#   excludes the event's `kind`) fall back to DMing DISCORD_USER_ID — exactly
+#   the v1.0.0 behavior.
+# - Two entries pointing at the same snowflake with overlapping inbound
+#   directions will collide; bridget keeps the first and logs the duplicate
+#   to stderr.
