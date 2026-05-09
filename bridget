@@ -1053,6 +1053,10 @@ def handle_command(text: str) -> str:
         summary = get_status_summary()
         if len(summary) > STATUS_OUTPUT_BUDGET:
             summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+        try:
+            run_pogo(['nudge', 'crew-mayor', 'status check from human via bridge'])
+        except Exception as e:
+            print(f'mayor nudge failed: {e}', file=sys.stderr)
         return summary
 
     return (
