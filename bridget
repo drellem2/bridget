@@ -112,6 +112,8 @@ def load_config() -> dict:
     inbox_str = lookup('POGO_INBOX_REPO')
     inbox_repo = str(Path(inbox_str).expanduser()) if inbox_str else None
 
+    mail_recipient = lookup('POGO_MAIL_RECIPIENT') or 'mayor'
+
     return {
         'token': lookup('DISCORD_BOT_TOKEN'),
         'user_id': user_id,
@@ -122,6 +124,7 @@ def load_config() -> dict:
         'mail_dir': mail_parent / 'new',
         'designs_dir': designs_dir,
         'inbox_repo': inbox_repo,
+        'mail_recipient': mail_recipient,
     }
 
 
@@ -225,6 +228,7 @@ async def watch_mailbox(user: discord.User):
                 "• `idea: [tag] <text>` — file with an extra scope tag (e.g. `[bridget]`)\n"
                 "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
                 "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
+                "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
                 "• `status` — global pull view (unread mail + in-flight work)"
             )
         except discord.HTTPException as e:
@@ -560,6 +564,28 @@ def handle_command(text: str) -> str:
             return f'✓ nudged {agent_name}: "{reason}"'
         return f'✗ nudge failed: {err or out}'
 
+    if low == 'mail' or low.startswith('mail '):
+        rest = text[len('mail'):].lstrip()
+        if '\n' in rest:
+            subject, body = rest.split('\n', 1)
+            subject = subject.strip()
+            body = body.rstrip()
+        else:
+            subject = rest.strip()
+            body = '(no body)'
+        if not subject:
+            return 'Usage: mail <subject>\n[optional body, multi-line OK]'
+        recipient = CONFIG['mail_recipient']
+        rc, out, err = run_mg([
+            'mail', 'send', recipient,
+            '--from=human',
+            f'--subject={subject}',
+            f'--body={body}',
+        ])
+        if rc == 0:
+            return f'✓ mailed {recipient}: "{subject[:60]}"'
+        return f'✗ mail failed: {(err or out).strip()[:200]}'
+
     if low in ('help', '?', 'commands'):
         return (
             "**Commands:**\n"
@@ -573,6 +599,7 @@ def handle_command(text: str) -> str:
             "• `idea: [tag] <text>` — file with extra scope tag (e.g. `[bridget]`)\n"
             "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
             "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
+            "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
             "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
             "• `dismiss all` — inbox-zero everything\n"
             "• `status` — global pull view (unread mail + in-flight work)\n"
