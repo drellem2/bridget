@@ -38,6 +38,7 @@ ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
+IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
 INSTALL_DOCS_URL = 'https://github.com/CloverRoss/bridget#readme'
@@ -237,6 +238,34 @@ def save_task_states(states: dict) -> None:
     os.replace(tmp, TASK_STATES_FILE)
 
 
+def load_idea_claims() -> tuple[set, bool]:
+    """Read the idea-claims cache. Returns (claimed_ids, file_existed).
+    Missing or malformed → empty set + False so callers can prime silently."""
+    if not IDEA_CLAIMS_FILE.exists():
+        return set(), False
+    try:
+        d = json.loads(IDEA_CLAIMS_FILE.read_text())
+        if isinstance(d, dict):
+            ids = d.get('claimed_ids', [])
+        elif isinstance(d, list):
+            ids = d
+        else:
+            raise ValueError('not a dict or list')
+        return {str(x) for x in ids}, True
+    except Exception as e:
+        print(f'load_idea_claims parse error: {e}', file=sys.stderr)
+        return set(), True
+
+
+def save_idea_claims(ids: set) -> None:
+    """Atomically write the idea-claims cache."""
+    IDEA_CLAIMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IDEA_CLAIMS_FILE.parent / (IDEA_CLAIMS_FILE.name + '.tmp')
+    payload = {'claimed_ids': sorted(ids)}
+    tmp.write_text(json.dumps(payload, indent=2) + '\n')
+    os.replace(tmp, IDEA_CLAIMS_FILE)
+
+
 _TRANSITION_FORMATS = {
     'claimed': '🚀 claimed {id}{by}: {title}',
     'done': '✅ done {id}: {title}',
@@ -361,6 +390,54 @@ async def watch_mailbox(user: discord.User):
                 save_seen(seen)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def watch_idea_claims(user: discord.User):
+    claimed, file_existed = load_idea_claims()
+    primed = file_existed
+    while not client.is_closed():
+        try:
+            rc, out, err = run_mg(['list', '--status=claimed', '--json'])
+            if rc != 0:
+                print(f'watch_idea_claims mg list failed: {err.strip()[:200]}', file=sys.stderr)
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            fresh = set()
+            titles = {}
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if item.get('type') != 'idea':
+                    continue
+                iid = item.get('id')
+                if not iid:
+                    continue
+                fresh.add(iid)
+                titles[iid] = (item.get('title') or '?')[:80]
+
+            new_ids = fresh - claimed
+            claimed = fresh
+
+            if not primed:
+                primed = True
+            else:
+                for iid in sorted(new_ids):
+                    msg = f'🧠 architect claimed {iid}: {titles.get(iid, "?")}'
+                    try:
+                        await user.send(msg)
+                    except discord.HTTPException as e:
+                        print(f'idea-claim send failed: {e}', file=sys.stderr)
+
+            save_idea_claims(claimed)
+        except Exception as e:
+            print(f'watch_idea_claims loop error: {e}', file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -894,6 +971,7 @@ async def on_ready():
         return
     client.loop.create_task(watch_mailbox(user))
     client.loop.create_task(watch_task_transitions(user))
+    client.loop.create_task(watch_idea_claims(user))
 
 
 @client.event

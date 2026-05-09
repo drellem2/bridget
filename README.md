@@ -120,6 +120,18 @@ current status without DMing, so you don't get a flood of notifications for
 work that's already in flight. Only ideas/bugs/etc. with `type=task` trigger
 notifications; other types are filtered out.
 
+## Idea claim notifications
+
+bridget pushes a Discord DM when the architect claims an idea:
+
+- `🧠 architect claimed mg-XXXX: <title>`
+
+State lives at `~/.pogo/bridget.idea-claims.json` (runtime; not committed).
+The first run after deleting the cache silently re-primes — only ideas newly
+appearing in `mg list --status=claimed` after that point produce a DM. Only
+items with `type=idea` trigger notifications; tasks and other types are
+filtered out.
+
 ## Running as a service
 
 For v0.1, bridget is just a long-running Python process — supervise it however
