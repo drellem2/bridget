@@ -386,6 +386,17 @@ async def watch_mailbox(user: discord.User):
             )
         except discord.HTTPException as e:
             print(f"startup DM failed: {e}", file=sys.stderr)
+    else:
+        try:
+            summary = get_status_summary()
+            if len(summary) > STATUS_OUTPUT_BUDGET:
+                summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+            await user.send(
+                f"🔔 bridget online.\n\n{summary}\n\n"
+                f"Send `help` for a list of commands."
+            )
+        except discord.HTTPException as e:
+            print(f"startup DM failed: {e}", file=sys.stderr)
 
     while not client.is_closed():
         try:
