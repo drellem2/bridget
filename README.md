@@ -31,7 +31,7 @@ The full v2 roadmap and known-bugs list, mirrored from [ROADMAP.md](ROADMAP.md) 
 
 ### v2 Roadmap
 
-Gaps between bridget (`~/DUGLocal/bridget/bridget`) and the retiring personal bridge (`~/DUGLocal/pogo-discord-bridge/pogo-discord-bridge`). Compiled 2026-05-09 after the cutover.
+Gaps between bridget and the retiring personal `pogo-discord-bridge` install. Compiled 2026-05-09 after the cutover.
 
 Citations are `file:line`. "Filing line" = the exact text Clover can paste into Discord; bridget's parser handles `bug:` and `idea:` prefixes.
 
@@ -55,7 +55,7 @@ Citations are `file:line`. "Filing line" = the exact text Clover can paste into 
 - **Filing:** `bug: status command no longer nudges crew-mayor (regression of mg-68bf)`
 
 ##### 4. README must surface the roadmap + known bugs list
-- New bridget users currently have no in-repo signal of v2 priorities or known bugs — they have to discover issues by hitting them. The roadmap and the live `bug`-tagged work-item list should both be reflected in `~/DUGLocal/bridget/README.md`, and should stay current.
+- New bridget users currently have no in-repo signal of v2 priorities or known bugs — they have to discover issues by hitting them. The roadmap and the live `bug`-tagged work-item list should both be reflected in `README.md`, and should stay current.
 - **Required behavior:** on every push to bridget that adds/changes a roadmap item or known bug, the README sections must be updated in the same PR. Encode this as a contributor expectation (CONTRIBUTING.md or PR template) so it can't drift.
 - **Filing:** `idea: bridget README must include the v2 roadmap + known-bugs list, kept current on every push (contributor expectation enforced via CONTRIBUTING/PR template)`
 
@@ -102,7 +102,7 @@ The personal bridge's hardcoded paths were masking a class of bridget bugs: opti
 
 ### Known bugs
 
-Current open and in-flight bugs against `~/DUGLocal/bridget/bridget`. Maintained alongside mg state (the maintainer's local work tracker); update this file in the same PR that adds, dispatches, or closes a bug.
+Current open and in-flight bugs against `bridget`. Maintained alongside mg state (the maintainer's local work tracker); update this file in the same PR that adds, dispatches, or closes a bug.
 
 #### In flight (fix in PR, not yet landed)
 
