@@ -3,18 +3,21 @@
 This is the runbook for switching a running Pogo↔Discord bridge over to
 bridget. It serves two audiences:
 
-- **Existing user migrating from `pogo-discord-bridge`** (the personal-bridge
-  install at `~/DUGLocal/pogo-discord-bridge/`). Follow every section. The
-  env migration in §3 and the launchd plist edit in §4 are the load-bearing
-  steps; everything else is verification.
+- **Existing user migrating from `pogo-discord-bridge`** (the personal
+  bridge install). Follow every section. The env migration in §3 and the
+  launchd plist edit in §4 are the load-bearing steps; everything else is
+  verification.
 - **Fresh installer with no prior bridge** (e.g. Daniel on a new mac). Skip
   §1 and the env-migration table in §3 — instead, `git clone` the repo and
   fill in the three required `DISCORD_*` values from scratch. §2 (install.sh),
   §4 (launchd plist), and §6 (smoke test) still apply. §7 and §8 are no-ops.
 
-The personal-bridge install at `~/DUGLocal/pogo-discord-bridge/` is **not
-touched** by this procedure — rollback (§8) is just a plist edit and a
-launchd reload.
+> Throughout this runbook, substitute your bridget checkout path for any
+> `<bridget>` placeholder, and your home directory for `/Users/yourname`
+> in launchd plist examples.
+
+The personal `pogo-discord-bridge` install is **not touched** by this
+procedure — rollback (§8) is just a plist edit and a launchd reload.
 
 ## 1. Pre-flight check
 
@@ -34,7 +37,7 @@ Verify all 9 feature ports are on `origin/main`. Expected commit subjects
 plus the v0.1 scaffold (`mg-2fd8`).
 
 ```bash
-cd ~/DUGLocal/bridget
+cd <bridget>
 git checkout main && git pull --ff-only
 git log --oneline origin/main | head -20
 ```
@@ -45,7 +48,7 @@ the personal bridge.
 ## 2. Run install.sh
 
 ```bash
-cd ~/DUGLocal/bridget
+cd <bridget>
 ./install.sh
 ```
 
@@ -53,7 +56,7 @@ What this does:
 
 - Creates `~/.pogo/venv-bridget/` if missing; installs `requirements.txt`
   into it.
-- Symlinks `~/.pogo/bin/bridget` → `~/DUGLocal/bridget/bridget`.
+- Symlinks `~/.pogo/bin/bridget` → the `bridget` script in your checkout.
 - Seeds `~/.pogo/bridget.env` from `bridget.env.example` **only if**
   `~/.pogo/bridget.env` does not already exist.
 
@@ -101,14 +104,14 @@ external references (scripts, dashboards, muscle memory) keep working.
 The minimal diff:
 
 ```diff
--<string>/Users/cloverross/.pogo/bin/pogo-discord-bridge</string>
-+<string>/Users/cloverross/.pogo/bin/bridget</string>
+-<string>/Users/yourname/.pogo/bin/pogo-discord-bridge</string>
++<string>/Users/yourname/.pogo/bin/bridget</string>
  ...
--<string>/Users/cloverross/.pogo/discord-bridge.log</string>
-+<string>/Users/cloverross/.pogo/bridget.log</string>
+-<string>/Users/yourname/.pogo/discord-bridge.log</string>
++<string>/Users/yourname/.pogo/bridget.log</string>
  ...
--<string>/Users/cloverross/.pogo/discord-bridge.err.log</string>
-+<string>/Users/cloverross/.pogo/bridget.err.log</string>
+-<string>/Users/yourname/.pogo/discord-bridge.err.log</string>
++<string>/Users/yourname/.pogo/bridget.err.log</string>
 ```
 
 For confidence, compare your file to these full before/after renderings.
@@ -124,7 +127,7 @@ For confidence, compare your file to these full before/after renderings.
     <string>com.pogo.discord-bridge</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/cloverross/.pogo/bin/pogo-discord-bridge</string>
+        <string>/Users/yourname/.pogo/bin/pogo-discord-bridge</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -133,15 +136,15 @@ For confidence, compare your file to these full before/after renderings.
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/cloverross/.pogo/discord-bridge.log</string>
+    <string>/Users/yourname/.pogo/discord-bridge.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/cloverross/.pogo/discord-bridge.err.log</string>
+    <string>/Users/yourname/.pogo/discord-bridge.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/cloverross</string>
+        <string>/Users/yourname</string>
         <key>PATH</key>
-        <string>/Users/cloverross/go/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>
@@ -158,7 +161,7 @@ For confidence, compare your file to these full before/after renderings.
     <string>com.pogo.discord-bridge</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/cloverross/.pogo/bin/bridget</string>
+        <string>/Users/yourname/.pogo/bin/bridget</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -167,24 +170,26 @@ For confidence, compare your file to these full before/after renderings.
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/cloverross/.pogo/bridget.log</string>
+    <string>/Users/yourname/.pogo/bridget.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/cloverross/.pogo/bridget.err.log</string>
+    <string>/Users/yourname/.pogo/bridget.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/cloverross</string>
+        <string>/Users/yourname</string>
         <key>PATH</key>
-        <string>/Users/cloverross/go/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>
 ```
 
-(For a fresh install on a different machine, substitute `/Users/cloverross`
-with your home directory. Make sure the `PATH` entry includes wherever
-`pogo` and `mg` live — that's why a custom `PATH` is set here, since
-launchd does not source your shell rc files.)
+(For a fresh install, substitute `/Users/yourname` with your actual home
+directory in every plist string. The `PATH` entry above is a sensible
+default — if `pogo` or `mg` live somewhere else (e.g. `~/go/bin` or a
+custom prefix), prepend that directory before `/usr/local/bin`. launchd
+does not source your shell rc files, so the `PATH` here is the only one
+the service will see.)
 
 ## 5. Reload launchd
 
@@ -229,7 +234,7 @@ If any command misbehaves or the bot stays silent, jump to §8 (Rollback).
 safety margin against unexpected issues. After that:
 
 ```bash
-mv ~/DUGLocal/pogo-discord-bridge ~/DUGLocal/.archive-pogo-discord-bridge
+mv <pogo-discord-bridge-checkout> <pogo-discord-bridge-checkout>.archive
 ```
 
 The old log files (`~/.pogo/discord-bridge.log`,
@@ -257,9 +262,8 @@ If bridget misbehaves and you need to fall back to the personal bridge:
 4. File the bridget bug from Discord: `bug: <description>`. Include the
    relevant chunk of `~/.pogo/bridget.err.log` if there's a stack trace.
 
-The personal-bridge install at `~/DUGLocal/pogo-discord-bridge/` is
-untouched throughout the cutover — there's nothing to restore beyond the
-plist itself.
+The personal `pogo-discord-bridge` install is untouched throughout the
+cutover — there's nothing to restore beyond the plist itself.
 
 ## 9. Edge cases / FAQ
 

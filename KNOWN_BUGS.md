@@ -1,6 +1,6 @@
 # Bridget known bugs
 
-Current open and in-flight bugs against `~/DUGLocal/bridget/bridget`. Maintained alongside mg state (the maintainer's local work tracker); update this file in the same PR that adds, dispatches, or closes a bug.
+Current open and in-flight bugs against `bridget`. Maintained alongside mg state (the maintainer's local work tracker); update this file in the same PR that adds, dispatches, or closes a bug.
 
 ## In flight (fix in PR, not yet landed)
 
