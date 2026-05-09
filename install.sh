@@ -82,10 +82,15 @@ cat <<EOF
 
 Next steps:
   1. Edit $ENV_FILE — fill in DISCORD_BOT_TOKEN, DISCORD_USER_ID, DISCORD_SERVER_ID.
-  2. Run bridget:
+  2. (Optional) Override default paths in $ENV_FILE if your design docs or
+     inbox repo live elsewhere:
+       - POGO_DESIGNS_DIR — default: ~/.pogo/designs
+       - POGO_INBOX_REPO  — default: ~/.pogo/inbox
+     See bridget.env.example for the full list of optional keys.
+  3. Run bridget:
          $BIN_LINK
      The script reads its config from $ENV_FILE on startup.
-  3. To run bridget under a process supervisor (launchd / systemd / nohup),
+  4. To run bridget under a process supervisor (launchd / systemd / nohup),
      see the "Running as a service" section in README.md.
 
 EOF
