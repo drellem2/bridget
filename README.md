@@ -79,6 +79,7 @@ launchd/systemd unit can inject overrides without editing the file.
 - `status` — global pull view (unread mail + in-flight work).
 - `agents` — list crew agents and health.
 - `nudge <agent> [reason]` — wake a stalled agent.
+- `restart` — git pull + restart bridget (after merging a PR; see [Remote restart](#remote-restart)).
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `help` (or `?`) — print this list inside Discord.
 
@@ -131,6 +132,27 @@ The first run after deleting the cache silently re-primes — only ideas newly
 appearing in `mg list --status=claimed` after that point produce a DM. Only
 items with `type=idea` trigger notifications; tasks and other types are
 filtered out.
+
+## Remote restart
+
+The `restart` Discord command upgrades a running bridget to the latest
+`origin/main` without touching the host. The flow is: `git pull --ff-only` in
+the bridget checkout, run `build.sh` as a syntax check, then `os._exit(0)` so
+the supervisor (launchd / systemd) respawns the process.
+
+bridget self-detects its checkout from `Path(__file__).resolve().parent`, which
+works whenever `~/.pogo/bin/bridget` is the install.sh-managed symlink to the
+script in your clone. Set `BRIDGET_REPO_DIR` in `bridget.env` only if you run
+bridget from an unusual setup where that resolution doesn't land on the repo
+root.
+
+If the pull or syntax check fails, bridget reports the stderr in Discord and
+keeps running on the old code — you don't get stranded.
+
+**Bootstrap caveat.** The first `restart` after merging a PR that itself
+modifies the `restart` command must be done manually on the host (since the
+running bridge is still on the old code). After that, `restart` keeps you in
+sync.
 
 ## Running as a service
 

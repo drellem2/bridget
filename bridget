@@ -42,6 +42,10 @@ IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
 INSTALL_DOCS_URL = 'https://github.com/CloverRoss/bridget#readme'
+BRIDGET_REPO = Path(os.environ.get(
+    'BRIDGET_REPO_DIR',
+    str(Path(__file__).resolve().parent),
+))
 
 POLL_INTERVAL = 5  # seconds
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
@@ -356,7 +360,8 @@ async def watch_mailbox(user: discord.User):
                 "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
                 "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
                 "• `status` — global pull view (unread mail + in-flight work)\n"
-                "• `agents` — list crew agents and health"
+                "• `agents` — list crew agents and health\n"
+                "• `restart` — git pull + restart bridget (after merging a PR)"
             )
         except discord.HTTPException as e:
             print(f"startup DM failed: {e}", file=sys.stderr)
@@ -519,6 +524,18 @@ def run_pogo(args: list[str]) -> tuple[int, str, str]:
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'pogo command timed out'
+
+
+def run_shell(args: list[str], timeout: int = 30, cwd=None) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+        )
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, '', f'command timed out: {args[0] if args else "?"}'
+    except FileNotFoundError:
+        return 127, '', f'command not found: {args[0] if args else "?"}'
 
 
 def find_mails_for(mg_id: str) -> list:
@@ -817,6 +834,25 @@ def handle_command(text: str) -> str:
             return f'✓ nudged {agent_name}: "{reason}"'
         return f'✗ nudge failed: {err or out}'
 
+    if low == 'restart':
+        rc, out, err = run_shell(
+            ['git', '-C', str(BRIDGET_REPO), 'pull', '--ff-only'], timeout=30,
+        )
+        if rc != 0:
+            return f'❌ git pull failed: {(err or out).strip()[:200]}; staying on old code.'
+        rc_sha, sha_out, _ = run_shell(
+            ['git', '-C', str(BRIDGET_REPO), 'rev-parse', '--short', 'HEAD'], timeout=10,
+        )
+        sha = sha_out.strip() if rc_sha == 0 else '?'
+        rc_b, _, err_b = run_shell(
+            ['bash', 'build.sh'], timeout=10, cwd=str(BRIDGET_REPO),
+        )
+        if rc_b != 0:
+            return f'❌ syntax check failed: {err_b.strip()[:200]}; staying on old code.'
+        # 2s gives the Discord ack time to flush before launchd respawns us.
+        client.loop.call_later(2.0, lambda: os._exit(0))
+        return f'✅ pulled {sha}; restarting in 2s'
+
     if low == 'mail' or low.startswith('mail '):
         rest = text[len('mail'):].lstrip()
         if '\n' in rest:
@@ -858,6 +894,7 @@ def handle_command(text: str) -> str:
             "• `status` — global pull view (unread mail + in-flight work)\n"
             "• `agents` — list crew agents and health\n"
             "• `nudge <agent> [reason]` — wake a stalled agent\n"
+            "• `restart` — git pull + restart bridget (after merging a PR)\n"
             "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
             "• `help` (or `?`) — this list"
         )
