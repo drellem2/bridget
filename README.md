@@ -98,6 +98,21 @@ All config lives in `~/.pogo/bridget.env`. See
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
 | `BRIDGET_REPO_DIR`   | no  | Override for the bridget git checkout. Default: self-detected from the script's location (works for the install.sh-managed symlink). |
 
+### Behavioural knobs
+
+These all default to the v1.0.0 hard-coded behavior — set them only when
+your install needs to diverge.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `POGO_WORKFLOW_AGENT` | `architect` | Recipient/assignee for the workflow verbs (`approve`, `reject`, `revise`, `explain`, `next mg-XXXX`) and filing commands (`idea:`, `bug:`). Override if design coordination routes through a non-architect agent. |
+| `POGO_INBOX_TAG` | `pogo-inbox` | Base tag stamped on `idea:`, `bug:`, and `next` items. Inline `[scope]` tags from the user are still appended. |
+| `BRIDGET_POLL_INTERVAL` | `5` | Polling interval (seconds) for the mailbox / task-transitions / idea-claims watchers. |
+| `BRIDGET_QUIET_RESPECTS_OUTBOUND` | `false` | When `true`, watchers consult `~/.pogo/quiet.json` and suppress DMs while quiet hours are active. Inbound DMs are always processed. |
+| `BRIDGET_APPROVAL_RE` | `^Subject: approval needed ` | Regex matched against the first `Subject:` header to flag a mail as an approval request in `status`. |
+| `BRIDGET_RESTART_CMD` | `bash build.sh` | Shell command run from `BRIDGET_REPO_DIR` to validate a fresh checkout before the `restart` verb respawns the process. |
+| `BRIDGET_CREW_PATTERN` | `^(architect\|mayor\|human\|pm-.*\|)$` | Regex applied to `assignee` to decide whether the `claimed by …` annotation is suppressed. Anything matching = crew agent (suppressed); anything not matching = polecat. |
+
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
 

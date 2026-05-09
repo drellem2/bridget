@@ -30,6 +30,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -54,7 +55,6 @@ CREDIT_BALANCE_RE = re.compile(
     re.IGNORECASE,
 )
 
-POLL_INTERVAL = 5  # seconds
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
 STATUS_OUTPUT_BUDGET = 1700
 
@@ -153,6 +153,39 @@ def load_config() -> dict:
         else str(HOME / '.pogo' / 'inbox')
 
     mail_recipient = lookup('POGO_MAIL_RECIPIENT') or 'mayor'
+    workflow_agent = lookup('POGO_WORKFLOW_AGENT') or 'architect'
+    inbox_tag = lookup('POGO_INBOX_TAG') or 'pogo-inbox'
+
+    poll_interval_str = lookup('BRIDGET_POLL_INTERVAL')
+    try:
+        poll_interval = int(poll_interval_str) if poll_interval_str else 5
+    except ValueError:
+        die(f"BRIDGET_POLL_INTERVAL must be an integer (got {poll_interval_str!r}).")
+    if poll_interval <= 0:
+        die(f"BRIDGET_POLL_INTERVAL must be positive (got {poll_interval}).")
+
+    quiet_respects_outbound_raw = (lookup('BRIDGET_QUIET_RESPECTS_OUTBOUND') or 'false').strip().lower()
+    quiet_respects_outbound = quiet_respects_outbound_raw in ('true', '1', 'yes', 'on')
+
+    approval_re_str = lookup('BRIDGET_APPROVAL_RE') or r'^Subject: approval needed '
+    try:
+        approval_re = re.compile(approval_re_str)
+    except re.error as e:
+        die(f"BRIDGET_APPROVAL_RE is not a valid regex: {e}")
+
+    restart_cmd_str = lookup('BRIDGET_RESTART_CMD') or 'bash build.sh'
+    try:
+        restart_cmd = shlex.split(restart_cmd_str)
+    except ValueError as e:
+        die(f"BRIDGET_RESTART_CMD failed to parse as a shell command: {e}")
+    if not restart_cmd:
+        die("BRIDGET_RESTART_CMD must not be empty.")
+
+    crew_pattern_str = lookup('BRIDGET_CREW_PATTERN') or r'^(architect|mayor|human|pm-.*|)$'
+    try:
+        crew_pattern = re.compile(crew_pattern_str)
+    except re.error as e:
+        die(f"BRIDGET_CREW_PATTERN is not a valid regex: {e}")
 
     return {
         'token': lookup('DISCORD_BOT_TOKEN'),
@@ -165,6 +198,13 @@ def load_config() -> dict:
         'designs_dir': designs_dir,
         'inbox_repo': inbox_repo,
         'mail_recipient': mail_recipient,
+        'workflow_agent': workflow_agent,
+        'inbox_tag': inbox_tag,
+        'poll_interval': poll_interval,
+        'quiet_respects_outbound': quiet_respects_outbound,
+        'approval_re': approval_re,
+        'restart_cmd': restart_cmd,
+        'crew_pattern': crew_pattern,
     }
 
 
@@ -176,6 +216,13 @@ MG_BIN = CONFIG['mg_bin']
 MAIL_DIR = CONFIG['mail_dir']
 DESIGNS_DIR = CONFIG['designs_dir']
 INBOX_REPO = CONFIG['inbox_repo']
+WORKFLOW_AGENT = CONFIG['workflow_agent']
+INBOX_TAG = CONFIG['inbox_tag']
+POLL_INTERVAL = CONFIG['poll_interval']
+QUIET_RESPECTS_OUTBOUND = CONFIG['quiet_respects_outbound']
+APPROVAL_RE = CONFIG['approval_re']
+RESTART_CMD = CONFIG['restart_cmd']
+CREW_PATTERN = CONFIG['crew_pattern']
 
 
 import discord  # noqa: E402  (deferred so config errors don't require the venv)
@@ -251,6 +298,27 @@ def save_quiet(state: dict) -> None:
     os.replace(tmp, QUIET_FILE)
 
 
+def is_quiet_now() -> bool:
+    """True iff quiet hours are enabled AND we are currently inside the
+    configured local-time window. Windows that wrap midnight (start > end) are
+    handled. Used to gate outbound DMs when BRIDGET_QUIET_RESPECTS_OUTBOUND=true."""
+    state = load_quiet()
+    if not state.get('enabled'):
+        return False
+    if not (TIME_RE.match(state.get('start', '')) and TIME_RE.match(state.get('end', ''))):
+        return False
+    sh, sm = (int(x) for x in state['start'].split(':'))
+    eh, em = (int(x) for x in state['end'].split(':'))
+    s, e = sh * 60 + sm, eh * 60 + em
+    if s == e:
+        return False
+    now = datetime.datetime.now()
+    cur = now.hour * 60 + now.minute
+    if s < e:
+        return s <= cur < e
+    return cur >= s or cur < e
+
+
 def load_task_states() -> tuple[dict, bool]:
     """Read the task-state cache. Returns (states, file_existed). Missing or
     malformed → empty dict + False so callers can prime silently."""
@@ -307,7 +375,6 @@ _TRANSITION_FORMATS = {
     'done': '✅ done {id}: {title}',
     'shelved': '📦 shelved {id}: {title}',
 }
-_NON_POLECAT_ASSIGNEES = {'architect', 'mayor', 'human', ''}
 
 
 def format_transition(task: dict, new_status: str):
@@ -318,7 +385,7 @@ def format_transition(task: dict, new_status: str):
     by = ''
     if new_status == 'claimed':
         assignee = (task.get('assignee') or '').strip()
-        if assignee and assignee.lower() not in _NON_POLECAT_ASSIGNEES:
+        if assignee and not CREW_PATTERN.match(assignee.lower()):
             by = f' by {assignee}'
     return fmt.format(id=task.get('id', '?'), by=by, title=title)
 
@@ -375,33 +442,37 @@ def agent_cycle_paren(name: str) -> str:
 
 async def watch_mailbox(user: discord.User):
     seen = load_seen()
+    quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
     if not SEEN_FILE.exists() and MAIL_DIR.exists():
         for p in MAIL_DIR.iterdir():
             seen.add(p.name)
         save_seen(seen)
-        try:
-            await user.send(
-                "🔔 bridget online. I'll DM you when new mail arrives in "
-                "`human/new/`. Recognized replies:\n" + COMMAND_LIST
-            )
-        except discord.HTTPException as e:
-            print(f"startup DM failed: {e}", file=sys.stderr)
+        if not quiet_outbound:
+            try:
+                await user.send(
+                    "🔔 bridget online. I'll DM you when new mail arrives in "
+                    "`human/new/`. Recognized replies:\n" + COMMAND_LIST
+                )
+            except discord.HTTPException as e:
+                print(f"startup DM failed: {e}", file=sys.stderr)
     else:
-        try:
-            summary = get_status_summary()
-            if len(summary) > STATUS_OUTPUT_BUDGET:
-                summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
-            await user.send(
-                f"🔔 bridget online.\n\n{summary}\n\n"
-                f"Send `help` for a list of commands."
-            )
-        except discord.HTTPException as e:
-            print(f"startup DM failed: {e}", file=sys.stderr)
+        if not quiet_outbound:
+            try:
+                summary = get_status_summary()
+                if len(summary) > STATUS_OUTPUT_BUDGET:
+                    summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+                await user.send(
+                    f"🔔 bridget online.\n\n{summary}\n\n"
+                    f"Send `help` for a list of commands."
+                )
+            except discord.HTTPException as e:
+                print(f"startup DM failed: {e}", file=sys.stderr)
 
     while not client.is_closed():
         try:
             if MAIL_DIR.exists():
                 current = {p.name for p in MAIL_DIR.iterdir()}
+                quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
                 for fname in sorted(current - seen):
                     fpath = MAIL_DIR / fname
                     try:
@@ -419,6 +490,10 @@ async def watch_mailbox(user: discord.User):
                     )
                     if len(msg) > DISCORD_MSG_LIMIT:
                         msg = msg[:DISCORD_MSG_LIMIT] + '…'
+                    if quiet_outbound:
+                        # Suppress DM during quiet hours; mail still visible via `status`.
+                        seen.add(fname)
+                        continue
                     try:
                         await user.send(msg)
                         seen.add(fname)
@@ -465,7 +540,10 @@ async def watch_idea_claims(user: discord.User):
             if not primed:
                 primed = True
             else:
+                quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
                 for iid in sorted(new_ids):
+                    if quiet_outbound:
+                        continue
                     msg = f'🧠 architect claimed {iid}: {titles.get(iid, "?")}'
                     try:
                         await user.send(msg)
@@ -519,7 +597,10 @@ async def watch_task_transitions(user: discord.User):
             if not primed:
                 primed = True
             else:
+                quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
                 for msg in transitions:
+                    if quiet_outbound:
+                        continue
                     try:
                         await user.send(msg)
                     except discord.HTTPException as e:
@@ -625,8 +706,8 @@ def scan_pending_approvals() -> list[str]:
             for line in p.read_text().splitlines():
                 if line == '':
                     break
-                if line.startswith('Subject: approval needed '):
-                    out.append(line[len('Subject: '):])
+                if APPROVAL_RE.match(line):
+                    out.append(line[len('Subject: '):] if line.startswith('Subject: ') else line)
                     break
         except Exception:
             pass
@@ -696,7 +777,7 @@ def handle_command(text: str) -> str:
         parts = text.split(None, 1)
         mg_id = parts[1] if len(parts) > 1 else ''
         rc, out, err = run_mg([
-            'mail', 'send', 'architect',
+            'mail', 'send', WORKFLOW_AGENT,
             '--from=human',
             f'--subject=approve {mg_id}',
             '--body=approved via discord',
@@ -714,7 +795,7 @@ def handle_command(text: str) -> str:
         mg_id = parts[1]
         reason = parts[2] if len(parts) > 2 else 'rejected via discord'
         rc, out, err = run_mg([
-            'mail', 'send', 'architect',
+            'mail', 'send', WORKFLOW_AGENT,
             '--from=human',
             f'--subject=reject {mg_id}',
             f'--body={reason}',
@@ -735,7 +816,7 @@ def handle_command(text: str) -> str:
         if sh_rc == 0 and re.search(r'^Status:\s+shelved', sh_out, re.MULTILINE):
             run_mg(['unshelve', mg_id])
         rc, out, err = run_mg([
-            'mail', 'send', 'architect',
+            'mail', 'send', WORKFLOW_AGENT,
             '--from=human',
             f'--subject=revise {mg_id}',
             f'--body={feedback}',
@@ -818,8 +899,8 @@ def handle_command(text: str) -> str:
             'new', '--type=idea',
             f'--title=Roadmap: {short_name}',
             f'--body={idea_body}',
-            '--assignee=architect',
-            '--tag=pogo-inbox',
+            f'--assignee={WORKFLOW_AGENT}',
+            f'--tag={INBOX_TAG}',
             f'--repo={INBOX_REPO}',
         ])
         return f"✓ next idea filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
@@ -831,7 +912,7 @@ def handle_command(text: str) -> str:
         mg_id = parts[1]
         topic = parts[2]
         rc, out, err = run_mg([
-            'mail', 'send', 'architect',
+            'mail', 'send', WORKFLOW_AGENT,
             '--from=human',
             f'--subject=explain {mg_id}',
             f'--body={topic}',
@@ -922,7 +1003,7 @@ def handle_command(text: str) -> str:
         )
         sha = sha_out.strip() if rc_sha == 0 else '?'
         rc_b, _, err_b = run_shell(
-            ['bash', 'build.sh'], timeout=10, cwd=str(BRIDGET_REPO),
+            RESTART_CMD, timeout=10, cwd=str(BRIDGET_REPO),
         )
         if rc_b != 0:
             return f'❌ syntax check failed: {err_b.strip()[:200]}; staying on old code.'
@@ -971,8 +1052,8 @@ def handle_command(text: str) -> str:
             'new', '--type=idea',
             f'--title={title}',
             f'--body={body}',
-            '--assignee=architect',
-            '--tag=pogo-inbox',
+            f'--assignee={WORKFLOW_AGENT}',
+            f'--tag={INBOX_TAG}',
             f'--repo={INBOX_REPO}',
         ]
         for t in extra_tags:
@@ -996,8 +1077,8 @@ def handle_command(text: str) -> str:
             'new', '--type=bug',
             f'--title={title}',
             f'--body={body}',
-            '--assignee=architect',
-            '--tag=pogo-inbox',
+            f'--assignee={WORKFLOW_AGENT}',
+            f'--tag={INBOX_TAG}',
             f'--repo={INBOX_REPO}',
         ]
         for t in extra_tags:
