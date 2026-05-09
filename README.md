@@ -228,6 +228,10 @@ work on any macOS or Linux machine with Python 3.10+, pogo installed, and a
 Discord bot. Issues and patches that improve portability or add platform
 support are welcome.
 
+## Roadmap & known bugs
+
+v2 priorities — the gaps between bridget and the personal bridge it replaced — are tracked in [ROADMAP.md](ROADMAP.md). Current open and in-flight bugs are tracked in [KNOWN_BUGS.md](KNOWN_BUGS.md). Both files are mirrors of the maintainer's working tracker and are updated alongside any change to that state — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
