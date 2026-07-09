@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
 """Guards for the 'no hardcoded secrets' requirement.
 
 These are cheap, blunt, and run on every commit. They exist because the failure
@@ -230,6 +244,96 @@ class TestStateFilePermissions(unittest.TestCase):
     def test_installer_tightens_the_pogo_directory(self):
         install = (REPO / 'install.sh').read_text()
         self.assertIn('chmod 700 "$POGO_DIR"', install)
+
+
+class TestLicenseHeaders(unittest.TestCase):
+    """A10. Every source file carries a copyright line, an SPDX tag, and the
+    warranty disclaimer; a file that upstream also wrote carries both copyrights
+    and the modification notice GPL-3.0 section 5(a) asks for.
+
+    Enforced rather than documented, because the failure mode is a new file
+    shipping with no notice at all — which is what happened to every file in
+    bridget_core/ and tests/."""
+
+    SOURCE_GLOBS = ('bridget', 'build.sh', 'test.sh', 'install.sh',
+                    'bridget_core/*.py', 'tests/test_*.py',
+                    'tests/smoke-fresh-install.py', 'tests/smoke-fresh-install.sh')
+
+    def sources(self):
+        found = []
+        for pattern in self.SOURCE_GLOBS:
+            found.extend(sorted(REPO.glob(pattern)))
+        self.assertGreater(len(found), 15, 'sanity: globs matched suspiciously little')
+        return found
+
+    def _authors(self, path: Path) -> set:
+        out = subprocess.run(['git', 'log', '--format=%aN', '--', str(path)],
+                             cwd=REPO, capture_output=True, text=True, check=True).stdout
+        return {a for a in out.split('\n') if a}
+
+    @staticmethod
+    def _header(path: Path) -> str:
+        """The leading comment block, unwrapped into one whitespace-normalized
+        line. Scanning the whole file would make this very file fail, since it
+        necessarily quotes the notices it checks; normalizing means a reflowed
+        comment does not."""
+        lines = []
+        for line in path.read_text().splitlines():
+            if line.startswith('#!'):
+                continue
+            if not line.startswith('#'):
+                break
+            lines.append(line.lstrip('#').strip())
+        return ' '.join(' '.join(lines).split())
+
+    def test_every_source_file_has_an_spdx_tag(self):
+        for p in self.sources():
+            self.assertIn('SPDX-License-Identifier: GPL-3.0-or-later', self._header(p),
+                          f'{p.relative_to(REPO)} has no SPDX tag')
+
+    def test_every_source_file_has_a_copyright_line(self):
+        for p in self.sources():
+            self.assertIn('Copyright (C) 2026', self._header(p),
+                          f'{p.relative_to(REPO)} has no copyright line')
+
+    def test_every_source_file_disclaims_warranty(self):
+        """The GPL appendix asks for it, and the one-line 'see LICENSE' pointer
+        the repo used to carry was not it."""
+        for p in self.sources():
+            self.assertIn('WITHOUT ANY WARRANTY', self._header(p),
+                          f'{p.relative_to(REPO)} has no warranty disclaimer')
+
+    def test_an_upstream_file_carries_both_copyrights_and_a_modification_notice(self):
+        seen = 0
+        for p in self.sources():
+            if 'cloverross' not in self._authors(p):
+                continue
+            seen += 1
+            head = self._header(p)
+            self.assertIn('Copyright (C) 2026 Clover Ross', head,
+                          f'{p.relative_to(REPO)} drops the upstream copyright')
+            self.assertIn('Copyright (C) 2026 Daniel Miller', head,
+                          f'{p.relative_to(REPO)} drops the fork copyright')
+            self.assertIn('Modified in 2026', head,
+                          f'{p.relative_to(REPO)} lacks a GPL 5(a) modification notice')
+        self.assertGreater(seen, 0, 'sanity: no upstream-derived file found')
+
+    def test_a_fork_only_file_does_not_claim_upstream_authorship(self):
+        seen = 0
+        for p in self.sources():
+            if 'cloverross' in self._authors(p):
+                continue
+            seen += 1
+            self.assertNotIn('Copyright (C) 2026 Clover Ross', self._header(p),
+                             f'{p.relative_to(REPO)} credits upstream for a file it never saw')
+        self.assertGreater(seen, 0, 'sanity: no fork-only file found')
+
+    def test_authors_does_not_overstate_the_file_headers(self):
+        """AUTHORS used to claim the bridget script carried "the canonical
+        GPL-3.0-or-later notice". It carried a one-line pointer."""
+        authors = (REPO / 'AUTHORS').read_text()
+        self.assertNotIn('carries\nthe canonical GPL-3.0-or-later notice', authors)
+        self.assertIn('SPDX-License-Identifier', authors)
 
 
 class TestGitignoreCoversAnInTreeEnvFile(unittest.TestCase):

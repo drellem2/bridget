@@ -11,8 +11,26 @@ Original author and upstream
   Clover Ross  <cloverross@dreamuniversegames.com>
   https://github.com/cloverross/bridget
 
-Copyright (C) 2026 Clover Ross. The `bridget` script's file header carries
-the canonical GPL-3.0-or-later notice.
+Copyright (C) 2026 Clover Ross.
+
+Per-file notices
+----------------
+
+Every source file carries a copyright line, an `SPDX-License-Identifier:
+GPL-3.0-or-later` tag, and the GPL's warranty disclaimer. Which names appear is
+decided by the git history, not by convention:
+
+  - Files that originated upstream and were changed here — `bridget`,
+    `install.sh`, `build.sh`, `test.sh`, `tests/smoke-fresh-install.*` — carry
+    both copyrights and a notice of modification with its date, as GPL-3.0
+    section 5(a) requires of a modified file.
+  - Files written for this fork and absent upstream — all of `bridget_core/`
+    and the rest of `tests/` — carry the fork maintainer's copyright and say
+    so.
+
+To re-derive who touched what:
+
+  git log --format='%aN' -- <path> | sort -u
 
 Fork maintainer (this repository)
 ---------------------------------

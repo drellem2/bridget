@@ -1,15 +1,17 @@
-# bridget_core.statefile — owner-only atomic state writes. GPL-3.0-or-later.
-# Copyright (C) 2026 Clover Ross
-# Copyright (C) 2026 Daniel Miller (fork maintainer)
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
-# This file is part of bridget. bridget is free software: you can redistribute
-# it and/or modify it under the terms of the GNU General Public License as
-# published by the Free Software Foundation, either version 3 of the License,
-# or (at your option) any later version. It is distributed WITHOUT ANY
-# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License along with
-# this program. If not, see <https://www.gnu.org/licenses/>.
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
 """One way to write a state file: atomically, and readable only by its owner.
 
 Every file the bridge persists sits in `~/.pogo/` next to the env file that

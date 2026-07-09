@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-# tests/test_install.py — functional coverage for install.sh. GPL-3.0-or-later.
-# Copyright (C) 2026 Clover Ross
-# Copyright (C) 2026 Daniel Miller (fork maintainer)
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
-# This file is part of bridget and is distributed under the terms of the GNU
-# General Public License, version 3 or later. See LICENSE.
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
 """Run install.sh for real, against a throwaway $HOME, and check what it did.
 
 Everything else that "tests" the installer greps its source: `assertIn('chmod
@@ -29,7 +37,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 INSTALL = REPO / 'install.sh'
 
-#: Shape-valid, entirely fake. Three dot-separated base64url chunks.
+#: Shape-valid for `token_shape_ok` (three dot-separated base64url chunks), and
+#: entirely fake. Deliberately shorter than a real token in the first and third
+#: chunks so it does NOT match test_secrets.DISCORD_TOKEN_RE — otherwise this
+#: file would trip the "no token-shaped string is committed" guard, and the fix
+#: would be to blunt that guard. See test_the_fake_token_is_not_token_shaped.
 FAKE_TOKEN = 'MTIzNDU2Nzg5.GhIjKl.mNoPqRsTuVwXyZ0123'
 
 
@@ -275,6 +287,14 @@ class TestArgumentHandling(InstallerTestCase):
 class TestInstallerSourceInvariants(unittest.TestCase):
     """The greps that A13 says are tripwires, kept as tripwires — they guard
     properties the functional tests above cannot observe from outside."""
+
+    def test_the_fake_token_is_not_token_shaped(self):
+        """This file must not itself trip test_secrets.py's committed-secret
+        scan. Lengthening FAKE_TOKEN would fail there, far from the cause."""
+        sys.path.insert(0, str(REPO / 'tests'))
+        from test_secrets import DISCORD_TOKEN_RE
+        self.assertIsNone(DISCORD_TOKEN_RE.search(FAKE_TOKEN))
+        self.assertEqual(len(FAKE_TOKEN.split('.')), 3, 'still three chunks')
 
     def test_the_installer_never_uses_rm_rf(self):
         self.assertNotIn('rm -rf', INSTALL.read_text())

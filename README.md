@@ -172,7 +172,9 @@ and `discord.py`'s own logging is disabled (`log_handler=None`).
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `settings` — show the DM policy, muted conversations, and threading state.
 - `dm <all|curated|none>` — change how much mail reaches your DMs, live.
-- `mute all` / `unmute all` — silence every DM. Mail still threads into the log channel.
+- `mute all` / `unmute all` — silence every DM. With a log channel, mail still
+  threads into it. Without one the DM was your only surface, so mail is held in
+  the maildir until you `unmute all` — held, never dropped.
 - `help` (or `?`) — print this list inside Discord.
 
 Inside a conversation thread (see below) you can also just **type a reply** — it
