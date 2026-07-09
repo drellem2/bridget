@@ -14,9 +14,11 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 - **Conversation threads.** `BRIDGET_LOG_CHANNEL_ID` roots one Discord thread
   per mail conversation in a guild text channel. Conversations are keyed on the
-  root of the `References` chain, so a whole reply chain resolves to one thread.
-  The map persists in `~/.pogo/bridget.conversations.json` and survives
-  restarts, so threads are never orphaned. Unset = threading off.
+  message that rooted them and matched by a message-id index over every message
+  bridget has seen — including the replies it sends — so a whole reply chain
+  resolves to one thread however many round-trips it runs. The map persists in
+  `~/.pogo/bridget.conversations.json` and survives restarts, so threads are
+  never orphaned. Unset = threading off.
 - **The calm inbox.** `BRIDGET_DM_POLICY` = `all` (default) / `curated` /
   `none`. `curated` DMs only mail that wants a decision; everything else lands
   in the log channel. Refused without a log channel, so suppressed mail always
@@ -47,6 +49,21 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 - **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
   or any real secret value is committed, if a config key is undocumented, or if
   `TOKEN` is referenced anywhere but `client.run`.
+
+### Fixed
+
+- **Threading no longer collapses after the first round-trip.** Conversations
+  were keyed on `References[0]`, assumed to be the reply-chain root. It is not:
+  `mg mail send --in-reply-to X` seeds `References: [X]` — the parent — and it
+  is the primitive both bridget and the agents reply through. The second and
+  every subsequent inbound mail therefore rooted a fresh Discord thread, mutes
+  keyed on the old conversation stopped applying, and the conversation map grew
+  one entry per message. No mail was ever lost. Conversations are now matched by
+  a message-id index, and bridget records the id `mg` assigns each reply it
+  sends — the agent's answer names that id and nothing older.
+  `tests/test_mg_threading.py` drives a real `mg` through two round-trips; the
+  hand-authored `References` fixtures that let this ship could not have caught
+  it, because none of them carried the header shape `mg` actually writes.
 
 ### Changed
 

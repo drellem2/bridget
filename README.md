@@ -210,19 +210,27 @@ than silently swallowing your mail.
 ### How a conversation is identified
 
 Each mail carries a `Message-Id`, and a reply carries `In-Reply-To` plus a
-`References` chain (macguffin gh#66). bridget keys a conversation on the **root**
-of that chain, so every message in a reply chain resolves to the same thread no
-matter where in the chain it sits. The map lives in
-`~/.pogo/bridget.conversations.json` and survives restarts — otherwise a restart
-would orphan every open thread and root a duplicate for the next message.
+`References` chain (macguffin gh#66). A conversation is keyed on the id of the
+message that rooted it, and bridget keeps a **message-id index** of every
+message it has folded in — including the replies it sends itself. An arriving
+mail is matched against that index by walking its ancestry (`In-Reply-To`, then
+`References` newest-first, then its own id); it joins the conversation that owns
+the first id bridget recognizes, and roots a new one only when it recognizes
+none. The map lives in `~/.pogo/bridget.conversations.json` and survives
+restarts — otherwise a restart would orphan every open thread and root a
+duplicate for the next message.
+
+The index is not an optimization. `mg mail send --in-reply-to X` is a stateless
+primitive: it seeds `References: [X]` and nothing else. Only the first reply in
+a chain therefore names the root — from the second hop on, `References[0]` is
+merely the parent. Keying on `References[0]` alone would give you one thread per
+message from the second round-trip onward. It also means the 20-id cap macguffin
+puts on `References` costs nothing: bridget never needs the chain to reach back
+to the root, only to reach a message it has already seen.
 
 Mail with no correlation headers at all (anything written before gh#66) keys on
 its maildir filename, which is the value macguffin would have used as its id
 anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
-
-> **Note.** `References` is capped at the last 20 ids. A conversation running
-> past 20 messages loses its true root, and later messages start a second
-> thread. That is a visible, bounded degradation, not lost mail.
 
 ### Replying
 
@@ -540,7 +548,8 @@ bridget_core/          transport-agnostic. Imports no chat library at all.
   mail.py              maildir parsing; Message-Id / In-Reply-To / References;
                        conversation-key derivation
   mailbox.py           observe-only maildir scanning + persisted seen-set
-  conversations.py     conversation <-> thread map, persisted across restarts
+  conversations.py     conversation <-> thread map + message-id index,
+                       persisted across restarts
   settings.py          live-reloadable mute / DM-policy state
   mgshim.py            the mg CLI seam: detect --in-reply-to, degrade if absent
   acks.py              delivered / ambiguous / undeliverable outcomes
