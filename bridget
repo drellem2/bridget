@@ -806,6 +806,12 @@ def render_ack(ack: acks.Ack) -> str:
     return f'❌ undeliverable{where}: {reason}'
 
 
+def conversation_label(conv) -> str:
+    """How a conversation names itself to the human. One definition — the
+    `settings` list and the ambiguity candidates must not drift apart."""
+    return f'**{conv.agent}** — {conv.subject}'
+
+
 def render_settings(summary: dict) -> str:
     """Turn `SettingsStore.summary()` into the `settings` command's output."""
     lines = [
@@ -833,7 +839,7 @@ def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
     body_preview = mail['body']
     if len(body_preview) > MAIL_BODY_PREVIEW:
         body_preview = body_preview[:MAIL_BODY_PREVIEW] + f'\n…[truncated{hint}]'
-    header = f"{prefix}📬 **{mail['from']}** — {mail['subject']}\n"
+    header = defuse_fences(f"{prefix}📬 **{mail['from']}** — {mail['subject']}\n")
     footer = f"\n💬 reply in thread: {thread_link}" if thread_link else ''
     # A subject is attacker-adjacent text too: bound the header so it can never
     # squeeze the body's fence out of the message entirely.
@@ -946,14 +952,27 @@ async def resolve_thread(conv, mail: dict):
     return thread
 
 
-async def post_to_thread(conv, mail: dict) -> str:
+async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
     """Post `mail` into its conversation thread. Returns the thread URL, or ''
-    if the thread could not be reached."""
+    if the thread could not be reached.
+
+    Idempotent in `message_id`: delivery is at-least-once, so the same mail can
+    arrive here twice (a failed DM last time, or a crash between this send and
+    the watcher's commit). The second arrival gets the URL and no second post.
+
+    The guard is consulted *after* `resolve_thread`, never before. Resolving is
+    what re-roots a thread the human deleted, and `bind_thread` clears the
+    posted set when it does — so a mail whose thread no longer exists is posted
+    into the new one rather than silently skipped on the strength of a record
+    about a thread that is gone.
+    """
     thread = await resolve_thread(conv, mail)
     if thread is None:
         return ''
+    if message_id and CONVERSATIONS.was_posted(conv.key, message_id):
+        return thread_url(thread.id)
     body = mail['body'] or '(no body)'
-    header = f"**{mail['from']}** — {mail['subject']}\n"
+    header = defuse_fences(f"**{mail['from']}** — {mail['subject']}\n")
     if len(header) > MAIL_HEADER_LIMIT:
         header = header[:MAIL_HEADER_LIMIT - 2] + '…\n'
     text = header + code_block(body, budget=DISCORD_MSG_LIMIT - len(header))
@@ -962,6 +981,10 @@ async def post_to_thread(conv, mail: dict) -> str:
     except discord.HTTPException as e:
         print(f'thread send failed ({thread.id}): {e}', file=sys.stderr)
         return ''
+    if message_id:
+        # Only now. A post recorded optimistically would trade a duplicate for
+        # a drop, which is the wrong way round.
+        CONVERSATIONS.mark_posted(conv.key, message_id)
     return thread_url(thread.id)
 
 
@@ -1002,15 +1025,9 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
             agent=mail['from'],
             message_id=message_id,
         )
-        if CONVERSATIONS.was_posted(key, message_id):
-            # A redelivery: the DM failed last time, or we died between the
-            # thread send and the commit. The thread already holds this mail —
-            # posting it again is the one duplicate we can actually prevent.
-            url = thread_url(conv.thread_id) if conv.thread_id is not None else ''
-        else:
-            url = await post_to_thread(conv, mail)
-            if url:
-                CONVERSATIONS.mark_posted(key, message_id)
+        # Idempotent in `message_id`: a redelivery gets the thread's URL, not a
+        # second copy in the thread.
+        url = await post_to_thread(conv, mail, message_id=message_id)
     else:
         # No threads, no thread map. Recording every mail here would rewrite the
         # conversation file on each delivery for a feature that is switched off.
@@ -1150,6 +1167,11 @@ async def watch_agent_mailbox(channel_entry: dict):
                     print(f"agent-mail send failed for {agent}/{fname}, "
                           f"will retry: {e}", file=sys.stderr)
                     continue
+                # Only once it has landed. A crash in the window between the
+                # send and this line re-posts the mail to the channel on
+                # restart: the same at-least-once trade the DM makes, and for
+                # the same reason. There is no conversation thread here to
+                # dedupe against, and no idempotency key Discord will honour.
                 watcher.commit(fname)
         except Exception as e:
             print(f"watch_agent_mailbox({agent}) loop error: {e}",
@@ -1807,7 +1829,10 @@ def handle_command(text: str) -> str:
         return f"✓ quiet hours: disabled. (window {state['start']}–{state['end']} preserved for next enable)"
 
     if low == 'settings':
-        subjects = {c.key: f'**{c.agent}** — {c.subject}' for c in CONVERSATIONS.values()}
+        # Only the muted conversations get labelled; `summary()` looks up no
+        # others, and the store holds up to DEFAULT_MAX_CONVERSATIONS of them.
+        subjects = {key: conversation_label(CONVERSATIONS.get(key))
+                    for key in SETTINGS.muted if CONVERSATIONS.get(key)}
         out = render_settings(SETTINGS.summary(subjects))
         if not THREADS_ENABLED:
             out += '\n• Threads: `off` (set BRIDGET_LOG_CHANNEL_ID to enable)'
@@ -1989,7 +2014,7 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
 def recent_conversations(limit: int = 5) -> list:
     """(label, key) for the most recently active conversations, newest first."""
     convs = sorted(CONVERSATIONS.values(), key=lambda c: c.updated_at, reverse=True)
-    return [(f'**{c.agent}** — {c.subject}', c.key) for c in convs[:limit]]
+    return [(conversation_label(c), c.key) for c in convs[:limit]]
 
 
 def handle_channel_message(text: str, channel_entry: dict) -> str:

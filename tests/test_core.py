@@ -895,19 +895,49 @@ class TestMaildirWatcher(unittest.TestCase):
 
     def test_unreadable_mail_is_skipped_not_retried_forever(self):
         """A non-vanish OSError (EACCES/EIO) left the file in new/ and unseen,
-        so every poll re-read and re-logged it."""
+        so every poll re-read and re-logged it. It is retried a bounded number
+        of times — the fault may be transient — and then given up on."""
+        from bridget_core.mailbox import MAX_READ_ATTEMPTS
         w = MaildirWatcher(self.new, self.seen_file)
         w.prime()
         p = self.write_mail('9')
         p.chmod(0o000)
         try:
-            first = w.poll()
-            second = w.poll()
+            for attempt in range(MAX_READ_ATTEMPTS):
+                self.assertEqual(w.poll(), [])
+                if attempt < MAX_READ_ATTEMPTS - 1:
+                    self.assertNotIn('9', w.seen, 'gave up on the first bad read')
+            self.assertEqual(w.poll(), [], 'unreadable mail was retried in a hot loop')
         finally:
             p.chmod(0o644)
-        self.assertEqual(first, [])
-        self.assertEqual(second, [], 'unreadable mail was retried in a hot loop')
         self.assertIn('9', w.seen)
+
+    def test_a_transient_read_error_does_not_lose_the_mail(self):
+        """The invariant is "never drop mail". One bad read on a network
+        filesystem must not mark a healthy mail seen forever."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        p = self.write_mail('9', msg_id='id-9')
+        p.chmod(0o000)
+        try:
+            self.assertEqual(w.poll(), [])
+        finally:
+            p.chmod(0o644)
+        self.assertNotIn('9', w.seen)
+        got = w.poll()
+        self.assertEqual([n for n, _ in got], ['9'], 'a healthy mail was lost to one bad read')
+        self.assertEqual(got[0][1]['message_id'], 'id-9')
+
+    def test_the_failure_count_resets_after_a_good_read(self):
+        from bridget_core.mailbox import MAX_READ_ATTEMPTS
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        p = self.write_mail('9')
+        for _ in range(MAX_READ_ATTEMPTS - 1):
+            p.chmod(0o000)
+            self.assertEqual(w.poll(), [])
+            p.chmod(0o644)
+            self.assertEqual(len(w.poll()), 1, 'a good read must clear the failure count')
 
     def test_vanished_mail_is_not_marked_seen(self):
         """macguffin moved it to cur/ between listing and reading. It is gone

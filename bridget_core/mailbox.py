@@ -39,6 +39,12 @@ from .mail import parse_mail
 from .statefile import write_state
 
 
+#: How many consecutive polls a file may fail to *read* before we conclude the
+#: fault is permanent and stop retrying it. In-memory only: a restart re-tries,
+#: which is the right call — the restart may be what fixed the filesystem.
+MAX_READ_ATTEMPTS = 3
+
+
 class MaildirWatcher:
     """Observe-only scanner over one maildir `new/` directory.
 
@@ -50,8 +56,10 @@ class MaildirWatcher:
         for filename, mail in w.poll():
             if deliver(mail):
                 w.commit(filename)   # only now is it safe to forget
-            else:
-                w.unsee(filename)
+
+    A delivery that fails needs no cleanup: the mail was never marked seen, so
+    the next poll returns it again. `unsee()` is for the rarer case of a mail
+    already committed that the caller has decided to redeliver.
     """
 
     def __init__(self, mail_dir: Path, seen_file: Path, *, gc_threshold: int = 5000):
@@ -59,6 +67,9 @@ class MaildirWatcher:
         self.seen_file = Path(seen_file)
         self.gc_threshold = gc_threshold
         self.seen: set[str] = self._load_seen()
+        #: filename -> consecutive read failures. Not persisted; see
+        #: MAX_READ_ATTEMPTS.
+        self._read_failures: dict[str, int] = {}
 
     # -- seen-set persistence ---------------------------------------------
 
@@ -170,9 +181,20 @@ class MaildirWatcher:
                 continue
             except OSError as e:
                 # A real IO problem — EACCES, EIO — and the file is still there.
-                # Marking it seen is the only way to avoid re-reading, and
-                # re-logging, the same broken file on every single poll forever.
-                print(f'maildir read error ({name}), skipping: {e}', file=sys.stderr)
+                # It may be transient (a network filesystem hiccup, a backup
+                # window) or permanent (a corrupt inode). We cannot tell them
+                # apart from one read, so we retry a few polls before giving up:
+                # marking a healthy mail seen on one bad read would lose it
+                # forever, and never marking it seen re-logs the same broken
+                # file on every poll until the end of time.
+                self._read_failures[name] = self._read_failures.get(name, 0) + 1
+                attempts = self._read_failures[name]
+                if attempts < MAX_READ_ATTEMPTS:
+                    print(f'maildir read error ({name}), attempt {attempts} of '
+                          f'{MAX_READ_ATTEMPTS}, will retry: {e}', file=sys.stderr)
+                    continue
+                print(f'maildir read error ({name}), giving up after '
+                      f'{attempts} attempts: {e}', file=sys.stderr)
                 self.seen.add(name)
                 undeliverable = True
                 continue
@@ -181,6 +203,7 @@ class MaildirWatcher:
                 self.seen.add(name)
                 undeliverable = True
                 continue
+            self._read_failures.pop(name, None)
             out.append((name, mail))
         if undeliverable:
             self.save_seen(present=present)

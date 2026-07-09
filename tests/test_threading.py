@@ -391,6 +391,24 @@ class TestRenderSettings(unittest.TestCase):
         out = self.b.render_settings(self.b.SETTINGS.summary({'k1': 'design review'}))
         self.assertIn('design review', out)
 
+    def test_only_muted_conversations_are_labelled(self):
+        """`summary()` looks up labels for muted keys only; the store may hold
+        thousands of conversations."""
+        b = self.b
+        b.CONVERSATIONS.record('k1', subject='muted one', agent='mayor')
+        b.CONVERSATIONS.record('k2', subject='not muted', agent='pm')
+        b.SETTINGS.mute('k1')
+        out = b.render_settings(b.SETTINGS.summary(
+            {k: b.conversation_label(b.CONVERSATIONS.get(k))
+             for k in b.SETTINGS.muted if b.CONVERSATIONS.get(k)}))
+        self.assertIn('muted one', out)
+        self.assertNotIn('not muted', out)
+
+    def test_a_muted_conversation_the_store_forgot_falls_back_to_its_key(self):
+        self.b.SETTINGS.mute('gone')
+        out = self.b.render_settings(self.b.SETTINGS.summary({}))
+        self.assertIn('gone', out)
+
     def test_the_muted_list_is_capped_by_the_adapter(self):
         for i in range(15):
             self.b.SETTINGS.mute(f'k{i:02d}')
@@ -430,6 +448,17 @@ class TestCodeFenceIsInescapable(unittest.TestCase):
     def test_one_and_two_backticks_are_left_alone(self):
         """Inline code inside a block is literal; only 3+ opens a fence."""
         self.assertEqual(self.b.defuse_fences('a `x` and ``y``'), 'a `x` and ``y``')
+
+    def test_a_subject_containing_a_fence_cannot_open_one(self):
+        """The header sits *outside* the code block, so a ``` in the subject
+        opens a fence rather than closing ours. Defusing the body is not enough."""
+        card = self.b.format_mail_card(mail(subject='fix the ```make``` target'))
+        self.assertEqual(len(self._fences(card)), 2)
+        self.assertTrue(card.rstrip().endswith('```'))
+
+    def test_a_sender_name_containing_a_fence_cannot_open_one(self):
+        card = self.b.format_mail_card(mail(sender='```evil```'))
+        self.assertEqual(len(self._fences(card)), 2)
 
     def test_truncation_never_severs_the_closing_fence(self):
         card = self.b.format_mail_card(mail(body='x' * 50_000))
@@ -740,6 +769,48 @@ class TestNoDoublePostOnRedelivery(unittest.IsolatedAsyncioTestCase):
         await b.deliver_mail(FakeUser(), 'f1', m)   # delivered, never committed
         await b.deliver_mail(FakeUser(), 'f1', m)   # replayed after the crash
         self.assertEqual(len(channel.threads[0].sent), 1)
+
+    async def test_a_redelivery_re_roots_a_thread_the_human_deleted(self):
+        """The guard is consulted after resolve_thread, not before. Skipping the
+        post because we once put this mail in a thread that no longer exists
+        would lose it from the durable record entirely."""
+        b, channel = await self._threaded()
+
+        class Failing(FakeUser):
+            async def send(self, content):
+                raise FakeHTTPException('429')
+
+        m = mail(msg_id='id-1')
+        await b.deliver_mail(Failing(), 'f1', m)
+        old_thread = channel.threads[0]
+        self.assertEqual(len(old_thread.sent), 1)
+
+        # The human deletes the thread; Discord 404s on fetch.
+        del b.client.channels[old_thread.id]
+
+        user = FakeUser()
+        self.assertTrue(await b.deliver_mail(user, 'f1', m))
+        self.assertEqual(len(channel.threads), 2, 'the deleted thread was not re-rooted')
+        new_thread = channel.threads[1]
+        self.assertEqual(len(new_thread.sent), 1, 'the mail never reached the new thread')
+        self.assertIn(f'/{new_thread.id}', user.sent[0])
+
+    async def test_re_rooting_clears_the_posted_set(self):
+        b, channel = await self._threaded()
+        m = mail(msg_id='id-1')
+        await b.deliver_mail(FakeUser(), 'f1', m)
+        self.assertTrue(b.CONVERSATIONS.was_posted('id-1', 'id-1'))
+        b.CONVERSATIONS.bind_thread('id-1', 999999)
+        self.assertFalse(b.CONVERSATIONS.was_posted('id-1', 'id-1'),
+                         'a new thread inherited the old thread posted-set')
+
+    async def test_rebinding_the_same_thread_id_keeps_the_posted_set(self):
+        b, channel = await self._threaded()
+        m = mail(msg_id='id-1')
+        await b.deliver_mail(FakeUser(), 'f1', m)
+        tid = channel.threads[0].id
+        b.CONVERSATIONS.bind_thread('id-1', tid)
+        self.assertTrue(b.CONVERSATIONS.was_posted('id-1', 'id-1'))
 
     async def test_a_failed_thread_post_is_retried_not_skipped(self):
         """`mark_posted` runs only on success. A post recorded optimistically

@@ -108,7 +108,11 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   conversation store tracks which messages it has already rendered. The DM
   itself is not deduplicated — Discord offers no idempotency key — so the trade
   is explicit: a duplicate DM is recoverable by reading it twice, a lost mail is
-  not.
+  not. In the same spirit, a mail that fails to *read* (an EIO or EACCES from a
+  network filesystem) is now retried across a few polls before the watcher gives
+  up on it, rather than being marked seen — and so lost — on the first bad read.
+  And a redelivery whose thread the human has since deleted re-roots the thread
+  and posts there, instead of trusting a record about a thread that is gone.
 - **A code block cannot be escaped by the text inside it.** A mail body
   containing a triple backtick closed bridget's code fence early, and the
   remainder rendered as raw markdown. Agents post code constantly, so this was

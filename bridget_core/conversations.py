@@ -271,6 +271,10 @@ class ConversationStore:
             return
         conv.posted_ids.append(message_id)
         if len(conv.posted_ids) > MAX_MESSAGE_IDS:
+            # Bounded like `message_ids`. Eviction can only ever cost a duplicate
+            # post — never a lost mail — which is the safe direction, and it
+            # takes more than MAX_MESSAGE_IDS undelivered mails in one
+            # conversation to reach.
             conv.posted_ids = conv.posted_ids[-MAX_MESSAGE_IDS:]
         self.save()
 
@@ -281,6 +285,12 @@ class ConversationStore:
             return None
         if conv.thread_id is not None and conv.thread_id != thread_id:
             self._by_thread.pop(conv.thread_id, None)
+            # Re-rooting onto a different thread — the old one was deleted. The
+            # new thread holds nothing, so everything posted into the old one is
+            # gone with it and a redelivery must be free to post again. Without
+            # this, `was_posted` would suppress the repost on the strength of a
+            # record about a thread that no longer exists.
+            conv.posted_ids.clear()
         conv.thread_id = thread_id
         conv.updated_at = self._clock()
         self._by_thread[thread_id] = key
