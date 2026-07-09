@@ -988,9 +988,38 @@ class TestReplyInConversation(unittest.TestCase):
         self.assertIn('--subject=Re: design review', args)
         self.assertIn('--body=looks good', args)
 
-    def test_multiline_reply_splits_subject_and_body(self):
+    def test_multiline_reply_keeps_the_conversation_subject(self):
+        """A4, decided. This previously sent `--subject=ship it --body=after CI
+        passes`, mirroring the `mail` verb's first-line-is-the-subject
+        convention. In a thread the subject is already known and the human is
+        replying, not composing: every line is body, and the subject continues
+        the conversation."""
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
             self.b.reply_in_conversation('ship it\nafter CI passes', self.conv)
+        args = run.call_args[0][0]
+        self.assertIn('--subject=Re: design review', args)
+        self.assertIn('--body=ship it\nafter CI passes', args)
+
+    def test_a_reply_never_stacks_re_prefixes(self):
+        """`conv.subject` has had its `Re:` stripped by thread_title."""
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
+            self.b.reply_in_conversation('ok', self.conv)
+        subject = next(a for a in run.call_args[0][0] if a.startswith('--subject='))
+        self.assertEqual(subject, '--subject=Re: design review')
+
+    def test_an_unnamed_conversation_still_gets_a_subject(self):
+        """mg refuses a blank --subject."""
+        self.b.CONVERSATIONS.record('id-9', subject='', agent='mayor')
+        conv = self.b.CONVERSATIONS.get('id-9')
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
+            self.b.reply_in_conversation('hi', conv)
+        self.assertIn('--subject=Re: mail from mayor', run.call_args[0][0])
+
+    def test_the_mail_verb_still_splits_subject_from_body(self):
+        """A4 is scoped to in-thread replies. Composing a fresh mail in a mapped
+        channel still takes its subject from the first line."""
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
+            self.b.send_channel_chat_mail('ship it\nafter CI passes', 'mayor')
         args = run.call_args[0][0]
         self.assertIn('--subject=ship it', args)
         self.assertIn('--body=after CI passes', args)

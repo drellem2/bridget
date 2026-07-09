@@ -237,6 +237,13 @@ anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
 Type into a thread and bridget mails it back to the agent on the other end,
 threading the reply onto the conversation with `mg mail send --in-reply-to`.
 
+**Everything you type is body.** The reply goes out under
+`Re: <conversation subject>`, however many lines you wrote. This differs from
+the `mail` verb, which takes your first line as the subject — there you are
+composing and have to name the thing; in a thread the subject is already known,
+and taking your first sentence for it would break the agent's subject continuity
+and read as a non-sequitur in its inbox.
+
 Inside a thread, what you type is a **reply** unless it is unmistakably a
 command: a workflow verb carrying an mg-id (`approve mg-1234`, `read mg-abcd`),
 or an `idea:` / `bug:` prefix. Bare words are not commands there — "status is

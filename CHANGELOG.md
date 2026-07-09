@@ -69,11 +69,21 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
   A consequence worth stating plainly: **conversation identity no longer depends
   on the subject line.** Nothing keys on it. A reply whose first line becomes the
-  outbound subject (the multi-line-reply behaviour) cannot move a message out of
-  its conversation, so that behaviour is now purely cosmetic and can be changed
-  or left alone on its own merits.
+  outbound subject could not have moved a message out of its conversation. That
+  made the multi-line-reply behaviour purely cosmetic, and free to decide on its
+  own merits — see "a multi-line reply in a thread" under Changed.
 
 ### Changed
+
+- **A multi-line reply in a thread keeps the conversation's subject.** Typing
+  two lines into a thread used to send the first as `--subject` and the rest as
+  `--body`, mirroring the `mail` verb. Both lines are now body, and the subject
+  is always `Re: <conversation subject>`. Composing and replying are different
+  acts: a new mail needs a subject and the human supplies it; a thread reply
+  does not, because the subject is on the thread they are looking at. The old
+  behaviour broke subject continuity for the agent and put the human's first
+  sentence in its inbox as a non-sequitur. `send_channel_chat_mail` — free-form
+  text in a mapped channel, where the human *is* composing — still splits.
 
 - `install.sh` now tightens `~/.pogo/bridget.env` to `600` on every run, not
   only the run that created it. bridget warns at startup if it is readable

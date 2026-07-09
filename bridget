@@ -1912,6 +1912,15 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
     back into the conversation. The agent answers our message, so its reply
     names our id and no other; a conversation that forgot what it said could not
     recognize the answer, and would root a second thread for it.
+
+    Every line the human types is body, and the subject is always
+    `Re: <conversation subject>` (A4). The `mail` verb splits the first line off
+    as a subject, and this used to mirror it — but the two are different acts.
+    Composing a new mail needs a subject, so the human supplies one. Replying
+    inside a thread does not: the subject is already known, it is on the thread
+    they are looking at, and taking their first sentence for it both breaks
+    subject continuity for the agent and reads as a non-sequitur in its inbox.
+    `send_channel_chat_mail` still splits, because there the human is composing.
     """
     text = text.strip()
     if not text:
@@ -1920,11 +1929,11 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
         return acks.undeliverable(
             'this conversation has no known sender to reply to', agent=conv.agent)
 
-    if '\n' in text:
-        subject, body = text.split('\n', 1)
-        subject, body = subject.strip(), body.rstrip()
-    else:
-        subject, body = f'Re: {conv.subject}', text
+    # `conv.subject` has already had any `Re:` stripped by `thread_title`, so
+    # this cannot stack up. An unnamed conversation is named after its agent —
+    # mg refuses a blank --subject.
+    body = text
+    subject = f'Re: {conv.subject or f"mail from {conv.agent}"}'
 
     # The seam. Threading needs both a known parent id and an mg that speaks
     # --in-reply-to; missing either, the reply still goes out, just untethered.
