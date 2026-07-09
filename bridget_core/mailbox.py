@@ -11,6 +11,10 @@ this module makes against the maildir are `iterdir()` and `read_text()`.
 De-duplication therefore cannot rely on the directory: a message stays in
 `new/` after we deliver it. Instead each watcher keeps a seen-set of maildir
 filenames, persisted so a restart does not re-deliver the entire backlog.
+
+The seen-set is written *after* the caller confirms delivery, never before —
+see `MaildirWatcher.poll`. Delivery is at-least-once by construction, and the
+adapter is responsible for making a redelivery idempotent.
 """
 from __future__ import annotations
 
@@ -30,7 +34,10 @@ class MaildirWatcher:
         if not w.primed:
             w.prime()          # first run: adopt the backlog, don't replay it
         for filename, mail in w.poll():
-            deliver(mail)
+            if deliver(mail):
+                w.commit(filename)   # only now is it safe to forget
+            else:
+                w.unsee(filename)
     """
 
     def __init__(self, mail_dir: Path, seen_file: Path, *, gc_threshold: int = 5000):
@@ -109,18 +116,38 @@ class MaildirWatcher:
     def poll(self) -> list[tuple[str, dict]]:
         """Return `(filename, mail)` for each message not yet seen, oldest first.
 
-        Marks each returned message seen *before* returning it, and persists the
-        set. A message that fails to parse is marked seen and skipped rather
-        than retried forever.
+        **A returned message is not yet seen.** `poll` hands the caller a
+        message and makes no record of having done so; the caller marks it seen
+        by calling `commit()` once delivery has actually succeeded.
 
-        Note the ordering contract with the caller: because we mark seen here, a
-        delivery that fails after `poll()` returns is not retried unless the
-        caller says so. Callers that want at-least-once delivery — every caller
-        in this repo does — must call `unsee()` when a send fails.
+        That ordering is the whole at-least-once guarantee. Marking a message
+        seen before the caller delivers it opens a window — between the seen-set
+        hitting the disk and the mail hitting the chat surface — in which a hard
+        crash (SIGKILL, OOM, power loss) loses the mail forever: it is seen on
+        restart, so it is never re-read, and it is still sitting unread in
+        `new/`, so nothing else will ever surface it. `unsee()` cannot close that
+        window, because a killed process does not get to run `unsee()`. On a tool
+        whose invariant is "never drop mail on the floor", a window that small is
+        still a window.
+
+        Crashing *after* delivery but before `commit()` redelivers the message
+        instead. That is the trade this method makes deliberately: a duplicate is
+        recoverable by a human reading it twice, a drop is not. The adapter takes
+        the other half of the deal — `ConversationStore.was_posted` keeps a
+        redelivery from posting into the conversation thread twice.
+
+        A message that cannot be parsed or read *is* marked seen here, and the
+        seen-set persisted: it is never going to be delivered, so nothing will
+        ever commit it, and without this it would be re-read and re-logged on
+        every poll forever.
+
+        Callers must not poll again with a batch still in flight — the in-flight
+        messages are not yet in the seen-set and would be handed out twice.
         """
         present = self._filenames()
         fresh = sorted(present - self.seen)
         out: list[tuple[str, dict]] = []
+        undeliverable = False
         for name in fresh:
             path = self.mail_dir / name
             try:
@@ -136,22 +163,35 @@ class MaildirWatcher:
                 # re-logging, the same broken file on every single poll forever.
                 print(f'maildir read error ({name}), skipping: {e}', file=sys.stderr)
                 self.seen.add(name)
+                undeliverable = True
                 continue
             except Exception as e:
                 print(f'maildir parse error ({name}): {e}', file=sys.stderr)
                 self.seen.add(name)
+                undeliverable = True
                 continue
-            self.seen.add(name)
             out.append((name, mail))
-        if fresh:
+        if undeliverable:
             self.save_seen(present=present)
         return out
+
+    def commit(self, filename: str) -> None:
+        """Mark a delivered message seen, and persist that.
+
+        Call this only once the mail has reached the human. Everything before
+        this point is replayable; nothing after it is.
+        """
+        if filename not in self.seen:
+            self.seen.add(filename)
+            self.save_seen()
 
     def unsee(self, filename: str) -> None:
         """Forget a filename so the next `poll()` returns it again.
 
-        For callers that want at-least-once delivery: call this when the send
-        failed for a retryable reason.
+        Since `poll()` no longer marks a message seen, this is only load-bearing
+        for a message already committed — a delivery the caller has decided to
+        retry after the fact. For the ordinary "the send failed, try next poll"
+        path it is a no-op, and correct as one: the message was never seen.
         """
         if filename in self.seen:
             self.seen.discard(filename)

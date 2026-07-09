@@ -36,6 +36,7 @@ from bridget_core import (  # noqa: E402
     undeliverable,
 )
 from bridget_core.acks import AMBIGUOUS, DELIVERED, UNDELIVERABLE  # noqa: E402
+from bridget_core.conversations import MAX_MESSAGE_IDS  # noqa: E402
 from bridget_core.mail import (  # noqa: E402
     correlation_candidates,
     reply_target,
@@ -322,9 +323,64 @@ class TestConversationStore(unittest.TestCase):
         store = ConversationStore(self.path)
         store.record('k1', subject='s', agent='mayor', message_id='m1')
         raw = json.loads(self.path.read_text())
-        self.assertEqual(raw['version'], 1)
+        self.assertEqual(raw['version'], 2)
         self.assertIn('k1', raw['conversations'])
         self.assertNotIn('key', raw['conversations']['k1'])
+
+
+class TestPostedGuard(unittest.TestCase):
+    """A1. Delivery is at-least-once, so a mail can arrive at the adapter
+    twice. `posted_ids` is what stops the second arrival duplicating the
+    thread post."""
+
+    def setUp(self):
+        self.path = tmpdir('bridget-posted-') / 'conversations.json'
+        self.store = ConversationStore(self.path)
+        self.store.record('k1', subject='s', agent='mayor', message_id='m1')
+
+    def test_a_recorded_message_is_not_yet_posted(self):
+        """Recording folds an id into the conversation index. It says nothing
+        about whether the adapter managed to render it."""
+        self.assertFalse(self.store.was_posted('k1', 'm1'))
+
+    def test_mark_posted_then_was_posted(self):
+        self.store.mark_posted('k1', 'm1')
+        self.assertTrue(self.store.was_posted('k1', 'm1'))
+
+    def test_posted_state_survives_restart(self):
+        self.store.mark_posted('k1', 'm1')
+        self.assertTrue(ConversationStore(self.path).was_posted('k1', 'm1'))
+
+    def test_a_v1_file_loads_with_no_posted_ids(self):
+        self.path.write_text(json.dumps({
+            'version': 1,
+            'conversations': {'k9': {'thread_id': 5, 'subject': 's', 'agent': 'a',
+                                     'last_message_id': 'm9', 'message_ids': ['m9'],
+                                     'updated_at': ''}},
+        }))
+        store = ConversationStore(self.path)
+        self.assertEqual(store.get('k9').posted_ids, [])
+        self.assertFalse(store.was_posted('k9', 'm9'))
+
+    def test_mark_posted_is_idempotent(self):
+        self.store.mark_posted('k1', 'm1')
+        self.store.mark_posted('k1', 'm1')
+        self.assertEqual(self.store.get('k1').posted_ids, ['m1'])
+
+    def test_mark_posted_on_an_unknown_conversation_is_a_noop(self):
+        self.store.mark_posted('nope', 'm1')
+        self.assertFalse(self.store.was_posted('nope', 'm1'))
+
+    def test_an_empty_message_id_is_never_posted(self):
+        self.store.mark_posted('k1', '')
+        self.assertFalse(self.store.was_posted('k1', ''))
+
+    def test_posted_ids_are_bounded(self):
+        for i in range(MAX_MESSAGE_IDS + 10):
+            self.store.mark_posted('k1', f'p{i}')
+        conv = self.store.get('k1')
+        self.assertEqual(len(conv.posted_ids), MAX_MESSAGE_IDS)
+        self.assertEqual(conv.posted_ids[-1], f'p{MAX_MESSAGE_IDS + 9}')
 
 
 class TestConversationStoreResolve(unittest.TestCase):
@@ -543,13 +599,14 @@ class TestMaildirWatcher(unittest.TestCase):
         self.assertEqual(w.poll(), [])
         self.assertTrue(w.primed)
 
-    def test_poll_returns_new_mail_once(self):
+    def test_poll_returns_new_mail_once_it_is_committed(self):
         w = MaildirWatcher(self.new, self.seen_file)
         w.prime()
         self.write_mail('3', msg_id='id-3')
         got = w.poll()
         self.assertEqual([n for n, _ in got], ['3'])
         self.assertEqual(got[0][1]['message_id'], 'id-3')
+        w.commit('3')
         self.assertEqual(w.poll(), [])
 
     def test_poll_is_ordered_oldest_first(self):
@@ -573,8 +630,64 @@ class TestMaildirWatcher(unittest.TestCase):
         w.prime()
         self.write_mail('7')
         w.poll()
+        w.commit('7')
         reborn = MaildirWatcher(self.new, self.seen_file)
         self.assertEqual(reborn.poll(), [], 'restart re-delivered the backlog')
+
+    # -- A7: the at-most-once crash window ---------------------------------
+    #
+    # `unsee()` covers a graceful send failure. It structurally cannot cover a
+    # SIGKILL between "seen-set hits the disk" and "mail hits the chat" — a
+    # killed process does not get to run `unsee()`. These pin the ordering that
+    # closes that window: nothing is persisted until the caller commits.
+
+    def test_poll_does_not_persist_the_seen_set(self):
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        self.write_mail('9')
+        w.poll()
+        self.assertNotIn('9', self.seen_file.read_text().split())
+
+    def test_a_crash_between_poll_and_delivery_redelivers(self):
+        """The whole point of A7. Before the fix this mail was seen forever."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        self.write_mail('9', msg_id='id-9')
+        self.assertEqual([n for n, _ in w.poll()], ['9'])
+        # SIGKILL here: no commit, no unsee, no graceful anything.
+        reborn = MaildirWatcher(self.new, self.seen_file)
+        self.assertEqual([n for n, _ in reborn.poll()], ['9'],
+                         'a mail polled but never delivered was lost')
+
+    def test_committing_one_mail_does_not_commit_the_rest_of_the_batch(self):
+        """A batch is committed per-message. Persisting the whole batch when the
+        first one lands would strand the tail on a crash mid-batch."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        for n in ('1', '2', '3'):
+            self.write_mail(n)
+        self.assertEqual([n for n, _ in w.poll()], ['1', '2', '3'])
+        w.commit('1')
+        reborn = MaildirWatcher(self.new, self.seen_file)
+        self.assertEqual([n for n, _ in reborn.poll()], ['2', '3'])
+
+    def test_an_unparseable_mail_is_persisted_immediately(self):
+        """Nothing will ever commit it — it is not deliverable. Without an
+        eager persist it would be re-read and re-logged on every poll forever."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        (self.new / 'bad').write_bytes(b'\xff\xfe\x00 invalid utf-8')
+        w.poll()
+        self.assertIn('bad', self.seen_file.read_text().split())
+
+    def test_commit_is_idempotent(self):
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        self.write_mail('4')
+        w.poll()
+        w.commit('4')
+        w.commit('4')
+        self.assertEqual(self.seen_file.read_text().split().count('4'), 1)
 
     def test_unparseable_mail_is_skipped_not_retried(self):
         w = MaildirWatcher(self.new, self.seen_file)
@@ -593,12 +706,26 @@ class TestMaildirWatcher(unittest.TestCase):
         w = MaildirWatcher(self.new.parent / 'nope', self.seen_file)
         self.assertEqual(w.poll(), [])
 
-    def test_unsee_allows_retry_after_failed_send(self):
+    def test_unsee_allows_retry_after_a_committed_mail(self):
+        """Since poll() no longer marks a message seen, unsee() is only
+        load-bearing for a mail already committed — one the caller has decided
+        to redeliver after the fact."""
         w = MaildirWatcher(self.new, self.seen_file)
         w.prime()
         self.write_mail('9')
         self.assertEqual(len(w.poll()), 1)
+        w.commit('9')
+        self.assertEqual(w.poll(), [])
         w.unsee('9')
+        self.assertEqual([n for n, _ in w.poll()], ['9'])
+        self.assertNotIn('9', self.seen_file.read_text().split())
+
+    def test_unsee_of_an_uncommitted_mail_is_a_noop(self):
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        self.write_mail('9')
+        w.poll()
+        w.unsee('9')          # the ordinary failed-send path; nothing to undo
         self.assertEqual([n for n, _ in w.poll()], ['9'])
 
     def test_seen_set_never_forgets_mail_still_in_new(self):

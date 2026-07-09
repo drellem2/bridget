@@ -578,11 +578,90 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('discord.com/channels', user.sent[0])
 
 
+class TestNoDoublePostOnRedelivery(unittest.IsolatedAsyncioTestCase):
+    """A1. `post_to_thread` runs before `user.send`. When the DM fails the mail
+    is redelivered next poll — and, before the `posted_ids` guard, posted into
+    the thread a second time.
+
+    The suite's older at-least-once tests mock `deliver_mail` itself, so
+    `post_to_thread` never runs and the duplicate never shows up. These drive
+    the real thing."""
+
+    async def _threaded(self):
+        b = load_threaded()
+        channel = FakeTextChannel(555, client=b.client)
+        b.client.channels[555] = channel
+        return b, channel
+
+    async def test_a_failed_dm_then_a_retry_posts_to_the_thread_once(self):
+        b, channel = await self._threaded()
+
+        class Failing(FakeUser):
+            async def send(self, content):
+                raise FakeHTTPException('429 rate limited')
+
+        m = mail(msg_id='id-1')
+        self.assertFalse(await b.deliver_mail(Failing(), 'f1', m))
+        self.assertEqual(len(channel.threads), 1)
+        self.assertEqual(len(channel.threads[0].sent), 1)
+
+        # The retry. The thread already holds this mail.
+        user = FakeUser()
+        self.assertTrue(await b.deliver_mail(user, 'f1', m))
+        self.assertEqual(len(channel.threads), 1, 'the retry rooted a second thread')
+        self.assertEqual(len(channel.threads[0].sent), 1,
+                         'the retry posted the same mail into the thread twice')
+        self.assertEqual(len(user.sent), 1, 'the retry never reached the DM')
+
+    async def test_the_retry_still_carries_the_thread_link(self):
+        """The guard short-circuits the post; it must not lose the URL that
+        tells the human where their mail landed."""
+        b, channel = await self._threaded()
+
+        class Failing(FakeUser):
+            async def send(self, content):
+                raise FakeHTTPException('503')
+
+        m = mail(msg_id='id-1')
+        await b.deliver_mail(Failing(), 'f1', m)
+        user = FakeUser()
+        await b.deliver_mail(user, 'f1', m)
+        self.assertIn(f'/{channel.threads[0].id}', user.sent[0])
+
+    async def test_a_crash_before_commit_redelivers_without_duplicating(self):
+        """The A1+A7 pair, together. The watcher redelivers (A7); the store
+        keeps the redelivery out of the thread (A1)."""
+        b, channel = await self._threaded()
+        m = mail(msg_id='id-1')
+        await b.deliver_mail(FakeUser(), 'f1', m)   # delivered, never committed
+        await b.deliver_mail(FakeUser(), 'f1', m)   # replayed after the crash
+        self.assertEqual(len(channel.threads[0].sent), 1)
+
+    async def test_a_failed_thread_post_is_retried_not_skipped(self):
+        """`mark_posted` runs only on success. A post recorded optimistically
+        would trade a duplicate for a drop, which is the wrong way round."""
+        b, channel = await self._threaded()
+        m = mail(msg_id='id-1')
+
+        with mock.patch.object(b, 'post_to_thread', new=mock.AsyncMock(return_value='')):
+            self.assertTrue(await b.deliver_mail(FakeUser(), 'f1', m))
+        self.assertFalse(b.CONVERSATIONS.was_posted('id-1', 'id-1'))
+
+        await b.deliver_mail(FakeUser(), 'f1', m)
+        self.assertEqual(len(channel.threads[0].sent), 1, 'the thread post was never retried')
+
+    async def test_a_distinct_mail_in_the_same_conversation_still_posts(self):
+        b, channel = await self._threaded()
+        await b.deliver_mail(FakeUser(), 'f1', mail(msg_id='id-1'))
+        await b.deliver_mail(FakeUser(), 'f2', mail(msg_id='id-2', in_reply_to='id-1'))
+        self.assertEqual(len(channel.threads), 1)
+        self.assertEqual(len(channel.threads[0].sent), 2)
+
+
 class TestAtLeastOnceDelivery(unittest.IsolatedAsyncioTestCase):
-    """poll() marks mail seen before delivery, so every send-failure path must
-    unsee it. Otherwise a transient Discord 429/5xx silently eats the mail —
-    which is a regression from the pre-threading code, where the seen-set was
-    only updated after a successful send."""
+    """`poll()` hands out mail without marking it seen; the watcher commits only
+    after a send lands. A transient Discord 429/5xx must therefore leave the
+    mail uncommitted so the next poll returns it again."""
 
     async def test_dm_send_failure_reports_false_so_the_caller_can_retry(self):
         b = load_bridget()
@@ -606,7 +685,7 @@ class TestAtLeastOnceDelivery(unittest.IsolatedAsyncioTestCase):
         ok = await b.deliver_mail(FakeUser(), 'f1', mail(subject='FYI', msg_id='id-1'))
         self.assertTrue(ok)
 
-    async def test_failed_dm_is_unseen_and_redelivered_next_poll(self):
+    async def test_failed_dm_is_uncommitted_and_redelivered_next_poll(self):
         b = load_bridget()
         sent = []
         attempts = {'n': 0}
@@ -631,10 +710,11 @@ class TestAtLeastOnceDelivery(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
             await b.watch_mailbox(FakeUser())
 
-        watcher.unsee.assert_called_once_with('f1')
+        # The failed attempt commits nothing; only the successful retry does.
+        watcher.commit.assert_called_once_with('f1')
         self.assertEqual(sent, ['f1'], 'mail was not retried after a failed send')
 
-    async def test_exception_during_delivery_also_unsees(self):
+    async def test_exception_during_delivery_commits_nothing(self):
         b = load_bridget()
         watcher = mock.MagicMock()
         watcher.primed = True
@@ -648,7 +728,22 @@ class TestAtLeastOnceDelivery(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
             await b.watch_mailbox(FakeUser())
 
-        watcher.unsee.assert_called_once_with('f1')
+        watcher.commit.assert_not_called()
+
+    async def test_a_delivered_mail_is_committed(self):
+        b = load_bridget()
+        watcher = mock.MagicMock()
+        watcher.primed = True
+        watcher.poll.side_effect = [[('f1', mail(msg_id='id-1'))], []]
+        closed = iter([False, True, True])
+
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+
+        watcher.commit.assert_called_once_with('f1')
 
 
 class TestNeverConsumeUnsurfaceableMail(unittest.IsolatedAsyncioTestCase):

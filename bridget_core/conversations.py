@@ -32,7 +32,10 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+#: v2 added `posted_ids`. A v1 file loads cleanly — the field defaults to empty,
+#: which costs at most one duplicate post for a mail that was in flight across
+#: the upgrade.
+SCHEMA_VERSION = 2
 
 #: Conversations kept in the map. Oldest (by `updated_at`) are pruned first.
 #: Generous — an entry is a few hundred bytes, and forgetting a conversation
@@ -66,6 +69,10 @@ class Conversation:
     last_message_id: str = ''
     #: Maildir filenames folded into this conversation, newest last. Bounded.
     message_ids: list[str] = field(default_factory=list)
+    #: Ids the adapter has already rendered into the thread. Delivery is
+    #: at-least-once, so a mail can arrive here twice; this is what stops the
+    #: second arrival from posting a duplicate. A subset of `message_ids`.
+    posted_ids: list[str] = field(default_factory=list)
     updated_at: str = ''
 
     def to_json(self) -> dict:
@@ -138,6 +145,7 @@ class ConversationStore:
                 agent=value.get('agent', ''),
                 last_message_id=value.get('last_message_id', ''),
                 message_ids=list(value.get('message_ids', []) or []),
+                posted_ids=list(value.get('posted_ids', []) or []),
                 updated_at=value.get('updated_at', ''),
             )
             self._conversations[key] = conv
@@ -231,6 +239,28 @@ class ConversationStore:
         self._prune()
         self.save()
         return conv
+
+    def was_posted(self, key: str, message_id: str) -> bool:
+        """True if the adapter has already rendered `message_id` into `key`'s
+        thread. The guard against a redelivery posting the same mail twice."""
+        conv = self._conversations.get(key)
+        return bool(conv and message_id and message_id in conv.posted_ids)
+
+    def mark_posted(self, key: str, message_id: str) -> None:
+        """Record that `message_id` is now in `key`'s thread.
+
+        Call this *after* the post succeeds, never before: a post that failed
+        must be retried on the next poll, and a post recorded optimistically
+        would be skipped instead — trading a duplicate for a drop, which is the
+        wrong way round.
+        """
+        conv = self._conversations.get(key)
+        if conv is None or not message_id or message_id in conv.posted_ids:
+            return
+        conv.posted_ids.append(message_id)
+        if len(conv.posted_ids) > MAX_MESSAGE_IDS:
+            conv.posted_ids = conv.posted_ids[-MAX_MESSAGE_IDS:]
+        self.save()
 
     def bind_thread(self, key: str, thread_id) -> Conversation | None:
         """Attach an adapter thread handle to a conversation."""

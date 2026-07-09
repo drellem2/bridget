@@ -87,6 +87,10 @@ CREDIT_BALANCE_RE = re.compile(
 )
 
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
+
+#: Discord caps a thread name at 100 characters. The core does not know that —
+#: it renders a title to whatever length the adapter asks for.
+THREAD_TITLE_LIMIT = 90
 STATUS_OUTPUT_BUDGET = 1700
 
 UNRECOGNIZED_REPLY = "Unrecognized. Send `help` for the full command list."
@@ -880,9 +884,14 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     and quiet hours — a mail arriving at a bad hour is a smaller harm than a mail
     nobody ever sees.
 
-    Returns False if a *send* failed, so the caller can un-see the mail and retry
-    it on the next poll. A mail deliberately suppressed by policy returns True:
-    it was handled, not dropped.
+    Returns False if a *send* failed, so the caller leaves the mail uncommitted
+    and retries it on the next poll. A mail deliberately suppressed by policy
+    returns True: it was handled, not dropped.
+
+    Delivery is at-least-once (see `MaildirWatcher.poll`), so this function must
+    be idempotent per mail. Posting to the thread is guarded on `was_posted`;
+    the DM is not, because a duplicate DM is the acceptable half of the trade and
+    Discord gives us no idempotency key to dedupe on.
     """
     # Join the conversation any of this message's ancestors already belongs to;
     # only mint a fresh key when we recognize none of them. Probing first is
@@ -892,13 +901,22 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
            or conversation_key(mail, fallback=filename))
 
     if THREADS_ENABLED:
+        message_id = reply_target(mail, fallback=filename)
         conv = CONVERSATIONS.record(
             key,
-            subject=thread_title(mail),
+            subject=thread_title(mail, limit=THREAD_TITLE_LIMIT),
             agent=mail['from'],
-            message_id=reply_target(mail, fallback=filename),
+            message_id=message_id,
         )
-        url = await post_to_thread(conv, mail)
+        if CONVERSATIONS.was_posted(key, message_id):
+            # A redelivery: the DM failed last time, or we died between the
+            # thread send and the commit. The thread already holds this mail —
+            # posting it again is the one duplicate we can actually prevent.
+            url = thread_url(conv.thread_id) if conv.thread_id is not None else ''
+        else:
+            url = await post_to_thread(conv, mail)
+            if url:
+                CONVERSATIONS.mark_posted(key, message_id)
     else:
         # No threads, no thread map. Recording every mail here would rewrite the
         # conversation file on each delivery for a feature that is switched off.
@@ -964,16 +982,15 @@ async def watch_mailbox(user: discord.User):
             # it — leave it in the maildir and pick it up once we're audible.
             if THREADS_ENABLED or not dm_globally_suppressed():
                 for filename, mail in watcher.poll():
-                    # Isolate each mail. poll() has already marked the whole
-                    # batch seen, so letting one bad message abort the loop
-                    # would silently swallow every mail queued behind it.
+                    # Isolate each mail: one bad message must not abort the loop
+                    # and strand every mail queued behind it. A mail is only
+                    # committed — marked seen on disk — once it has landed.
                     try:
-                        if not await deliver_mail(user, filename, mail):
-                            watcher.unsee(filename)
+                        if await deliver_mail(user, filename, mail):
+                            watcher.commit(filename)
                     except Exception as e:
                         print(f"deliver failed for {filename}, will retry: {e}",
                               file=sys.stderr)
-                        watcher.unsee(filename)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)
@@ -1038,7 +1055,8 @@ async def watch_agent_mailbox(channel_entry: dict):
                 except discord.HTTPException as e:
                     print(f"agent-mail send failed for {agent}/{fname}, "
                           f"will retry: {e}", file=sys.stderr)
-                    watcher.unsee(fname)
+                    continue
+                watcher.commit(fname)
         except Exception as e:
             print(f"watch_agent_mailbox({agent}) loop error: {e}",
                   file=sys.stderr)
