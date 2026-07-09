@@ -33,10 +33,10 @@ class MaildirWatcher:
             deliver(mail)
     """
 
-    def __init__(self, mail_dir: Path, seen_file: Path, *, max_seen: int = 5000):
+    def __init__(self, mail_dir: Path, seen_file: Path, *, gc_threshold: int = 5000):
         self.mail_dir = Path(mail_dir)
         self.seen_file = Path(seen_file)
-        self.max_seen = max_seen
+        self.gc_threshold = gc_threshold
         self.seen: set[str] = self._load_seen()
 
     # -- seen-set persistence ---------------------------------------------
@@ -57,22 +57,30 @@ class MaildirWatcher:
             print(f'seen-set read error ({self.seen_file}): {e}', file=sys.stderr)
             return set()
 
-    def save_seen(self) -> None:
-        """Persist the seen-set atomically.
+    def save_seen(self, present: set[str] | None = None) -> None:
+        """Persist the seen-set atomically, garbage-collecting dead entries.
 
-        Bounded by `max_seen`: maildir filenames are monotonically increasing
-        (macguffin stamps them with nanosecond timestamps), so keeping the
-        lexicographically largest names keeps the newest. Dropping an old name
-        cannot cause a re-delivery, because the mail it refers to is older than
-        everything retained.
+        The seen-set may only forget a filename once that file has left `new/`
+        (i.e. `mg mail read` moved it to `cur/`). It can never be trimmed by
+        age: because we are observe-only, a delivered message *stays* in `new/`
+        forever until the human reads it, so dropping its name re-surfaces it as
+        new on the very next poll — and again every poll after that.
+
+        So the collection is by presence, not recency: `seen &= present`. That
+        bounds the set to the size of `new/`, which is the smallest it can
+        safely be. If `new/` itself holds more than `gc_threshold` unread
+        messages the set stays large, and correctly so.
         """
-        seen = self.seen
-        if len(seen) > self.max_seen:
-            seen = set(sorted(seen)[-self.max_seen:])
-            self.seen = seen
+        if len(self.seen) > self.gc_threshold:
+            if present is None:
+                present = self._filenames()
+            # Intersect, never truncate. A name whose file is still in new/ must
+            # be remembered or its mail gets delivered twice.
+            self.seen &= present
+
         self.seen_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.seen_file.parent / (self.seen_file.name + '.tmp')
-        tmp.write_text('\n'.join(sorted(seen)))
+        tmp.write_text('\n'.join(sorted(self.seen)))
         os.replace(tmp, self.seen_file)
 
     # -- scanning ----------------------------------------------------------
@@ -93,8 +101,9 @@ class MaildirWatcher:
         every mail the human accumulated before installing it. Returns the count
         adopted.
         """
-        self.seen |= self._filenames()
-        self.save_seen()
+        present = self._filenames()
+        self.seen |= present
+        self.save_seen(present=present)
         return len(self.seen)
 
     def poll(self) -> list[tuple[str, dict]]:
@@ -105,22 +114,28 @@ class MaildirWatcher:
         than retried forever.
 
         Note the ordering contract with the caller: because we mark seen here, a
-        delivery that fails after `poll()` returns is not retried. That is the
-        deliberate trade — at-most-once delivery, never a hot loop re-sending a
-        message chat keeps rejecting. Callers that want at-least-once should
-        call `unsee()` on failure.
+        delivery that fails after `poll()` returns is not retried unless the
+        caller says so. Callers that want at-least-once delivery — every caller
+        in this repo does — must call `unsee()` when a send fails.
         """
-        fresh = sorted(self._filenames() - self.seen)
+        present = self._filenames()
+        fresh = sorted(present - self.seen)
         out: list[tuple[str, dict]] = []
         for name in fresh:
             path = self.mail_dir / name
             try:
                 mail = parse_mail(path.read_text())
-            except OSError as e:
+            except FileNotFoundError:
                 # The file vanished between listing and reading (macguffin moved
                 # it to cur/ under us). Nothing to deliver; don't mark it seen —
                 # it is gone from new/ and will not be listed again.
-                print(f'maildir read error ({name}): {e}', file=sys.stderr)
+                continue
+            except OSError as e:
+                # A real IO problem — EACCES, EIO — and the file is still there.
+                # Marking it seen is the only way to avoid re-reading, and
+                # re-logging, the same broken file on every single poll forever.
+                print(f'maildir read error ({name}), skipping: {e}', file=sys.stderr)
+                self.seen.add(name)
                 continue
             except Exception as e:
                 print(f'maildir parse error ({name}): {e}', file=sys.stderr)
@@ -128,8 +143,8 @@ class MaildirWatcher:
                 continue
             self.seen.add(name)
             out.append((name, mail))
-        if out or fresh:
-            self.save_seen()
+        if fresh:
+            self.save_seen(present=present)
         return out
 
     def unsee(self, filename: str) -> None:

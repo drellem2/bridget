@@ -40,8 +40,10 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   downgrades the capability and retries once, so an `mg` swapped underneath a
   running bridget never surfaces as a spurious undeliverable.
 - **`install.sh --setup`** — masked prompts for the Discord credentials. Token
-  entry has terminal echo off; only `****` + last four characters are echoed
-  back; the value never reaches `argv` or shell history.
+  entry has terminal echo off and **no part of the token is echoed back** (a
+  partial token is still a leaked token); the installer validates its *shape*
+  instead, so a paste error is still caught. The value never reaches `argv` or
+  shell history.
 - **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
   or any real secret value is committed, if a config key is undocumented, or if
   `TOKEN` is referenced anywhere but `client.run`.
@@ -55,9 +57,23 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   implementation (`bridget_core.mailbox`). They read `new/` and never move
   anything out of it; `mg mail read` owns that transition. The `dismiss` and
   `read` commands still mark mail read, because the user asked them to.
-- The seen-set is bounded (5000 newest filenames) and written atomically.
+- The seen-set is written atomically and garbage-collected by *presence* — a
+  filename is forgotten only once its message has left `new/`. It is never
+  trimmed by age: because reads are observe-only, a delivered message stays in
+  `new/`, so dropping its name re-delivers it on the next poll and every poll
+  after that.
+- Delivery is at-least-once. A Discord send failure (rate limit, 5xx) now
+  un-sees the mail and retries on the next poll instead of consuming it.
+- With no log channel, `mute all` and quiet hours stop the watcher consuming
+  mail rather than swallowing it, so it is delivered once you are audible again.
 - Mail suppressed by quiet hours is no longer invisible when threading is on:
   it still lands in the log channel.
+- Inside a conversation thread, only unambiguous commands (a workflow verb with
+  an mg-id, or an `idea:`/`bug:` prefix) are treated as commands. Everything
+  else is a reply, so "status is green, ship it" reaches the agent instead of
+  printing a status dump, and "dismiss all of that" cannot inbox-zero the human.
+- Bare `unmute` now explains itself instead of unmuting every DM, mirroring
+  bare `mute`.
 
 ## [1.0.0] - 2026-05-09
 

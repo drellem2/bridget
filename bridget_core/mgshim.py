@@ -45,12 +45,16 @@ def help_advertises_in_reply_to(help_text: str) -> bool:
         if line.startswith('Flags:') or line.startswith('Global Flags:'):
             in_flags = True
             continue
-        if in_flags:
-            if line and not line[:1].isspace():
-                in_flags = False  # left the Flags block
-                continue
-            if line.strip().split()[:1] == [FLAG_IN_REPLY_TO]:
-                return True
+        if not in_flags:
+            continue
+        if line and not line[:1].isspace():
+            in_flags = False  # left the Flags block
+            continue
+        # cobra prints either `      --flag string` or, when a shorthand exists,
+        # `  -r, --flag string`. Check both leading tokens, stripping the comma.
+        tokens = [t.rstrip(',') for t in line.strip().split()[:2]]
+        if FLAG_IN_REPLY_TO in tokens:
+            return True
     return False
 
 

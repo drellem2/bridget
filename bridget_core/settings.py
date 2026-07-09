@@ -49,7 +49,7 @@ class SettingsStore:
         self._default_dm_policy = (
             default_dm_policy if default_dm_policy in DM_POLICIES else DEFAULT_DM_POLICY
         )
-        self._mtime: float | None = None
+        self._stamp: tuple | None = None
         self.dm_policy: str = self._default_dm_policy
         self.mute_all: bool = False
         self.muted: set[str] = set()
@@ -64,12 +64,12 @@ class SettingsStore:
         self.mute_all = False
         self.muted = set()
         self.updated_at = ''
-        self._mtime = None
+        self._stamp = None
 
         if not self.path.exists():
             return
         try:
-            self._mtime = self.path.stat().st_mtime
+            self._stamp = self._read_stamp()
             d = json.loads(self.path.read_text())
             if not isinstance(d, dict):
                 raise ValueError('not a JSON object')
@@ -88,17 +88,28 @@ class SettingsStore:
         self.muted = set(muted) if isinstance(muted, list) else set()
         self.updated_at = d.get('updated_at', '')
 
+    def _read_stamp(self) -> tuple | None:
+        """A change-token for the settings file.
+
+        `st_mtime_ns` rather than `st_mtime`, and `st_size` alongside it: an
+        edit landing in the same clock tick as our own `save()` would be
+        invisible to a coarse, seconds-resolution mtime, and the operator's
+        `mute` would appear to do nothing.
+        """
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
     def reload_if_changed(self) -> bool:
         """Re-read the file if it changed on disk. Returns True if it did.
 
         Called from the watcher poll loops, so an operator's `mute` (or a hand
         edit) takes effect within one poll interval.
         """
-        try:
-            mtime = self.path.stat().st_mtime if self.path.exists() else None
-        except OSError:
-            return False
-        if mtime == self._mtime:
+        stamp = self._read_stamp()
+        if stamp == self._stamp:
             return False
         self.load()
         return True
@@ -116,10 +127,7 @@ class SettingsStore:
         tmp = self.path.parent / (self.path.name + '.tmp')
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
         os.replace(tmp, self.path)
-        try:
-            self._mtime = self.path.stat().st_mtime
-        except OSError:
-            self._mtime = None
+        self._stamp = self._read_stamp()
 
     # -- queries ----------------------------------------------------------
 

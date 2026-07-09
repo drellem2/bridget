@@ -86,6 +86,21 @@ STATUS_OUTPUT_BUDGET = 1700
 
 UNRECOGNIZED_REPLY = "Unrecognized. Send `help` for the full command list."
 
+#: Inside a conversation thread, almost everything the human types is a reply to
+#: mail — so only *unambiguous* commands may be intercepted there. Each of these
+#: either carries an mg-id or ends in a colon, neither of which occurs by
+#: accident in prose. Bare words are deliberately excluded: `handle_command`
+#: matches `status` with a `startswith`, so a reply of "status is green, ship it"
+#: would otherwise print a status dump and never reach the agent, and "dismiss
+#: all of that" would mark the human's whole inbox read.
+THREAD_VERB_RE = re.compile(
+    r'^\s*(?:'
+    r'(?:approve|reject|revise|explain|next|read|dismiss)\s+mg-[0-9a-z]{4}\b'
+    r'|(?:idea|bug):'
+    r')',
+    re.IGNORECASE,
+)
+
 COMMAND_LIST = (
     "• `approve mg-XXXX` — approve a design (auto-clears related mails)\n"
     "• `reject mg-XXXX <reason>` — shelve idea + clear mails\n"
@@ -125,13 +140,13 @@ def warn_if_world_readable(path: Path) -> bool:
     legitimately have a different ownership model, and refusing to start would
     be worse than saying so. Returns True if the permissions are loose."""
     try:
-        mode = path.stat().st_mode & 0o077
+        mode = path.stat().st_mode & 0o777
     except OSError:
         return False
-    if mode:
+    if mode & 0o077:
         print(
             f"bridget: WARNING: {path} is readable beyond its owner "
-            f"(mode {oct(path.stat().st_mode & 0o777)}). It holds your bot token.\n"
+            f"(mode {oct(mode)}). It holds your bot token.\n"
             f"  fix with: chmod 600 {path}",
             file=sys.stderr,
         )
@@ -653,12 +668,16 @@ def agent_cycle_paren(name: str) -> str:
         return '(last cycle ?, next cycle ?)'
 
 
-def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '') -> str:
-    """The DM card for one mail. Compact by design — the DM is a to-do list, not
-    a reading surface; the thread holds the full text."""
+MAIL_BODY_PREVIEW = 1200
+
+
+def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
+                     hint: str = '; use `read <mg-id>`') -> str:
+    """The card for one mail. Compact by design — the DM is a to-do list, not a
+    reading surface; the thread (or `read <mg-id>`) holds the full text."""
     body_preview = mail['body']
-    if len(body_preview) > 1200:
-        body_preview = body_preview[:1200] + '\n…[truncated; use `read <mg-id>`]'
+    if len(body_preview) > MAIL_BODY_PREVIEW:
+        body_preview = body_preview[:MAIL_BODY_PREVIEW] + f'\n…[truncated{hint}]'
     msg = (
         f"{prefix}"
         f"📬 **{mail['from']}** — {mail['subject']}\n"
@@ -695,6 +714,19 @@ def should_dm(mail: dict, conversation: str) -> bool:
     if SETTINGS.dm_policy == 'curated':
         return wants_attention(mail)
     return True
+
+
+def dm_globally_suppressed() -> bool:
+    """True if *no* mail can currently reach the DM, whatever its conversation.
+
+    Distinct from `should_dm`, which is per-mail. When threading is off the DM is
+    the only push surface, so a globally-suppressed DM means a polled mail would
+    be consumed by the seen-set and pushed nowhere. The watcher uses this to
+    stop polling instead — deferring the mail rather than swallowing it.
+    """
+    if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
+        return True
+    return SETTINGS.mute_all or SETTINGS.dm_policy == 'none'
 
 
 def thread_url(thread_id) -> str:
@@ -778,34 +810,41 @@ async def post_to_thread(conv, mail: dict) -> str:
     return thread_url(thread.id)
 
 
-async def deliver_mail(user: discord.User, filename: str, mail: dict) -> None:
+async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     """Route one new mail to the surfaces it belongs on.
 
     Threading (when enabled) always happens: the log channel is the durable
     record, and muting a conversation should not make its mail disappear. Only
     the DM is gated.
 
-    The exception is a log channel we could not reach. The mail has already been
-    marked seen, so if we now also honor a `curated`/`none` policy or a mute, it
-    would never surface anywhere and never be retried. In that one case the DM is
-    the last surface standing, and it wins over policy, mute, and quiet hours —
-    a mail arriving at a bad hour is a smaller harm than a mail nobody ever sees.
+    The exception is a log channel we could not reach. If we then also honored a
+    `curated`/`none` policy or a mute, the mail would surface nowhere. In that
+    one case the DM is the last surface standing, and it wins over policy, mute,
+    and quiet hours — a mail arriving at a bad hour is a smaller harm than a mail
+    nobody ever sees.
+
+    Returns False if a *send* failed, so the caller can un-see the mail and retry
+    it on the next poll. A mail deliberately suppressed by policy returns True:
+    it was handled, not dropped.
     """
     key = conversation_key(mail, fallback=filename)
-    conv = CONVERSATIONS.record(
-        key,
-        subject=thread_title(mail),
-        agent=mail['from'],
-        message_id=reply_target(mail, fallback=filename),
-    )
 
-    url = ''
     if THREADS_ENABLED:
+        conv = CONVERSATIONS.record(
+            key,
+            subject=thread_title(mail),
+            agent=mail['from'],
+            message_id=reply_target(mail, fallback=filename),
+        )
         url = await post_to_thread(conv, mail)
+    else:
+        # No threads, no thread map. Recording every mail here would rewrite the
+        # conversation file on each delivery for a feature that is switched off.
+        url = ''
 
     stranded = THREADS_ENABLED and not url
     if not stranded and not should_dm(mail, key):
-        return
+        return True
 
     prefix = ''
     if stranded:
@@ -813,7 +852,11 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> None:
     try:
         await user.send(format_mail_card(mail, thread_link=url, prefix=prefix))
     except discord.HTTPException as e:
-        print(f'DM failed for {filename}: {e}', file=sys.stderr)
+        # Transient by default (429/5xx). Report failure so the mail is retried
+        # rather than silently consumed by the seen-set.
+        print(f'DM failed for {filename}, will retry: {e}', file=sys.stderr)
+        return False
+    return True
 
 
 async def send_startup_dm(user: discord.User, first_run: bool) -> None:
@@ -854,14 +897,21 @@ async def watch_mailbox(user: discord.User):
     while not client.is_closed():
         try:
             SETTINGS.reload_if_changed()
-            for filename, mail in watcher.poll():
-                # Isolate each mail. poll() has already marked the whole batch
-                # seen, so letting one bad message abort the loop would silently
-                # swallow every mail queued behind it.
-                try:
-                    await deliver_mail(user, filename, mail)
-                except Exception as e:
-                    print(f"deliver failed for {filename}: {e}", file=sys.stderr)
+            # With no log channel the DM is the only surface. Rather than poll
+            # mail we cannot push anywhere — which would mark it seen and lose
+            # it — leave it in the maildir and pick it up once we're audible.
+            if THREADS_ENABLED or not dm_globally_suppressed():
+                for filename, mail in watcher.poll():
+                    # Isolate each mail. poll() has already marked the whole
+                    # batch seen, so letting one bad message abort the loop
+                    # would silently swallow every mail queued behind it.
+                    try:
+                        if not await deliver_mail(user, filename, mail):
+                            watcher.unsee(filename)
+                    except Exception as e:
+                        print(f"deliver failed for {filename}, will retry: {e}",
+                              file=sys.stderr)
+                        watcher.unsee(filename)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)
@@ -881,16 +931,9 @@ def agent_seen_file(agent: str) -> Path:
 
 
 def format_agent_mail_msg(mail: dict) -> str:
-    body_preview = mail['body']
-    if len(body_preview) > 1200:
-        body_preview = body_preview[:1200] + '\n…[truncated]'
-    msg = (
-        f"📬 **{mail['from']}** — {mail['subject']}\n"
-        f"```\n{body_preview}\n```"
-    )
-    if len(msg) > DISCORD_MSG_LIMIT:
-        msg = msg[:DISCORD_MSG_LIMIT] + '…'
-    return msg
+    """Same card as the human DM, minus the `read <mg-id>` hint — that command
+    only makes sense in the human's own DM."""
+    return format_mail_card(mail, hint='')
 
 
 async def watch_agent_mailbox(channel_entry: dict):
@@ -921,15 +964,19 @@ async def watch_agent_mailbox(channel_entry: dict):
                 # seen and never reach the channel.
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
-            quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
+            if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
+                # Defer, don't consume. A channel has no `status` fallback, so a
+                # mail polled and skipped during quiet hours would be lost
+                # outright rather than merely delayed.
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
             for fname, mail in watcher.poll():
-                if quiet_outbound:
-                    continue
                 try:
                     await channel.send(format_agent_mail_msg(mail))
                 except discord.HTTPException as e:
-                    print(f"agent-mail send failed for {agent}/{fname}: {e}",
-                          file=sys.stderr)
+                    print(f"agent-mail send failed for {agent}/{fname}, "
+                          f"will retry: {e}", file=sys.stderr)
+                    watcher.unsee(fname)
         except Exception as e:
             print(f"watch_agent_mailbox({agent}) loop error: {e}",
                   file=sys.stderr)
@@ -1609,16 +1656,25 @@ def handle_command(text: str) -> str:
         return f'✓ DM policy: `{arg}`.'
 
     if low == 'mute all':
-        return ('✓ all DMs muted. Mail still threads into the log channel.'
-                if SETTINGS.set_mute_all(True) else 'All DMs were already muted.')
+        if not SETTINGS.set_mute_all(True):
+            return 'All DMs were already muted.'
+        if THREADS_ENABLED:
+            return '✓ all DMs muted. Mail still threads into the log channel.'
+        # No log channel: the DM was the only push surface. Say so plainly
+        # rather than claiming a log channel that does not exist. Nothing is
+        # lost — the watcher stops consuming mail while muted, so `unmute all`
+        # delivers whatever arrived in the meantime.
+        return ('✓ all DMs muted. With no log channel this is your only surface, '
+                'so nothing will be pushed until you `unmute all` — mail is held, '
+                'not dropped. `status` still shows it.')
 
-    if low in ('unmute all', 'unmute'):
+    if low == 'unmute all':
         return ('✓ DMs unmuted.' if SETTINGS.set_mute_all(False)
                 else 'DMs were not muted.')
 
-    if low == 'mute':
-        return ('Reply `mute` inside a conversation thread to silence it, or '
-                '`mute all` to silence every DM.')
+    if low in ('mute', 'unmute'):
+        return (f'Reply `{low}` inside a conversation thread to act on that '
+                f'conversation, or `{low} all` to act on every DM.')
 
     if low == 'status' or low.startswith('status'):
         summary = get_status_summary()
@@ -1657,10 +1713,12 @@ def handle_thread_message(text: str, conv) -> str:
 
     # A workflow verb typed in a thread still means what it means everywhere
     # else — approving a design shouldn't depend on which surface you typed it
-    # into. Only free-form text becomes a reply.
-    reply = handle_command(text)
-    if reply != UNRECOGNIZED_REPLY:
-        return reply
+    # into. But only the unambiguous ones: in a thread the default reading of
+    # what the human typed is "this is a reply", not "this is a command".
+    if THREAD_VERB_RE.match(text):
+        reply = handle_command(text)
+        if reply != UNRECOGNIZED_REPLY:
+            return reply
 
     return str(reply_in_conversation(text, conv))
 
@@ -1679,12 +1737,7 @@ def send_channel_chat_mail(text: str, agent: str) -> str:
     else:
         subject = text
         body = '(no body)'
-    rc, out, err = run_mg([
-        'mail', 'send', agent,
-        '--from=human',
-        f'--subject={subject[:200]}',
-        f'--body={body}',
-    ])
+    rc, out, err = run_mg(build_send_args(agent, subject, body, sender='human'))
     if rc == 0:
         return f'✓ mailed `{agent}`: "{subject[:60]}"'
     return f'✗ mail failed: {(err or out).strip()[:200]}'

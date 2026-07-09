@@ -138,11 +138,13 @@ and `discord.py`'s own logging is disabled (`log_handler=None`).
 - `install.sh` creates the file `chmod 600`, and tightens the permissions on
   every run if it finds them looser.
 - bridget warns on startup if the file is readable beyond its owner.
-- `install.sh --setup` prompts for the token with terminal echo **off**, writes
-  it via a `600` temp file, and echoes back only `****` plus the last four
-  characters so you can spot a paste error without disclosing the secret. The
-  token never appears in `argv` (visible to any user via `ps`) or in your shell
-  history.
+- `install.sh --setup` prompts for the token with terminal echo **off** and
+  writes it via a `600` temp file. **No part of the token is ever echoed** — not
+  a prefix, not a suffix, not its length; a partial token is still a leaked
+  token, and installer output routinely lands in logs and transcripts. To catch a
+  paste error anyway, the installer validates the token's *shape* (three
+  dot-separated base64url parts) and tells you if it doesn't match. The token
+  never appears in `argv` (readable by any user via `ps`) or in shell history.
 - A test (`tests/test_secrets.py`) fails the build if a Discord-token-shaped
   string, or any real value for a secret key, is ever committed.
 
@@ -225,8 +227,15 @@ anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
 ### Replying
 
 Type into a thread and bridget mails it back to the agent on the other end,
-threading the reply onto the conversation with `mg mail send --in-reply-to`. You
-always get an explicit acknowledgement:
+threading the reply onto the conversation with `mg mail send --in-reply-to`.
+
+Inside a thread, what you type is a **reply** unless it is unmistakably a
+command: a workflow verb carrying an mg-id (`approve mg-1234`, `read mg-abcd`),
+or an `idea:` / `bug:` prefix. Bare words are not commands there — "status is
+green, ship it" is a reply, not a request for a status dump, and "dismiss all of
+that noise" will not inbox-zero you. In a DM, every command works as always.
+
+You always get an explicit acknowledgement:
 
 | | |
 |---|---|
@@ -261,6 +270,11 @@ its thread, or everything with `mute all`. **Muting silences the DM, never the
 thread** — a muted conversation keeps its full record in the log channel, so
 muting can never lose mail. Live state is in `~/.pogo/bridget.settings.json`.
 
+With **no** log channel there is no second surface, so `mute all` (and quiet
+hours) can't quietly divert mail. bridget therefore stops *consuming* mail while
+you're unreachable: it stays in the maildir, `status` still counts it, and
+`unmute all` delivers what arrived meanwhile. Silence is a pause, never a delete.
+
 ### What bridget never does to your maildir
 
 The watchers are **observe-only**: they read `<mailbox>/new/` and never move,
@@ -268,6 +282,14 @@ rename, or delete anything in it. `mg mail read` owns that transition. If
 displaying a mail in chat also marked it read, every mail you glanced at on your
 phone would vanish from your real inbox. De-duplication is therefore a persisted
 seen-set of maildir filenames (`~/.pogo/bridget.seen`), not the directory itself.
+
+Because a delivered mail *stays* in `new/`, the seen-set may only forget a
+filename once that file has actually left `new/`. It is garbage-collected by
+presence, never trimmed by age — trimming by age would re-surface the oldest
+still-unread mail as "new" on the very next poll, and every poll thereafter.
+
+Delivery is **at-least-once**: if Discord rejects a send (rate limit, 5xx), the
+mail is un-seen and retried on the next poll rather than silently consumed.
 
 The `dismiss` and `read` commands do mark mail read — because you asked them to.
 

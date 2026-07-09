@@ -117,12 +117,12 @@ set_env_key() {
     chmod 600 "$ENV_FILE"
 }
 
-mask() {
-    # Confirm the token round-tripped without disclosing it. Fixed-width, so
-    # the mask does not even leak the token's length; last 4 chars only, which
-    # is enough for a human to spot a paste error.
-    local v="$1"
-    if (( ${#v} <= 4 )); then printf '****'; else printf '****%s' "${v: -4}"; fi
+token_shape_ok() {
+    # Catch a paste error without disclosing any part of the secret. A Discord
+    # bot token is three dot-separated base64url chunks. We never echo the
+    # value, a prefix, or a suffix — a partial token is still a leaked token,
+    # and this output may be captured in a log or a terminal transcript.
+    [[ "$1" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]
 }
 
 if (( SETUP )); then
@@ -133,8 +133,14 @@ if (( SETUP )); then
     IFS= read -rs token || true
     printf '\n'
     if [[ -n "$token" ]]; then
-        set_env_key DISCORD_BOT_TOKEN "$token"
-        log "DISCORD_BOT_TOKEN set ($(mask "$token"))"
+        if token_shape_ok "$token"; then
+            set_env_key DISCORD_BOT_TOKEN "$token"
+            log "DISCORD_BOT_TOKEN set (value hidden)"
+        else
+            warn "that does not look like a Discord bot token (expected three"
+            warn "dot-separated parts). Leaving DISCORD_BOT_TOKEN unchanged —"
+            warn "re-run 'bash install.sh --setup' to try again."
+        fi
         unset token
     else
         log "DISCORD_BOT_TOKEN unchanged"

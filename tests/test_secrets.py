@@ -145,11 +145,19 @@ class TestEnvFilePermissions(unittest.TestCase):
         install = (REPO / 'install.sh').read_text()
         self.assertIn('read -rs token', install)
 
-    def test_installer_never_echoes_the_raw_token(self):
+    def test_installer_never_echoes_the_token_or_any_part_of_it(self):
+        """A partial token is still a leaked token — no prefix, no suffix."""
         install = (REPO / 'install.sh').read_text()
         self.assertNotIn('echo "$token"', install)
-        self.assertNotIn('printf \'%s\' "$token"', install)
-        self.assertIn('mask "$token"', install)
+        self.assertNotIn("printf '%s' \"$token\"", install)
+        # No bash substring/expansion of $token may reach an output statement.
+        self.assertNotRegex(install, r'(log|warn|echo|printf)[^\n]*\$\{token[:#%]')
+        self.assertNotRegex(install, r'(log|warn|echo|printf)[^\n]*"\$token"')
+        self.assertIn('DISCORD_BOT_TOKEN set (value hidden)', install)
+
+    def test_installer_validates_token_shape_without_disclosing_it(self):
+        install = (REPO / 'install.sh').read_text()
+        self.assertIn('token_shape_ok', install)
 
     def test_installer_passes_the_token_via_env_not_argv(self):
         """argv is world-readable in `ps`; the env of another uid is not."""

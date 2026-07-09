@@ -465,6 +465,164 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('discord.com/channels', user.sent[0])
 
 
+class TestAtLeastOnceDelivery(unittest.IsolatedAsyncioTestCase):
+    """poll() marks mail seen before delivery, so every send-failure path must
+    unsee it. Otherwise a transient Discord 429/5xx silently eats the mail —
+    which is a regression from the pre-threading code, where the seen-set was
+    only updated after a successful send."""
+
+    async def test_dm_send_failure_reports_false_so_the_caller_can_retry(self):
+        b = load_bridget()
+
+        class Failing(FakeUser):
+            async def send(self, content):
+                raise FakeHTTPException('429 rate limited')
+
+        ok = await b.deliver_mail(Failing(), 'f1', mail(msg_id='id-1'))
+        self.assertFalse(ok, 'a failed DM must not report success')
+
+    async def test_successful_dm_reports_true(self):
+        b = load_bridget()
+        self.assertTrue(await b.deliver_mail(FakeUser(), 'f1', mail(msg_id='id-1')))
+
+    async def test_suppressed_mail_reports_true_and_is_not_retried(self):
+        """Suppression is a decision, not a failure. Retrying it would loop."""
+        b = load_threaded(BRIDGET_DM_POLICY='curated')
+        channel = FakeTextChannel(555, client=b.client)
+        b.client.channels[555] = channel
+        ok = await b.deliver_mail(FakeUser(), 'f1', mail(subject='FYI', msg_id='id-1'))
+        self.assertTrue(ok)
+
+    async def test_failed_dm_is_unseen_and_redelivered_next_poll(self):
+        b = load_bridget()
+        sent = []
+        attempts = {'n': 0}
+
+        async def flaky_deliver(_u, filename, _m):
+            attempts['n'] += 1
+            if attempts['n'] == 1:
+                return False          # transient failure
+            sent.append(filename)
+            return True
+
+        watcher = mock.MagicMock()
+        watcher.primed = True
+        watcher.poll.side_effect = [[('f1', mail(msg_id='id-1'))],
+                                    [('f1', mail(msg_id='id-1'))], []]
+        closed = iter([False, False, True, True])
+
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'deliver_mail', side_effect=flaky_deliver), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+
+        watcher.unsee.assert_called_once_with('f1')
+        self.assertEqual(sent, ['f1'], 'mail was not retried after a failed send')
+
+    async def test_exception_during_delivery_also_unsees(self):
+        b = load_bridget()
+        watcher = mock.MagicMock()
+        watcher.primed = True
+        watcher.poll.side_effect = [[('f1', mail(msg_id='id-1'))], []]
+        closed = iter([False, True, True])
+
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'deliver_mail', side_effect=RuntimeError('boom')), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+
+        watcher.unsee.assert_called_once_with('f1')
+
+
+class TestNeverConsumeUnsurfaceableMail(unittest.IsolatedAsyncioTestCase):
+    """With threads off the DM is the only push surface. Polling mail we cannot
+    push anywhere would mark it seen and lose it, so the watcher must not poll."""
+
+    def _run_one_cycle(self, b):
+        watcher = mock.MagicMock()
+        watcher.primed = True
+        watcher.poll.return_value = []
+        closed = iter([False, True, True])
+        return watcher, closed
+
+    async def test_mute_all_with_threads_off_defers_instead_of_consuming(self):
+        b = load_bridget()
+        b.SETTINGS.set_mute_all(True)
+        watcher, closed = self._run_one_cycle(b)
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+        watcher.poll.assert_not_called()
+
+    async def test_quiet_hours_with_threads_off_defers_instead_of_consuming(self):
+        b = load_bridget(env_overrides={'BRIDGET_QUIET_RESPECTS_OUTBOUND': 'true'})
+        watcher, closed = self._run_one_cycle(b)
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'is_quiet_now', return_value=True), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+        watcher.poll.assert_not_called()
+
+    async def test_mute_all_with_threads_on_still_polls_and_threads(self):
+        """The log channel is a surface, so consuming the mail is safe."""
+        b = load_threaded()
+        b.SETTINGS.set_mute_all(True)
+        watcher, closed = self._run_one_cycle(b)
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+        watcher.poll.assert_called()
+
+    async def test_normal_state_polls(self):
+        b = load_bridget()
+        watcher, closed = self._run_one_cycle(b)
+        with mock.patch.object(b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await b.watch_mailbox(FakeUser())
+        watcher.poll.assert_called()
+
+    def test_dm_globally_suppressed_matrix(self):
+        b = load_bridget()
+        self.assertFalse(b.dm_globally_suppressed())
+        b.SETTINGS.set_mute_all(True)
+        self.assertTrue(b.dm_globally_suppressed())
+        b.SETTINGS.set_mute_all(False)
+        self.assertFalse(b.dm_globally_suppressed())
+
+    def test_per_conversation_mute_is_not_global(self):
+        """A single muted conversation must not stop the watcher polling."""
+        b = load_bridget()
+        b.SETTINGS.mute('k1')
+        self.assertFalse(b.dm_globally_suppressed())
+
+
+class TestConversationRecordingIsThreadOnly(unittest.IsolatedAsyncioTestCase):
+    async def test_no_conversation_file_written_when_threads_are_off(self):
+        b = load_bridget()
+        await b.deliver_mail(FakeUser(), 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(b.CONVERSATIONS), 0)
+        self.assertFalse(b.CONVERSATIONS_FILE.exists(),
+                         'wrote a conversation map for a disabled feature')
+
+    async def test_conversation_recorded_when_threads_are_on(self):
+        b = load_threaded()
+        b.client.channels[555] = FakeTextChannel(555, client=b.client)
+        await b.deliver_mail(FakeUser(), 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(b.CONVERSATIONS), 1)
+
+
 class TestWatchMailboxRobustness(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.b = load_threaded()
@@ -698,7 +856,7 @@ class TestHandleThreadMessage(unittest.TestCase):
         self.assertIn('delivered', out)
 
     def test_workflow_verb_still_routes_to_the_workflow_agent(self):
-        """`approve mg-1` must mean the same thing in a thread as in a DM."""
+        """`approve mg-1234` must mean the same thing in a thread as in a DM."""
         with mock.patch.object(self.b, 'run_mg', return_value=(0, 'ok', '')) as run:
             self.b.handle_thread_message('approve mg-1234', self.conv)
         joined = ' '.join(run.call_args_list[0][0][0])
@@ -706,6 +864,49 @@ class TestHandleThreadMessage(unittest.TestCase):
 
     def test_help_in_thread_names_the_agent(self):
         self.assertIn('mayor', self.b.handle_thread_message('help', self.conv))
+
+    def test_prose_starting_with_a_command_word_is_a_reply_not_a_command(self):
+        """The bug: `handle_command` matches `status` with startswith, so a
+        genuine reply was swallowed and the agent never heard it."""
+        for text in ('status is green, ship it',
+                     'dm the client tomorrow',
+                     'restart the deploy when you can',
+                     'nudge me if it stalls',
+                     'agents are all idle now',
+                     'balance looks fine',
+                     'quiet down, this is fine',
+                     'settings look right to me',
+                     'dismiss all of that, it was noise'):
+            with self.subTest(text=text):
+                with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
+                    out = self.b.handle_thread_message(text, self.conv)
+                self.assertIn('delivered', out, f'{text!r} was intercepted as a command')
+                args = run.call_args[0][0]
+                self.assertEqual(args[:3], ['mail', 'send', 'mayor'])
+
+    def test_dismiss_all_in_a_thread_does_not_touch_the_maildir(self):
+        """`dismiss all of that` as prose must never inbox-zero the human."""
+        with mock.patch.object(self.b, 'mark_mail_read') as marker, \
+             mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')):
+            self.b.handle_thread_message('dismiss all of that noise', self.conv)
+        marker.assert_not_called()
+
+    def test_unambiguous_verbs_with_an_mg_id_are_still_commands(self):
+        for text in ('approve mg-1234', 'reject mg-abcd because no',
+                     'revise mg-9be0 please', 'explain mg-4c6b the seam',
+                     'read mg-0001', 'dismiss mg-0002'):
+            with self.subTest(text=text):
+                self.assertTrue(self.b.THREAD_VERB_RE.match(text))
+
+    def test_idea_and_bug_prefixes_are_still_commands(self):
+        self.assertTrue(self.b.THREAD_VERB_RE.match('idea: add dark mode'))
+        self.assertTrue(self.b.THREAD_VERB_RE.match('bug: it crashes'))
+
+    def test_prose_does_not_match_the_verb_regex(self):
+        for text in ('status is green', 'dismiss all of that', 'next steps are clear',
+                     'read the docs', 'approve of this approach'):
+            with self.subTest(text=text):
+                self.assertIsNone(self.b.THREAD_VERB_RE.match(text))
 
 
 # --- inbound: on_message routing --------------------------------------------
@@ -804,6 +1005,27 @@ class TestSettingsCommands(unittest.TestCase):
 
     def test_bare_mute_in_a_dm_explains_itself(self):
         self.assertIn('inside a conversation thread', load_bridget().handle_command('mute'))
+
+    def test_bare_unmute_explains_rather_than_unmuting_everything(self):
+        """`mute` only explained while `unmute` silently acted on all DMs."""
+        b = load_bridget()
+        b.SETTINGS.set_mute_all(True)
+        out = b.handle_command('unmute')
+        self.assertIn('inside a conversation thread', out)
+        self.assertTrue(b.SETTINGS.mute_all, 'bare `unmute` unmuted everything')
+
+    def test_mute_all_without_a_log_channel_does_not_promise_threading(self):
+        """It used to claim 'Mail still threads into the log channel' with no
+        log channel configured — a plain falsehood."""
+        b = load_bridget()
+        out = b.handle_command('mute all')
+        self.assertNotIn('still threads into the log channel', out)
+        self.assertIn('only surface', out)
+        self.assertIn('held', out)
+
+    def test_mute_all_with_a_log_channel_does_promise_threading(self):
+        b = load_threaded()
+        self.assertIn('still threads into the log channel', b.handle_command('mute all'))
 
     def test_settings_persist_across_restart(self):
         b = load_threaded()

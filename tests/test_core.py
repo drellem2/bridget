@@ -15,9 +15,11 @@ Covers:
 - the ack outcome model
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -356,6 +358,36 @@ class TestSettingsStore(unittest.TestCase):
         s.save()
         self.assertFalse(s.reload_if_changed())
 
+    def test_reload_detects_an_edit_within_the_same_clock_second(self):
+        """On a coarse-mtime filesystem a same-second hand edit was invisible,
+        so the operator's `mute` appeared to do nothing. Compare (mtime_ns, size)."""
+        s = SettingsStore(self.path)
+        s.save()
+        stat_before = self.path.stat()
+        # Simulate a coarse filesystem: same whole-second mtime, different content.
+        self.path.write_text(json.dumps({'version': 1, 'dm_policy': 'none',
+                                         'mute_all': True, 'muted': ['k9']}))
+        os.utime(self.path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 1))
+        self.assertTrue(s.reload_if_changed())
+        self.assertTrue(s.is_muted('k9'))
+
+    def test_reload_detects_a_size_change_at_identical_mtime(self):
+        s = SettingsStore(self.path)
+        s.save()
+        st = self.path.stat()
+        self.path.write_text(json.dumps({'version': 1, 'muted': ['k1', 'k2', 'k3'],
+                                         'dm_policy': 'all', 'mute_all': False}))
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))  # identical mtime
+        self.assertTrue(s.reload_if_changed(), 'size change went unnoticed')
+        self.assertTrue(s.is_muted('k2'))
+
+    def test_reload_survives_a_deleted_settings_file(self):
+        s = SettingsStore(self.path)
+        s.save()
+        self.path.unlink()
+        self.assertTrue(s.reload_if_changed())
+        self.assertEqual(s.dm_policy, 'all')
+
     def test_malformed_file_yields_defaults(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text('nonsense{')
@@ -467,20 +499,71 @@ class TestMaildirWatcher(unittest.TestCase):
         w.unsee('9')
         self.assertEqual([n for n, _ in w.poll()], ['9'])
 
-    def test_seen_set_is_bounded_and_keeps_newest(self):
-        w = MaildirWatcher(self.new, self.seen_file, max_seen=3)
-        w.seen = {'1', '2', '3', '4', '5'}
-        w.save_seen()
-        self.assertEqual(w.seen, {'3', '4', '5'})
-
-    def test_bounded_seen_set_does_not_redeliver_old_mail(self):
-        """Dropped names are older than everything retained, and their files
-        are older than every future mail, so they can never reappear as new."""
-        w = MaildirWatcher(self.new, self.seen_file, max_seen=2)
+    def test_seen_set_never_forgets_mail_still_in_new(self):
+        """The bug this replaced: trimming the seen-set by age re-surfaced old
+        mail as new on the next poll — forever, because observe-only means the
+        file never leaves new/."""
         for n in ('1', '2', '3'):
             self.write_mail(n)
+        w = MaildirWatcher(self.new, self.seen_file, gc_threshold=2)
         w.prime()
-        self.assertEqual(w.seen, {'2', '3'})
+        self.assertEqual(w.seen, {'1', '2', '3'}, 'a still-present mail was forgotten')
+        self.assertEqual(w.poll(), [], 'old mail was re-delivered')
+        self.assertEqual(w.poll(), [], 'and re-delivered again')
+
+    def test_seen_set_collects_names_whose_mail_left_new(self):
+        """Once `mg mail read` moves a message to cur/, its name is dead weight."""
+        for n in ('1', '2', '3'):
+            self.write_mail(n)
+        w = MaildirWatcher(self.new, self.seen_file, gc_threshold=2)
+        w.prime()
+        (self.new / '1').rename(self.cur / '1')
+        (self.new / '2').rename(self.cur / '2')
+        w.save_seen()
+        self.assertEqual(w.seen, {'3'}, 'dead names were not collected')
+
+    def test_seen_set_may_exceed_the_threshold_when_new_is_large(self):
+        """Correctness beats the bound: if new/ holds more unread than the
+        threshold, every name must still be remembered."""
+        for n in range(5):
+            self.write_mail(f'{n}')
+        w = MaildirWatcher(self.new, self.seen_file, gc_threshold=2)
+        w.prime()
+        self.assertEqual(len(w.seen), 5)
+        self.assertEqual(w.poll(), [])
+
+    def test_unreadable_mail_is_skipped_not_retried_forever(self):
+        """A non-vanish OSError (EACCES/EIO) left the file in new/ and unseen,
+        so every poll re-read and re-logged it."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        p = self.write_mail('9')
+        p.chmod(0o000)
+        try:
+            first = w.poll()
+            second = w.poll()
+        finally:
+            p.chmod(0o644)
+        self.assertEqual(first, [])
+        self.assertEqual(second, [], 'unreadable mail was retried in a hot loop')
+        self.assertIn('9', w.seen)
+
+    def test_vanished_mail_is_not_marked_seen(self):
+        """macguffin moved it to cur/ between listing and reading. It is gone
+        from new/, will never be listed again, and needs no seen entry."""
+        w = MaildirWatcher(self.new, self.seen_file)
+        w.prime()
+        self.write_mail('8')
+        real_read = Path.read_text
+
+        def vanish(self_path, *a, **k):
+            if self_path.name == '8':
+                raise FileNotFoundError(2, 'gone')
+            return real_read(self_path, *a, **k)
+
+        with unittest.mock.patch.object(Path, 'read_text', vanish):
+            self.assertEqual(w.poll(), [])
+        self.assertNotIn('8', w.seen)
 
 
 #: Verbatim `mg mail send --help` from a build WITHOUT gh#66. Note the long
@@ -546,6 +629,20 @@ class TestHelpProbe(unittest.TestCase):
 
     def test_empty_help_is_not_a_capability(self):
         self.assertFalse(help_advertises_in_reply_to(''))
+
+    def test_detects_a_flag_printed_with_a_shorthand_alias(self):
+        """cobra prints `  -r, --flag string` when a shorthand is registered."""
+        help_text = (
+            'Usage:\n  mg mail send AGENT [flags]\n\n'
+            'Flags:\n'
+            '      --body string          body\n'
+            '  -r, --in-reply-to string   MSG-ID this replies to\n'
+        )
+        self.assertTrue(help_advertises_in_reply_to(help_text))
+
+    def test_a_similarly_named_flag_does_not_match(self):
+        help_text = 'Flags:\n      --in-reply-to-file string   path\n'
+        self.assertFalse(help_advertises_in_reply_to(help_text))
 
 
 class TestUnknownFlagDetection(unittest.TestCase):

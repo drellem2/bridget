@@ -15,9 +15,6 @@ one, keyed on its own id.
 """
 from __future__ import annotations
 
-# Headers whose value is a whitespace-separated list of message ids.
-_LIST_HEADERS = ('references',)
-
 
 def _split_headers(content: str) -> tuple[dict, str]:
     """Split a raw maildir message into (headers, body).
