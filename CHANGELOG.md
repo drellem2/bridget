@@ -5,6 +5,60 @@ All notable changes to bridget will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Thread-per-conversation UX and a transport-agnostic core. Every addition is
+opt-in: with no new keys set, bridget behaves exactly as v1.x did.
+
+### Added
+
+- **Conversation threads.** `BRIDGET_LOG_CHANNEL_ID` roots one Discord thread
+  per mail conversation in a guild text channel. Conversations are keyed on the
+  root of the `References` chain, so a whole reply chain resolves to one thread.
+  The map persists in `~/.pogo/bridget.conversations.json` and survives
+  restarts, so threads are never orphaned. Unset = threading off.
+- **The calm inbox.** `BRIDGET_DM_POLICY` = `all` (default) / `curated` /
+  `none`. `curated` DMs only mail that wants a decision; everything else lands
+  in the log channel. Refused without a log channel, so suppressed mail always
+  has somewhere to go.
+- **Reply in thread.** Type into a conversation thread and bridget mails it back
+  to the agent on the other end, threaded onto the conversation.
+- **Explicit acks.** Every inbound reply resolves to delivered ✅ / ambiguous ⚠️
+  / undeliverable ❌. Silence is never an outcome.
+- **Live mute/settings.** `settings`, `dm <policy>`, `mute all` / `unmute all`,
+  and bare `mute` / `unmute` inside a thread. Persisted to
+  `~/.pogo/bridget.settings.json` and hot-reloaded. Muting silences the DM but
+  never the thread, so muting cannot lose mail.
+- **`bridget_core`** — the transport-agnostic core (maildir watching, mg shim,
+  conversation map, settings, acks), importing no chat library. A Slack or
+  Matrix port is a new adapter, not a rewrite. `tests/test_core.py` does not
+  stub `discord`, so the split is enforced by the suite.
+- **`BRIDGET_CORRELATION_IDS`** (`auto` / `on` / `off`) — whether to thread
+  replies with `mg mail send --in-reply-to` (macguffin gh#66). `auto` probes
+  `mg mail send --help` once. Replies always deliver; without the flag they
+  simply arrive as new top-level mail. A send rejected with `unknown flag`
+  downgrades the capability and retries once, so an `mg` swapped underneath a
+  running bridget never surfaces as a spurious undeliverable.
+- **`install.sh --setup`** — masked prompts for the Discord credentials. Token
+  entry has terminal echo off; only `****` + last four characters are echoed
+  back; the value never reaches `argv` or shell history.
+- **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
+  or any real secret value is committed, if a config key is undocumented, or if
+  `TOKEN` is referenced anywhere but `client.run`.
+
+### Changed
+
+- `install.sh` now tightens `~/.pogo/bridget.env` to `600` on every run, not
+  only the run that created it. bridget warns at startup if it is readable
+  beyond its owner.
+- The maildir watchers are now explicitly observe-only, sharing one audited
+  implementation (`bridget_core.mailbox`). They read `new/` and never move
+  anything out of it; `mg mail read` owns that transition. The `dismiss` and
+  `read` commands still mark mail read, because the user asked them to.
+- The seen-set is bounded (5000 newest filenames) and written atomically.
+- Mail suppressed by quiet hours is no longer invisible when threading is on:
+  it still lands in the log channel.
+
 ## [1.0.0] - 2026-05-09
 
 Feature parity with the original personal pogo-discord-bridge install. First

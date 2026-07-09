@@ -159,11 +159,15 @@ def load_bridget(env_overrides: dict | None = None, env_file_extra: str = ''):
     fake_home = Path(tempfile.mkdtemp(prefix='bridget-thread-test-'))
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
-    (env_dir / 'bridget.env').write_text(
+    env_path = env_dir / 'bridget.env'
+    env_path.write_text(
         'DISCORD_BOT_TOKEN=fake\n'
         'DISCORD_USER_ID=1\n'
         'DISCORD_SERVER_ID=2\n' + env_file_extra
     )
+    # As install.sh would leave it — otherwise every load prints the
+    # world-readable warning and drowns the test output.
+    os.chmod(env_path, 0o600)
     (fake_home / '.macguffin' / 'mail' / 'human' / 'new').mkdir(parents=True)
 
     keys = {'HOME', 'BRIDGET_REPO_DIR', 'BRIDGET_LOG_CHANNEL_ID', 'BRIDGET_DM_POLICY'}
@@ -404,11 +408,54 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
         self.assertEqual(len(self.user.sent), 1)
         self.assertNotIn('reply in thread', self.user.sent[0])
+        self.assertIn('log channel unreachable', self.user.sent[0])
 
     async def test_log_channel_that_cannot_host_threads_is_reported(self):
         self.b.client.channels[555] = FakeDMChannel()  # no create_thread
         await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
         self.assertEqual(len(self.user.sent), 1, 'mail lost when channel cannot thread')
+
+    async def test_stranded_mail_overrides_a_silencing_dm_policy(self):
+        """The mail is already marked seen. If the thread failed AND the policy
+        suppresses the DM, nothing would ever surface it again."""
+        b = load_threaded(BRIDGET_DM_POLICY='none')
+        user = FakeUser()
+        b.client.channels.clear()  # log channel unreachable
+        await b.deliver_mail(user, 'f1', mail(subject='FYI: green', msg_id='id-1'))
+        self.assertEqual(len(user.sent), 1, 'mail vanished under dm_policy=none')
+        self.assertIn('log channel unreachable', user.sent[0])
+
+    async def test_stranded_mail_overrides_a_mute(self):
+        self.b.client.channels.clear()
+        self.b.SETTINGS.mute('id-1')
+        await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(self.user.sent), 1, 'muted mail vanished when thread failed')
+
+    async def test_stranded_mail_overrides_quiet_hours(self):
+        b = load_threaded(BRIDGET_QUIET_RESPECTS_OUTBOUND='true')
+        user = FakeUser()
+        b.client.channels.clear()
+        with mock.patch.object(b, 'is_quiet_now', return_value=True):
+            await b.deliver_mail(user, 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(user.sent), 1, 'mail vanished during quiet hours')
+
+    async def test_healthy_thread_does_not_override_the_policy(self):
+        """The override is only for the stranded case — don't undo the calm inbox."""
+        b = load_threaded(BRIDGET_DM_POLICY='none')
+        channel = FakeTextChannel(555, client=b.client)
+        b.client.channels[555] = channel
+        user = FakeUser()
+        await b.deliver_mail(user, 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(channel.threads), 1)
+        self.assertEqual(user.sent, [], 'dm_policy=none must still suppress a healthy delivery')
+
+    async def test_threading_off_and_quiet_still_suppresses(self):
+        """With no log channel there is nothing to be stranded from; quiet wins."""
+        b = load_bridget(env_overrides={'BRIDGET_QUIET_RESPECTS_OUTBOUND': 'true'})
+        user = FakeUser()
+        with mock.patch.object(b, 'is_quiet_now', return_value=True):
+            await b.deliver_mail(user, 'f1', mail(msg_id='id-1'))
+        self.assertEqual(user.sent, [])
 
     async def test_threading_disabled_dms_without_thread_link(self):
         b = load_bridget()
@@ -416,6 +463,42 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         await b.deliver_mail(user, 'f1', mail(msg_id='id-1'))
         self.assertEqual(len(user.sent), 1)
         self.assertNotIn('discord.com/channels', user.sent[0])
+
+
+class TestWatchMailboxRobustness(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.b = load_threaded()
+        self.channel = FakeTextChannel(555, client=self.b.client)
+        self.b.client.channels[555] = self.channel
+
+    async def test_one_bad_mail_does_not_swallow_the_rest_of_the_batch(self):
+        """poll() marks the whole batch seen up front, so an exception on mail 1
+        would strand mails 2..n forever."""
+        user = FakeUser()
+        batch = [('f1', mail(msg_id='id-1')),
+                 ('f2', mail(msg_id='id-2')),
+                 ('f3', mail(msg_id='id-3'))]
+        delivered = []
+
+        async def flaky(_user, filename, _mail):
+            if filename == 'f1':
+                raise RuntimeError('boom')
+            delivered.append(filename)
+
+        watcher = mock.MagicMock()
+        watcher.primed = True
+        # One populated poll, then empty forever; is_closed() ends the loop.
+        watcher.poll.side_effect = [batch, []]
+        closed = iter([False, True, True])
+
+        with mock.patch.object(self.b, 'MaildirWatcher', return_value=watcher), \
+             mock.patch.object(self.b, 'deliver_mail', side_effect=flaky), \
+             mock.patch.object(self.b, 'send_startup_dm', new=mock.AsyncMock()), \
+             mock.patch.object(self.b.client, 'is_closed', side_effect=lambda: next(closed)), \
+             mock.patch.object(self.b.asyncio, 'sleep', new=mock.AsyncMock()):
+            await self.b.watch_mailbox(user)
+
+        self.assertEqual(delivered, ['f2', 'f3'], 'a bad mail swallowed the batch behind it')
 
 
 # --- inbound: replies in threads --------------------------------------------

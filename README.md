@@ -115,8 +115,36 @@ your install needs to diverge.
 | `BRIDGET_RESTART_CMD` | `bash build.sh` | Shell command run from `BRIDGET_REPO_DIR` to validate a fresh checkout before the `restart` verb respawns the process. |
 | `BRIDGET_CREW_PATTERN` | `^(architect\|mayor\|human\|pm-.*\|)$` | Regex applied to `assignee` to decide whether the `claimed by …` annotation is suppressed. Anything matching = crew agent (suppressed); anything not matching = polecat. |
 
+### Threading knobs
+
+Unset, these leave bridget behaving exactly as it did before threads existed.
+See [Conversation threads](#conversation-threads-optional).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `BRIDGET_LOG_CHANNEL_ID` | *(unset)* | Guild text channel where conversation threads are rooted. Unset = threading off. |
+| `BRIDGET_DM_POLICY` | `all` | `all` / `curated` / `none` — how much mail reaches your DMs. Anything but `all` requires a log channel. |
+| `BRIDGET_CORRELATION_IDS` | `auto` | `auto` / `on` / `off` — whether replies thread via `mg mail send --in-reply-to`. |
+
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
+
+### Secrets
+
+`~/.pogo/bridget.env` holds your bot token. bridget reads it into memory and
+hands it to discord.py — it is never printed, logged, or written anywhere else,
+and `discord.py`'s own logging is disabled (`log_handler=None`).
+
+- `install.sh` creates the file `chmod 600`, and tightens the permissions on
+  every run if it finds them looser.
+- bridget warns on startup if the file is readable beyond its owner.
+- `install.sh --setup` prompts for the token with terminal echo **off**, writes
+  it via a `600` temp file, and echoes back only `****` plus the last four
+  characters so you can spot a paste error without disclosing the secret. The
+  token never appears in `argv` (visible to any user via `ps`) or in your shell
+  history.
+- A test (`tests/test_secrets.py`) fails the build if a Discord-token-shaped
+  string, or any real value for a secret key, is ever committed.
 
 ## Commands (DM the bot)
 
@@ -140,10 +168,108 @@ launchd/systemd unit can inject overrides without editing the file.
 - `nudge <agent> [reason]` — wake a stalled agent.
 - `restart` — git pull + restart bridget (after merging a PR; see [Remote restart](#remote-restart)).
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
+- `settings` — show the DM policy, muted conversations, and threading state.
+- `dm <all|curated|none>` — change how much mail reaches your DMs, live.
+- `mute all` / `unmute all` — silence every DM. Mail still threads into the log channel.
 - `help` (or `?`) — print this list inside Discord.
+
+Inside a conversation thread (see below) you can also just **type a reply** — it
+gets mailed back to whoever started the conversation — or `mute` / `unmute` that
+one conversation without naming it.
 
 bridget only acts on DMs from the user whose ID is in `DISCORD_USER_ID`;
 messages from anyone else are ignored.
+
+## Conversation threads (optional)
+
+By default bridget DMs you every mail, in one flat stream. Turn on threading and
+it becomes a two-surface UX: a **log channel** that holds the firehose, with one
+**thread per conversation**, and a **DM inbox** you can curate down to just the
+things that want a decision from you.
+
+```
+BRIDGET_LOG_CHANNEL_ID=123456789012345678
+BRIDGET_DM_POLICY=curated
+```
+
+### Why a channel, and not threads in the DM
+
+Discord threads only exist inside guild **text channels** — a DM channel cannot
+host one. (This is where Discord differs from Slack, where any message can root
+a thread.) So the log channel is where conversations live, and the DM keeps its
+job as the place bridget taps you on the shoulder. A DM card links straight to
+its thread.
+
+The bot needs **View Channel**, **Send Messages**, **Create Public Threads**, and
+**Send Messages in Threads** on that channel. Point `BRIDGET_LOG_CHANNEL_ID` at a
+text channel; a category, voice channel, or DM will be reported at startup rather
+than silently swallowing your mail.
+
+### How a conversation is identified
+
+Each mail carries a `Message-Id`, and a reply carries `In-Reply-To` plus a
+`References` chain (macguffin gh#66). bridget keys a conversation on the **root**
+of that chain, so every message in a reply chain resolves to the same thread no
+matter where in the chain it sits. The map lives in
+`~/.pogo/bridget.conversations.json` and survives restarts — otherwise a restart
+would orphan every open thread and root a duplicate for the next message.
+
+Mail with no correlation headers at all (anything written before gh#66) keys on
+its maildir filename, which is the value macguffin would have used as its id
+anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
+
+> **Note.** `References` is capped at the last 20 ids. A conversation running
+> past 20 messages loses its true root, and later messages start a second
+> thread. That is a visible, bounded degradation, not lost mail.
+
+### Replying
+
+Type into a thread and bridget mails it back to the agent on the other end,
+threading the reply onto the conversation with `mg mail send --in-reply-to`. You
+always get an explicit acknowledgement:
+
+| | |
+|---|---|
+| ✅ delivered | the mail went out, and to whom. |
+| ⚠️ ambiguous | bridget can't tell which conversation you meant (e.g. you typed in the log channel instead of in a thread). It lists the candidates. |
+| ❌ undeliverable | there's nowhere to send it, or `mg` refused — with the reason, verbatim. |
+
+Silence is never an outcome: if a reply didn't go, bridget says so.
+
+`--in-reply-to` ships in macguffin gh#66 and is **not** required. bridget probes
+`mg mail send --help` once (`BRIDGET_CORRELATION_IDS=auto`) and uses the flag if
+it exists. Without it, replies still deliver — they just arrive as new top-level
+mail instead of joining the conversation. If mg is swapped underneath a running
+bridget and starts rejecting the flag, the send is retried once without it rather
+than reported as undeliverable. `settings` shows which mode is active.
+
+### The calm inbox
+
+`BRIDGET_DM_POLICY` decides how much of the firehose interrupts you:
+
+| Policy | Effect |
+|---|---|
+| `all` | Every mail DMs you. The default, and what bridget always did. |
+| `curated` | Only mail matching `BRIDGET_APPROVAL_RE` — i.e. mail that wants a decision — DMs you. Everything else lands in the log channel. |
+| `none` | Nothing DMs you. The log channel is the only surface. |
+
+`curated` and `none` require a log channel; without one, bridget refuses to start
+rather than silently drop the mail it would have suppressed.
+
+Change it live with `dm curated`. Mute a single conversation by typing `mute` in
+its thread, or everything with `mute all`. **Muting silences the DM, never the
+thread** — a muted conversation keeps its full record in the log channel, so
+muting can never lose mail. Live state is in `~/.pogo/bridget.settings.json`.
+
+### What bridget never does to your maildir
+
+The watchers are **observe-only**: they read `<mailbox>/new/` and never move,
+rename, or delete anything in it. `mg mail read` owns that transition. If
+displaying a mail in chat also marked it read, every mail you glanced at on your
+phone would vanish from your real inbox. De-duplication is therefore a persisted
+seen-set of maildir filenames (`~/.pogo/bridget.seen`), not the directory itself.
+
+The `dismiss` and `read` commands do mark mail read — because you asked them to.
 
 ## Quiet hours
 
@@ -375,6 +501,37 @@ Common failure modes:
 - **`restart` says git pull failed** — the bridget checkout has uncommitted
   changes or a divergent branch. Resolve manually in the repo; bridget keeps
   running on the old code in the meantime.
+- **Threads aren't being created** — the bot needs *Create Public Threads* and
+  *Send Messages in Threads* on `BRIDGET_LOG_CHANNEL_ID`, and the channel must
+  be a guild **text** channel. bridget prints the reason at startup and falls
+  back to DMing you, so mail is never lost while you fix it.
+- **Replies arrive as new top-level mail, not in the conversation** — your `mg`
+  predates gh#66 and has no `--in-reply-to`. `settings` will show
+  `Correlation IDs: off (detected)`. Upgrade macguffin; nothing else to do.
+
+## Architecture
+
+bridget is split so that the chat platform is a leaf, not the trunk:
+
+```
+bridget_core/          transport-agnostic. Imports no chat library at all.
+  mail.py              maildir parsing; Message-Id / In-Reply-To / References;
+                       conversation-key derivation
+  mailbox.py           observe-only maildir scanning + persisted seen-set
+  conversations.py     conversation <-> thread map, persisted across restarts
+  settings.py          live-reloadable mute / DM-policy state
+  mgshim.py            the mg CLI seam: detect --in-reply-to, degrade if absent
+  acks.py              delivered / ambiguous / undeliverable outcomes
+
+bridget                the Discord presentation adapter: DM cards, guild
+                       threads, the command surface, discord.py wiring
+```
+
+Everything that would be identical for a Slack or Matrix bridge lives in
+`bridget_core`. Porting to another platform is a new adapter, not a rewrite.
+`tests/test_core.py` deliberately does **not** stub `discord`, so the split is
+enforced by the test suite rather than by good intentions: if a Discord type
+leaks into the core, that suite stops importing.
 
 ## Project status
 

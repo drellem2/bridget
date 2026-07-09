@@ -119,7 +119,33 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def warn_if_world_readable(path: Path) -> bool:
+    """Warn when the env file (which holds the bot token) is readable by anyone
+    but its owner. A warning, not an error: a container or a CI runner may
+    legitimately have a different ownership model, and refusing to start would
+    be worse than saying so. Returns True if the permissions are loose."""
+    try:
+        mode = path.stat().st_mode & 0o077
+    except OSError:
+        return False
+    if mode:
+        print(
+            f"bridget: WARNING: {path} is readable beyond its owner "
+            f"(mode {oct(path.stat().st_mode & 0o777)}). It holds your bot token.\n"
+            f"  fix with: chmod 600 {path}",
+            file=sys.stderr,
+        )
+        return True
+    return False
+
+
 def load_env_file(path: Path) -> dict:
+    """Parse a `key=value` env file.
+
+    Never logs a value: this file holds DISCORD_BOT_TOKEN, and bridget's whole
+    secret-handling contract is that the token is read into memory and handed to
+    discord.py, never echoed, printed, or written anywhere else.
+    """
     out = {}
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -139,6 +165,7 @@ def load_config() -> dict:
             f"  see {INSTALL_DOCS_URL} for setup instructions."
         )
 
+    warn_if_world_readable(ENV_FILE)
     file_env = load_env_file(ENV_FILE)
 
     def lookup(key: str) -> str | None:
@@ -626,18 +653,19 @@ def agent_cycle_paren(name: str) -> str:
         return '(last cycle ?, next cycle ?)'
 
 
-def format_mail_card(mail: dict, thread_url: str = '') -> str:
+def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '') -> str:
     """The DM card for one mail. Compact by design — the DM is a to-do list, not
     a reading surface; the thread holds the full text."""
     body_preview = mail['body']
     if len(body_preview) > 1200:
         body_preview = body_preview[:1200] + '\n…[truncated; use `read <mg-id>`]'
     msg = (
+        f"{prefix}"
         f"📬 **{mail['from']}** — {mail['subject']}\n"
         f"```\n{body_preview}\n```"
     )
-    if thread_url:
-        msg += f"\n💬 reply in thread: {thread_url}"
+    if thread_link:
+        msg += f"\n💬 reply in thread: {thread_link}"
     if len(msg) > DISCORD_MSG_LIMIT:
         msg = msg[:DISCORD_MSG_LIMIT] + '…'
     return msg
@@ -756,6 +784,12 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> None:
     Threading (when enabled) always happens: the log channel is the durable
     record, and muting a conversation should not make its mail disappear. Only
     the DM is gated.
+
+    The exception is a log channel we could not reach. The mail has already been
+    marked seen, so if we now also honor a `curated`/`none` policy or a mute, it
+    would never surface anywhere and never be retried. In that one case the DM is
+    the last surface standing, and it wins over policy, mute, and quiet hours —
+    a mail arriving at a bad hour is a smaller harm than a mail nobody ever sees.
     """
     key = conversation_key(mail, fallback=filename)
     conv = CONVERSATIONS.record(
@@ -769,10 +803,15 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> None:
     if THREADS_ENABLED:
         url = await post_to_thread(conv, mail)
 
-    if not should_dm(mail, key):
+    stranded = THREADS_ENABLED and not url
+    if not stranded and not should_dm(mail, key):
         return
+
+    prefix = ''
+    if stranded:
+        prefix = '⚠️ log channel unreachable — delivering here instead.\n'
     try:
-        await user.send(format_mail_card(mail, thread_url=url))
+        await user.send(format_mail_card(mail, thread_link=url, prefix=prefix))
     except discord.HTTPException as e:
         print(f'DM failed for {filename}: {e}', file=sys.stderr)
 
@@ -816,7 +855,13 @@ async def watch_mailbox(user: discord.User):
         try:
             SETTINGS.reload_if_changed()
             for filename, mail in watcher.poll():
-                await deliver_mail(user, filename, mail)
+                # Isolate each mail. poll() has already marked the whole batch
+                # seen, so letting one bad message abort the loop would silently
+                # swallow every mail queued behind it.
+                try:
+                    await deliver_mail(user, filename, mail)
+                except Exception as e:
+                    print(f"deliver failed for {filename}: {e}", file=sys.stderr)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)

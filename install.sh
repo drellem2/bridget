@@ -5,7 +5,24 @@
 # - Symlinks ~/.pogo/bin/bridget → this repo's bridget script.
 # - Seeds ~/.pogo/bridget.env from bridget.env.example if no env file exists.
 # - Verifies `mg` is on PATH and prints next-step instructions.
+#
+# With --setup, additionally prompts for the Discord credentials and writes them
+# into the env file. The bot token is read with the terminal echo off and is
+# never printed, logged, or passed on a command line — only a masked
+# confirmation (last 4 characters) is shown back.
 set -euo pipefail
+
+SETUP=0
+for arg in "$@"; do
+    case "$arg" in
+        --setup) SETUP=1 ;;
+        -h|--help)
+            printf 'usage: install.sh [--setup]\n\n'
+            printf '  --setup   prompt for Discord credentials (token entry is masked)\n'
+            exit 0 ;;
+        *) printf 'install.sh: unknown argument %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$HOME/.pogo/venv-bridget"
@@ -64,7 +81,78 @@ if [[ ! -e "$ENV_FILE" ]]; then
     cp "$ENV_EXAMPLE" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
 else
-    log "$ENV_FILE already exists — leaving it alone"
+    log "$ENV_FILE already exists — leaving its contents alone"
+fi
+
+# The env file holds the bot token. Enforce owner-only on every run, not just
+# on the run that created it: a hand-rolled env file is the common case, and a
+# 644 token is a real leak on a shared host.
+if [[ -e "$ENV_FILE" ]]; then
+    mode="$(stat -f '%OLp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE" 2>/dev/null || echo '')"
+    if [[ -n "$mode" && "$mode" != "600" ]]; then
+        log "tightening $ENV_FILE permissions ($mode → 600); it holds your bot token"
+        chmod 600 "$ENV_FILE"
+    fi
+fi
+
+# 3b. optional interactive setup — masked token entry
+#
+# Values are written with a temp file + mv so an interrupted run cannot leave a
+# half-written env file, and the temp file is created 600 before it holds
+# anything. The token never appears in argv, in the terminal, or in shell history.
+set_env_key() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+    chmod 600 "$tmp"
+    if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        # Rewrite in place via awk so the value never becomes a sed script.
+        VALUE="$value" awk -v k="$key" \
+            'BEGIN{FS=OFS="="} $1==k && !done {print k "=" ENVIRON["VALUE"]; done=1; next} {print}' \
+            "$ENV_FILE" > "$tmp"
+    else
+        cat "$ENV_FILE" > "$tmp" 2>/dev/null || true
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    fi
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
+
+mask() {
+    # Confirm the token round-tripped without disclosing it. Fixed-width, so
+    # the mask does not even leak the token's length; last 4 chars only, which
+    # is enough for a human to spot a paste error.
+    local v="$1"
+    if (( ${#v} <= 4 )); then printf '****'; else printf '****%s' "${v: -4}"; fi
+}
+
+if (( SETUP )); then
+    log "interactive setup — press Enter to keep an existing value"
+    printf '\n'
+
+    printf 'Discord bot token (input hidden): '
+    IFS= read -rs token || true
+    printf '\n'
+    if [[ -n "$token" ]]; then
+        set_env_key DISCORD_BOT_TOKEN "$token"
+        log "DISCORD_BOT_TOKEN set ($(mask "$token"))"
+        unset token
+    else
+        log "DISCORD_BOT_TOKEN unchanged"
+    fi
+
+    for key in DISCORD_USER_ID DISCORD_SERVER_ID; do
+        printf '%s (snowflake, digits only): ' "$key"
+        IFS= read -r value || true
+        if [[ -z "$value" ]]; then
+            log "$key unchanged"
+        elif [[ "$value" =~ ^[0-9]+$ ]]; then
+            set_env_key "$key" "$value"
+            log "$key set to $value"
+        else
+            warn "$key must be all digits — got '$value'. Leaving it unchanged."
+        fi
+    done
+    printf '\n'
 fi
 
 # 4. verify mg
@@ -81,16 +169,22 @@ cat <<EOF
 [install] Done.
 
 Next steps:
-  1. Edit $ENV_FILE — fill in DISCORD_BOT_TOKEN, DISCORD_USER_ID, DISCORD_SERVER_ID.
-  2. (Optional) Override default paths in $ENV_FILE if your design docs or
+  1. Fill in DISCORD_BOT_TOKEN, DISCORD_USER_ID, DISCORD_SERVER_ID — either edit
+     $ENV_FILE directly, or re-run with masked prompts:
+         bash install.sh --setup
+  2. (Optional) Turn on thread-per-conversation and the calm DM inbox:
+       - BRIDGET_LOG_CHANNEL_ID — guild text channel to root threads in
+       - BRIDGET_DM_POLICY      — all (default) | curated | none
+     See the "Conversation threads" section in README.md.
+  3. (Optional) Override default paths in $ENV_FILE if your design docs or
      inbox repo live elsewhere:
        - POGO_DESIGNS_DIR — default: ~/.pogo/designs
        - POGO_INBOX_REPO  — default: ~/.pogo/inbox
      See bridget.env.example for the full list of optional keys.
-  3. Run bridget:
+  4. Run bridget:
          $BIN_LINK
      The script reads its config from $ENV_FILE on startup.
-  4. To run bridget under a process supervisor (launchd / systemd / nohup),
+  5. To run bridget under a process supervisor (launchd / systemd / nohup),
      see the "Running as a service" section in README.md.
 
 EOF
