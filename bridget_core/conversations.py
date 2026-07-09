@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .statefile import write_state
 
 #: v2 added `posted_ids`. A v1 file loads cleanly — the field defaults to empty,
 #: which costs at most one duplicate post for a mail that was in flight across
@@ -154,14 +155,11 @@ class ConversationStore:
                 self._by_thread[conv.thread_id] = key
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             'version': SCHEMA_VERSION,
             'conversations': {k: c.to_json() for k, c in self._conversations.items()},
         }
-        tmp = self.path.parent / (self.path.name + '.tmp')
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
-        os.replace(tmp, self.path)
+        write_state(self.path, json.dumps(payload, indent=2, sort_keys=True) + '\n')
 
     # -- reads ------------------------------------------------------------
 

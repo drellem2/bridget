@@ -84,14 +84,31 @@ else
     log "$ENV_FILE already exists — leaving its contents alone"
 fi
 
+file_mode() {
+    stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null || echo ''
+}
+
 # The env file holds the bot token. Enforce owner-only on every run, not just
 # on the run that created it: a hand-rolled env file is the common case, and a
 # 644 token is a real leak on a shared host.
 if [[ -e "$ENV_FILE" ]]; then
-    mode="$(stat -f '%OLp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE" 2>/dev/null || echo '')"
+    mode="$(file_mode "$ENV_FILE")"
     if [[ -n "$mode" && "$mode" != "600" ]]; then
         log "tightening $ENV_FILE permissions ($mode → 600); it holds your bot token"
         chmod 600 "$ENV_FILE"
+    fi
+fi
+
+# The directory holding it, likewise. mkdir under the default umask of 022
+# leaves ~/.pogo at 0755, so the env file's own 600 is the only thing between a
+# co-tenant and your bot token — and bridget's state files next to it name every
+# agent you talk to and every conversation you muted.
+POGO_DIR="$(dirname "$ENV_FILE")"
+if [[ -d "$POGO_DIR" ]]; then
+    mode="$(file_mode "$POGO_DIR")"
+    if [[ -n "$mode" && "$mode" != "700" ]]; then
+        log "tightening $POGO_DIR permissions ($mode → 700)"
+        chmod 700 "$POGO_DIR"
     fi
 fi
 

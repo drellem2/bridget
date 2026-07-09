@@ -5,5 +5,11 @@ __pycache__/
 *.log
 .DS_Store
 
+# bridget reads its env file from ~/.pogo/bridget.env, so the real one lives
+# out of tree. But `cp bridget.env.example bridget.env` in the checkout is the
+# obvious thing to try, and the next `git add -A` would commit a bot token.
+# (`bridget.env.example` ends in .example, so it is not matched.)
+*.env
+
 # pogo creates a search index inside any visited project — not source
 .pogo/

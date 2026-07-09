@@ -18,11 +18,11 @@ adapter is responsible for making a redelivery idempotent.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 from .mail import parse_mail
+from .statefile import write_state
 
 
 class MaildirWatcher:
@@ -85,10 +85,7 @@ class MaildirWatcher:
             # be remembered or its mail gets delivered twice.
             self.seen &= present
 
-        self.seen_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.seen_file.parent / (self.seen_file.name + '.tmp')
-        tmp.write_text('\n'.join(sorted(self.seen)))
-        os.replace(tmp, self.seen_file)
+        write_state(self.seen_file, '\n'.join(sorted(self.seen)))
 
     # -- scanning ----------------------------------------------------------
 

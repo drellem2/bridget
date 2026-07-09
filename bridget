@@ -63,6 +63,7 @@ from bridget_core.mail import (  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
+from bridget_core.statefile import write_state  # noqa: E402
 
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
@@ -531,16 +532,13 @@ def load_quiet() -> dict:
 
 def save_quiet(state: dict) -> None:
     """Atomically write ~/.pogo/quiet.json with all schema keys populated."""
-    QUIET_FILE.parent.mkdir(parents=True, exist_ok=True)
     out = {
         'enabled': bool(state.get('enabled', False)),
         'start': state.get('start') or QUIET_DEFAULTS['start'],
         'end': state.get('end') or QUIET_DEFAULTS['end'],
         'updated_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
     }
-    tmp = QUIET_FILE.parent / (QUIET_FILE.name + '.tmp')
-    tmp.write_text(json.dumps(out, indent=2) + '\n')
-    os.replace(tmp, QUIET_FILE)
+    write_state(QUIET_FILE, json.dumps(out, indent=2) + '\n')
 
 
 def is_quiet_now() -> bool:
@@ -581,10 +579,7 @@ def load_task_states() -> tuple[dict, bool]:
 
 def save_task_states(states: dict) -> None:
     """Atomically write the task-state cache."""
-    TASK_STATES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = TASK_STATES_FILE.parent / (TASK_STATES_FILE.name + '.tmp')
-    tmp.write_text(json.dumps(states, indent=2, sort_keys=True) + '\n')
-    os.replace(tmp, TASK_STATES_FILE)
+    write_state(TASK_STATES_FILE, json.dumps(states, indent=2, sort_keys=True) + '\n')
 
 
 def load_idea_claims() -> tuple[set, bool]:
@@ -608,11 +603,8 @@ def load_idea_claims() -> tuple[set, bool]:
 
 def save_idea_claims(ids: set) -> None:
     """Atomically write the idea-claims cache."""
-    IDEA_CLAIMS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = IDEA_CLAIMS_FILE.parent / (IDEA_CLAIMS_FILE.name + '.tmp')
     payload = {'claimed_ids': sorted(ids)}
-    tmp.write_text(json.dumps(payload, indent=2) + '\n')
-    os.replace(tmp, IDEA_CLAIMS_FILE)
+    write_state(IDEA_CLAIMS_FILE, json.dumps(payload, indent=2) + '\n')
 
 
 _TRANSITION_FORMATS = {

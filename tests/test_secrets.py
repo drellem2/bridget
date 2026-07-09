@@ -165,5 +165,87 @@ class TestEnvFilePermissions(unittest.TestCase):
         self.assertIn('VALUE="$value" awk', install)
 
 
+class TestStateFilePermissions(unittest.TestCase):
+    """A8. The state files hold no token, but they do hold mail subjects, agent
+    names, and which conversations the human muted. Under the default umask of
+    022 a plain write_text lands them at 0644."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix='bridget-state-perm-'))
+
+    def _mode(self, p: Path) -> int:
+        return stat.S_IMODE(p.stat().st_mode)
+
+    def test_write_state_is_owner_only(self):
+        from bridget_core.statefile import write_state
+        p = self.d / 'x.json'
+        write_state(p, '{}')
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertEqual(p.read_text(), '{}')
+
+    def test_write_state_tightens_an_existing_loose_file(self):
+        from bridget_core.statefile import write_state
+        p = self.d / 'x.json'
+        p.write_text('old')
+        os.chmod(p, 0o644)
+        write_state(p, 'new')
+        self.assertEqual(self._mode(p), 0o600)
+
+    def test_write_state_leaves_no_temp_file_behind(self):
+        from bridget_core.statefile import write_state
+        write_state(self.d / 'x.json', '{}')
+        self.assertEqual([p.name for p in self.d.iterdir()], ['x.json'])
+
+    def test_a_directory_write_state_creates_is_owner_only(self):
+        from bridget_core.statefile import write_state
+        p = self.d / 'fresh' / 'x.json'
+        write_state(p, '{}')
+        self.assertEqual(self._mode(p.parent), 0o700)
+
+    def test_an_existing_directory_is_left_alone(self):
+        """~/.pogo is pogo's, not bridget's. install.sh tightens it where the
+        user can see it happen; the library does not re-permission it silently."""
+        from bridget_core.statefile import write_state
+        os.chmod(self.d, 0o755)
+        write_state(self.d / 'x.json', '{}')
+        self.assertEqual(self._mode(self.d), 0o755)
+
+    def test_every_state_store_lands_at_0600(self):
+        """The end-to-end claim, through the real store classes."""
+        from bridget_core import ConversationStore, MaildirWatcher, SettingsStore
+
+        conv = self.d / 'conversations.json'
+        ConversationStore(conv).record('k1', subject='secret subject', agent='mayor')
+        self.assertEqual(self._mode(conv), 0o600)
+
+        settings = self.d / 'settings.json'
+        SettingsStore(settings).mute('k1')
+        self.assertEqual(self._mode(settings), 0o600)
+
+        seen = self.d / 'bridget.seen'
+        (self.d / 'new').mkdir()
+        MaildirWatcher(self.d / 'new', seen).prime()
+        self.assertEqual(self._mode(seen), 0o600)
+
+    def test_installer_tightens_the_pogo_directory(self):
+        install = (REPO / 'install.sh').read_text()
+        self.assertIn('chmod 700 "$POGO_DIR"', install)
+
+
+class TestGitignoreCoversAnInTreeEnvFile(unittest.TestCase):
+    """A9. The real env file lives at ~/.pogo/bridget.env, out of tree. But
+    `cp bridget.env.example bridget.env` in the checkout is the obvious thing to
+    try, and the next `git add -A` would commit a bot token."""
+
+    def test_a_dotenv_file_in_the_checkout_is_ignored(self):
+        r = subprocess.run(['git', 'check-ignore', '-q', 'bridget.env'], cwd=REPO)
+        self.assertEqual(r.returncode, 0, 'bridget.env is not gitignored')
+
+    def test_the_example_is_still_tracked(self):
+        r = subprocess.run(['git', 'check-ignore', '-q', 'bridget.env.example'], cwd=REPO)
+        self.assertEqual(r.returncode, 1, 'the example template must stay tracked')
+        self.assertIn(REPO / 'bridget.env.example', tracked_files())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

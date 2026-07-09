@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 import sys
 from pathlib import Path
+
+from .statefile import write_state
 
 SCHEMA_VERSION = 1
 
@@ -115,7 +116,6 @@ class SettingsStore:
         return True
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.updated_at = self._clock()
         payload = {
             'version': SCHEMA_VERSION,
@@ -124,9 +124,7 @@ class SettingsStore:
             'muted': sorted(self.muted),
             'updated_at': self.updated_at,
         }
-        tmp = self.path.parent / (self.path.name + '.tmp')
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
-        os.replace(tmp, self.path)
+        write_state(self.path, json.dumps(payload, indent=2, sort_keys=True) + '\n')
         self._stamp = self._read_stamp()
 
     # -- queries ----------------------------------------------------------
