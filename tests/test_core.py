@@ -35,6 +35,12 @@ from bridget_core import (  # noqa: E402
 )
 from bridget_core.acks import AMBIGUOUS, DELIVERED, UNDELIVERABLE  # noqa: E402
 from bridget_core.mail import reply_target, thread_title  # noqa: E402
+from bridget_core.mgshim import (  # noqa: E402
+    MgCapabilities,
+    build_send_args,
+    help_advertises_in_reply_to,
+    is_unknown_flag_error,
+)
 
 
 def tmpdir(prefix: str) -> Path:
@@ -464,6 +470,164 @@ class TestMaildirWatcher(unittest.TestCase):
             self.write_mail(n)
         w.prime()
         self.assertEqual(w.seen, {'2', '3'})
+
+
+#: Verbatim `mg mail send --help` from a build WITHOUT gh#66. Note the long
+#: description is absent here; the Flags block is the contract.
+HELP_WITHOUT = """Send a message to an agent's mailbox.
+
+Usage:
+  mg mail send AGENT [flags]
+
+Flags:
+      --body string      message body (required)
+      --from string      sender name (required)
+  -h, --help             help for send
+      --json             emit a single JSON object instead of human-formatted output
+      --subject string   message subject (required)
+"""
+
+#: Verbatim `mg mail send --help` from a build WITH gh#66.
+HELP_WITH = """Send a message to an agent's mailbox.
+
+Every delivered message carries a Message-Id equal to its MSG-ID. Pass
+--in-reply-to MSG-ID to mark this message as a reply.
+
+Usage:
+  mg mail send AGENT [flags]
+
+Flags:
+      --body string          message body (required)
+      --from string          sender name (required)
+  -h, --help                 help for send
+      --in-reply-to string   MSG-ID this message replies to
+      --json                 emit a single JSON object instead of human-formatted output
+      --subject string       message subject (required)
+"""
+
+#: The trap: prose advertises the flag, the Flags block does not define it.
+#: An mg build really did ship this way, and passing the flag to it errors.
+HELP_PROSE_ONLY = """Send a message to an agent's mailbox.
+
+Pass --in-reply-to MSG-ID to mark this message as a reply: it writes In-Reply-To
+and seeds References.
+
+Usage:
+  mg mail send AGENT [flags]
+
+Flags:
+      --body string      message body (required)
+      --from string      sender name (required)
+      --subject string   message subject (required)
+"""
+
+
+class TestHelpProbe(unittest.TestCase):
+    def test_detects_the_flag_in_the_flags_block(self):
+        self.assertTrue(help_advertises_in_reply_to(HELP_WITH))
+
+    def test_absent_flag_detected(self):
+        self.assertFalse(help_advertises_in_reply_to(HELP_WITHOUT))
+
+    def test_prose_mention_alone_does_not_count(self):
+        """The flag-set is the contract, not the description."""
+        self.assertFalse(help_advertises_in_reply_to(HELP_PROSE_ONLY))
+
+    def test_empty_help_is_not_a_capability(self):
+        self.assertFalse(help_advertises_in_reply_to(''))
+
+
+class TestUnknownFlagDetection(unittest.TestCase):
+    def test_recognizes_cobra_unknown_flag_error(self):
+        self.assertTrue(is_unknown_flag_error('Error: unknown flag: --in-reply-to'))
+
+    def test_other_errors_are_not_unknown_flag(self):
+        self.assertFalse(is_unknown_flag_error('Error: no such mailbox'))
+
+    def test_unknown_flag_for_a_different_flag_does_not_match(self):
+        self.assertFalse(is_unknown_flag_error('Error: unknown flag: --colour'))
+
+    def test_empty_stderr(self):
+        self.assertFalse(is_unknown_flag_error(''))
+
+
+class TestMgCapabilities(unittest.TestCase):
+    def test_auto_probes_help_once(self):
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return HELP_WITH
+
+        caps = MgCapabilities(probe)
+        self.assertTrue(caps.correlation_ids)
+        self.assertTrue(caps.correlation_ids)
+        self.assertEqual(len(calls), 1, 'probe should be cached')
+
+    def test_auto_detects_absence(self):
+        self.assertFalse(MgCapabilities(lambda: HELP_WITHOUT).correlation_ids)
+
+    def test_mode_on_skips_the_probe(self):
+        def probe():
+            raise AssertionError('should not probe when forced on')
+
+        self.assertTrue(MgCapabilities(probe, mode='on').correlation_ids)
+
+    def test_mode_off_skips_the_probe(self):
+        def probe():
+            raise AssertionError('should not probe when forced off')
+
+        self.assertFalse(MgCapabilities(probe, mode='off').correlation_ids)
+
+    def test_failing_probe_degrades_to_off(self):
+        def probe():
+            raise OSError('mg not found')
+
+        self.assertFalse(MgCapabilities(probe).correlation_ids)
+
+    def test_downgrade_sticks(self):
+        """mg got rebuilt mid-session; the cached probe is now a lie."""
+        caps = MgCapabilities(lambda: HELP_WITH)
+        self.assertTrue(caps.correlation_ids)
+        caps.downgrade()
+        self.assertFalse(caps.correlation_ids)
+
+    def test_downgrade_does_not_override_a_forced_on(self):
+        caps = MgCapabilities(lambda: HELP_WITHOUT, mode='on')
+        caps.downgrade()
+        self.assertTrue(caps.correlation_ids)
+
+    def test_bogus_mode_falls_back_to_auto(self):
+        self.assertTrue(MgCapabilities(lambda: HELP_WITH, mode='sideways').correlation_ids)
+
+    def test_describe_reports_state_and_how(self):
+        self.assertEqual(MgCapabilities(lambda: HELP_WITH).describe(), 'on (detected)')
+        self.assertEqual(MgCapabilities(lambda: HELP_WITH, mode='off').describe(), 'off (forced)')
+
+
+class TestBuildSendArgs(unittest.TestCase):
+    def test_basic_args(self):
+        args = build_send_args('mayor', 'subj', 'body')
+        self.assertEqual(args[:3], ['mail', 'send', 'mayor'])
+        self.assertIn('--from=human', args)
+        self.assertIn('--subject=subj', args)
+        self.assertIn('--body=body', args)
+
+    def test_in_reply_to_appended_only_when_given(self):
+        self.assertNotIn('--in-reply-to=', ' '.join(build_send_args('a', 's', 'b')))
+        self.assertIn('--in-reply-to=id-1',
+                      build_send_args('a', 's', 'b', in_reply_to='id-1'))
+
+    def test_empty_body_becomes_placeholder(self):
+        self.assertIn('--body=(no body)', build_send_args('a', 's', ''))
+
+    def test_subject_is_truncated(self):
+        args = build_send_args('a', 'x' * 500, 'b')
+        subject = next(a for a in args if a.startswith('--subject='))
+        self.assertEqual(len(subject) - len('--subject='), 200)
+
+    def test_sender_is_overridable(self):
+        self.assertIn('--from=bot', build_send_args('a', 's', 'b', sender='bot'))
 
 
 class TestAcks(unittest.TestCase):

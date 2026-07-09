@@ -41,10 +41,30 @@ try:
 except ImportError:  # pragma: no cover — fallback for 3.10
     tomllib = None
 
+# The transport-agnostic core. Nothing below the `import discord` line may leak
+# back into it — see bridget_core/__init__.py for the split.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridget_core import (  # noqa: E402
+    ConversationStore,
+    MaildirWatcher,
+    MgCapabilities,
+    SettingsStore,
+    acks,
+    build_send_args,
+    conversation_key,
+    is_unknown_flag_error,
+    parse_mail,
+)
+from bridget_core.mail import reply_target, thread_title  # noqa: E402
+from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
+from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
+
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
 CHANNELS_FILE = HOME / '.pogo' / 'bridget.channels.toml'
+CONVERSATIONS_FILE = HOME / '.pogo' / 'bridget.conversations.json'
+SETTINGS_FILE = HOME / '.pogo' / 'bridget.settings.json'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
@@ -86,6 +106,10 @@ COMMAND_LIST = (
     "• `nudge <agent> [reason]` — wake a stalled agent\n"
     "• `restart` — git pull + restart bridget (after merging a PR)\n"
     "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
+    "• `settings` — show DM policy, mutes, and threading state\n"
+    "• `dm <all|curated|none>` — how much mail reaches your DMs\n"
+    "• `mute all` / `unmute all` — silence every DM (mail still threads)\n"
+    "• in a thread: type a reply to mail it back; `mute` / `unmute` that conversation\n"
     "• `help` (or `?`) — this list"
 )
 
@@ -195,6 +219,35 @@ def load_config() -> dict:
     except re.error as e:
         die(f"BRIDGET_CREW_PATTERN is not a valid regex: {e}")
 
+    # Threading. Discord threads only exist inside guild text channels — a DM
+    # channel cannot host one. So conversation threads are rooted in a "log"
+    # channel, and the DM stays the curated inbox. Unset → threading off and
+    # behavior is identical to v1.x.
+    log_channel_str = lookup('BRIDGET_LOG_CHANNEL_ID')
+    log_channel_id = None
+    if log_channel_str:
+        try:
+            log_channel_id = int(log_channel_str)
+        except ValueError:
+            die("BRIDGET_LOG_CHANNEL_ID must be an integer (a Discord channel snowflake).")
+
+    correlation_ids = (lookup('BRIDGET_CORRELATION_IDS') or 'auto').strip().lower()
+    if correlation_ids not in CORRELATION_MODES:
+        die(f"BRIDGET_CORRELATION_IDS must be one of {', '.join(CORRELATION_MODES)} "
+            f"(got {correlation_ids!r}).")
+
+    dm_policy = (lookup('BRIDGET_DM_POLICY') or DEFAULT_DM_POLICY).strip().lower()
+    if dm_policy not in DM_POLICIES:
+        die(f"BRIDGET_DM_POLICY must be one of {', '.join(DM_POLICIES)} (got {dm_policy!r}).")
+    if dm_policy != 'all' and log_channel_id is None:
+        # Without a log channel there is no second surface, so a policy that
+        # suppresses DMs would silently drop mail. Refuse rather than swallow.
+        die(
+            f"BRIDGET_DM_POLICY={dm_policy} needs BRIDGET_LOG_CHANNEL_ID set — otherwise\n"
+            f"  mail suppressed from your DMs would have nowhere else to go.\n"
+            f"  see bridget.env.example for the threading setup."
+        )
+
     return {
         'token': lookup('DISCORD_BOT_TOKEN'),
         'user_id': user_id,
@@ -213,6 +266,9 @@ def load_config() -> dict:
         'approval_re': approval_re,
         'restart_cmd': restart_cmd,
         'crew_pattern': crew_pattern,
+        'log_channel_id': log_channel_id,
+        'dm_policy': dm_policy,
+        'correlation_ids': correlation_ids,
     }
 
 
@@ -344,6 +400,26 @@ QUIET_RESPECTS_OUTBOUND = CONFIG['quiet_respects_outbound']
 APPROVAL_RE = CONFIG['approval_re']
 RESTART_CMD = CONFIG['restart_cmd']
 CREW_PATTERN = CONFIG['crew_pattern']
+LOG_CHANNEL_ID = CONFIG['log_channel_id']
+
+#: Threading is opt-in: it needs somewhere to put the threads. Without a log
+#: channel the bridge behaves exactly as it did before threads existed.
+THREADS_ENABLED = LOG_CHANNEL_ID is not None
+
+#: The conversation <-> Discord-thread map, and the live mute/DM-policy state.
+#: Both persist to ~/.pogo/ and survive restarts.
+CONVERSATIONS = ConversationStore(CONVERSATIONS_FILE)
+SETTINGS = SettingsStore(SETTINGS_FILE, default_dm_policy=CONFIG['dm_policy'])
+
+
+def _probe_mg_help() -> str:
+    """`mg mail send --help`, for the correlation-ID capability probe."""
+    return run_mg(['mail', 'send', '--help'])[1]
+
+
+#: Whether this build of mg speaks `--in-reply-to` (macguffin gh#66). Probed
+#: lazily on first reply, and downgraded if a send is ever rejected for it.
+MG_CAPS = MgCapabilities(_probe_mg_help, mode=CONFIG['correlation_ids'])
 
 # Per-channel routing config. Empty dicts when ~/.pogo/bridget.channels.toml is
 # missing — bridget then falls back to v1.0.0 DM-only behavior.
@@ -370,34 +446,8 @@ intents.guild_messages = True
 client = discord.Client(intents=intents)
 
 
-def parse_mail(content: str) -> dict:
-    lines = content.splitlines()
-    headers = {}
-    body_start = len(lines)
-    for i, line in enumerate(lines):
-        if line == '':
-            body_start = i + 1
-            break
-        if ': ' in line:
-            k, v = line.split(': ', 1)
-            headers[k.lower()] = v
-    body = '\n'.join(lines[body_start:])
-    return {
-        'from': headers.get('from', '?'),
-        'subject': headers.get('subject', '?'),
-        'body': body,
-    }
-
-
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        return set(SEEN_FILE.read_text().splitlines())
-    return set()
-
-
-def save_seen(seen: set) -> None:
-    SEEN_FILE.write_text('\n'.join(sorted(seen)))
-
+# parse_mail, the seen-set, the conversation map and the settings store all live
+# in bridget_core now; they are imported at the top of this file.
 
 QUIET_DEFAULTS = {'enabled': False, 'start': '23:00', 'end': '06:00'}
 TIME_RE = re.compile(r'^[0-2]\d:[0-5]\d$')
@@ -576,66 +626,197 @@ def agent_cycle_paren(name: str) -> str:
         return '(last cycle ?, next cycle ?)'
 
 
+def format_mail_card(mail: dict, thread_url: str = '') -> str:
+    """The DM card for one mail. Compact by design — the DM is a to-do list, not
+    a reading surface; the thread holds the full text."""
+    body_preview = mail['body']
+    if len(body_preview) > 1200:
+        body_preview = body_preview[:1200] + '\n…[truncated; use `read <mg-id>`]'
+    msg = (
+        f"📬 **{mail['from']}** — {mail['subject']}\n"
+        f"```\n{body_preview}\n```"
+    )
+    if thread_url:
+        msg += f"\n💬 reply in thread: {thread_url}"
+    if len(msg) > DISCORD_MSG_LIMIT:
+        msg = msg[:DISCORD_MSG_LIMIT] + '…'
+    return msg
+
+
+def wants_attention(mail: dict) -> bool:
+    """True if this mail asks the human for a decision, and so earns a DM even
+    under the `curated` policy. Today that means an approval request, matched
+    with the same BRIDGET_APPROVAL_RE the `status` view uses."""
+    return bool(APPROVAL_RE.match(f"Subject: {mail['subject']}"))
+
+
+def should_dm(mail: dict, conversation: str) -> bool:
+    """Decide whether this mail interrupts the human.
+
+    Three gates, in order of authority:
+      quiet hours   — an explicit do-not-disturb window
+      mute          — the human silenced this conversation (or all of them)
+      DM policy     — how much of the firehose reaches the DM at all
+    """
+    if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
+        return False
+    if SETTINGS.is_muted(conversation):
+        return False
+    if SETTINGS.dm_policy == 'none':
+        return False
+    if SETTINGS.dm_policy == 'curated':
+        return wants_attention(mail)
+    return True
+
+
+def thread_url(thread_id) -> str:
+    return f'https://discord.com/channels/{SERVER_ID}/{thread_id}'
+
+
+async def resolve_thread(conv, mail: dict):
+    """Return the Discord thread rendering `conv`, creating it if needed.
+
+    A conversation's first mail posts a root card in the log channel and opens a
+    thread off it; later mail in the same chain posts into that thread. The
+    thread id is persisted, so a restart re-attaches to the existing thread
+    rather than rooting a duplicate.
+
+    Returns None if the log channel is unusable — the caller falls back to a DM
+    rather than dropping the mail.
+    """
+    if conv.thread_id is not None:
+        thread = client.get_channel(conv.thread_id)
+        if thread is None:
+            try:
+                thread = await client.fetch_channel(conv.thread_id)
+            except (discord.NotFound, discord.Forbidden):
+                # The human deleted the thread. Drop the binding and re-root.
+                thread = None
+            except discord.HTTPException as e:
+                print(f'thread fetch failed ({conv.thread_id}): {e}', file=sys.stderr)
+                return None
+        if thread is not None:
+            if getattr(thread, 'archived', False):
+                # Discord refuses sends to an archived thread; reopen it.
+                try:
+                    await thread.edit(archived=False)
+                except discord.HTTPException as e:
+                    print(f'thread unarchive failed ({conv.thread_id}): {e}', file=sys.stderr)
+                    return None
+            return thread
+
+    channel = client.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(LOG_CHANNEL_ID)
+        except discord.HTTPException as e:
+            print(f'log channel {LOG_CHANNEL_ID} unusable: {e}', file=sys.stderr)
+            return None
+    if not hasattr(channel, 'create_thread'):
+        print(
+            f'log channel {LOG_CHANNEL_ID} cannot host threads — '
+            f'BRIDGET_LOG_CHANNEL_ID must name a guild text channel, not a '
+            f'DM, category, or voice channel.',
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        root = await channel.send(f"📬 **{mail['from']}** — {mail['subject']}")
+        thread = await root.create_thread(name=conv.subject[:100] or 'conversation')
+    except discord.HTTPException as e:
+        print(f'thread create failed for {conv.key}: {e}', file=sys.stderr)
+        return None
+
+    CONVERSATIONS.bind_thread(conv.key, thread.id)
+    return thread
+
+
+async def post_to_thread(conv, mail: dict) -> str:
+    """Post `mail` into its conversation thread. Returns the thread URL, or ''
+    if the thread could not be reached."""
+    thread = await resolve_thread(conv, mail)
+    if thread is None:
+        return ''
+    body = mail['body'] or '(no body)'
+    text = f"**{mail['from']}** — {mail['subject']}\n```\n{body}\n```"
+    if len(text) > DISCORD_MSG_LIMIT:
+        text = text[:DISCORD_MSG_LIMIT] + '…'
+    try:
+        await thread.send(text)
+    except discord.HTTPException as e:
+        print(f'thread send failed ({thread.id}): {e}', file=sys.stderr)
+        return ''
+    return thread_url(thread.id)
+
+
+async def deliver_mail(user: discord.User, filename: str, mail: dict) -> None:
+    """Route one new mail to the surfaces it belongs on.
+
+    Threading (when enabled) always happens: the log channel is the durable
+    record, and muting a conversation should not make its mail disappear. Only
+    the DM is gated.
+    """
+    key = conversation_key(mail, fallback=filename)
+    conv = CONVERSATIONS.record(
+        key,
+        subject=thread_title(mail),
+        agent=mail['from'],
+        message_id=reply_target(mail, fallback=filename),
+    )
+
+    url = ''
+    if THREADS_ENABLED:
+        url = await post_to_thread(conv, mail)
+
+    if not should_dm(mail, key):
+        return
+    try:
+        await user.send(format_mail_card(mail, thread_url=url))
+    except discord.HTTPException as e:
+        print(f'DM failed for {filename}: {e}', file=sys.stderr)
+
+
+async def send_startup_dm(user: discord.User, first_run: bool) -> None:
+    if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
+        return
+    if SETTINGS.mute_all:
+        return
+    try:
+        if first_run:
+            await user.send(
+                "🔔 bridget online. I'll DM you when new mail arrives in "
+                "`human/new/`. Recognized replies:\n" + COMMAND_LIST
+            )
+            return
+        summary = get_status_summary()
+        if len(summary) > STATUS_OUTPUT_BUDGET:
+            summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+        await user.send(
+            f"🔔 bridget online.\n\n{summary}\n\n"
+            f"Send `help` for a list of commands."
+        )
+    except discord.HTTPException as e:
+        print(f"startup DM failed: {e}", file=sys.stderr)
+
+
 async def watch_mailbox(user: discord.User):
-    seen = load_seen()
-    quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
-    if not SEEN_FILE.exists() and MAIL_DIR.exists():
-        for p in MAIL_DIR.iterdir():
-            seen.add(p.name)
-        save_seen(seen)
-        if not quiet_outbound:
-            try:
-                await user.send(
-                    "🔔 bridget online. I'll DM you when new mail arrives in "
-                    "`human/new/`. Recognized replies:\n" + COMMAND_LIST
-                )
-            except discord.HTTPException as e:
-                print(f"startup DM failed: {e}", file=sys.stderr)
-    else:
-        if not quiet_outbound:
-            try:
-                summary = get_status_summary()
-                if len(summary) > STATUS_OUTPUT_BUDGET:
-                    summary = summary[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
-                await user.send(
-                    f"🔔 bridget online.\n\n{summary}\n\n"
-                    f"Send `help` for a list of commands."
-                )
-            except discord.HTTPException as e:
-                print(f"startup DM failed: {e}", file=sys.stderr)
+    """Poll the human's maildir and deliver new mail. Observe-only: the watcher
+    reads `new/` and never moves anything out of it — `mg mail read` owns that,
+    and the `dismiss`/`read` commands are the only things here that mark mail
+    read, because the human asked them to."""
+    watcher = MaildirWatcher(MAIL_DIR, SEEN_FILE)
+    first_run = not watcher.primed
+    if first_run:
+        # Adopt the backlog rather than replaying it into chat.
+        watcher.prime()
+    await send_startup_dm(user, first_run)
 
     while not client.is_closed():
         try:
-            if MAIL_DIR.exists():
-                current = {p.name for p in MAIL_DIR.iterdir()}
-                quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
-                for fname in sorted(current - seen):
-                    fpath = MAIL_DIR / fname
-                    try:
-                        mail = parse_mail(fpath.read_text())
-                    except Exception as e:
-                        print(f"parse error {fname}: {e}", file=sys.stderr)
-                        seen.add(fname)
-                        continue
-                    body_preview = mail['body']
-                    if len(body_preview) > 1200:
-                        body_preview = body_preview[:1200] + '\n…[truncated; use `read <mg-id>`]'
-                    msg = (
-                        f"📬 **{mail['from']}** — {mail['subject']}\n"
-                        f"```\n{body_preview}\n```"
-                    )
-                    if len(msg) > DISCORD_MSG_LIMIT:
-                        msg = msg[:DISCORD_MSG_LIMIT] + '…'
-                    if quiet_outbound:
-                        # Suppress DM during quiet hours; mail still visible via `status`.
-                        seen.add(fname)
-                        continue
-                    try:
-                        await user.send(msg)
-                        seen.add(fname)
-                    except discord.HTTPException as e:
-                        print(f"send failed for {fname}: {e}", file=sys.stderr)
-                save_seen(seen)
+            SETTINGS.reload_if_changed()
+            for filename, mail in watcher.poll():
+                await deliver_mail(user, filename, mail)
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)
@@ -652,19 +833,6 @@ def agent_seen_file(agent: str) -> Path:
     DM watcher and the channel watchers don't fight over each other's state."""
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', agent)
     return HOME / '.pogo' / f'bridget.seen.{safe}'
-
-
-def load_agent_seen(agent: str) -> set:
-    p = agent_seen_file(agent)
-    if p.exists():
-        return set(p.read_text().splitlines())
-    return set()
-
-
-def save_agent_seen(agent: str, seen: set) -> None:
-    p = agent_seen_file(agent)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text('\n'.join(sorted(seen)))
 
 
 def format_agent_mail_msg(mail: dict) -> str:
@@ -692,48 +860,31 @@ async def watch_agent_mailbox(channel_entry: dict):
         return
     agent = channel_entry['agent']
     snowflake = channel_entry['snowflake']
-    mail_dir = agent_mail_dir(agent)
-    seen_file = agent_seen_file(agent)
 
-    seen = load_agent_seen(agent)
-    # Prime on first run so we don't flood the channel with backlog.
-    if not seen_file.exists() and mail_dir.exists():
-        for p in mail_dir.iterdir():
-            seen.add(p.name)
-        save_agent_seen(agent, seen)
+    watcher = MaildirWatcher(agent_mail_dir(agent), agent_seen_file(agent))
+    if not watcher.primed:
+        # Adopt the backlog on first run so we don't flood the channel.
+        watcher.prime()
 
     while not client.is_closed():
         try:
             channel = client.get_channel(snowflake)
             if channel is None:
                 # The bot may not have joined the guild yet, or the channel
-                # snowflake is wrong. Don't churn — just wait and retry.
+                # snowflake is wrong. Don't churn — just wait and retry, and
+                # crucially don't poll: a mail consumed now would be marked
+                # seen and never reach the channel.
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
-            if not mail_dir.exists():
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-            current = {p.name for p in mail_dir.iterdir()}
             quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
-            for fname in sorted(current - seen):
-                fpath = mail_dir / fname
-                try:
-                    mail = parse_mail(fpath.read_text())
-                except Exception as e:
-                    print(f"agent-mail parse error {agent}/{fname}: {e}",
-                          file=sys.stderr)
-                    seen.add(fname)
-                    continue
+            for fname, mail in watcher.poll():
                 if quiet_outbound:
-                    seen.add(fname)
                     continue
                 try:
                     await channel.send(format_agent_mail_msg(mail))
-                    seen.add(fname)
                 except discord.HTTPException as e:
                     print(f"agent-mail send failed for {agent}/{fname}: {e}",
                           file=sys.stderr)
-            save_agent_seen(agent, seen)
         except Exception as e:
             print(f"watch_agent_mailbox({agent}) loop error: {e}",
                   file=sys.stderr)
@@ -1389,6 +1540,41 @@ def handle_command(text: str) -> str:
         save_quiet(state)
         return f"✓ quiet hours: disabled. (window {state['start']}–{state['end']} preserved for next enable)"
 
+    if low == 'settings':
+        subjects = {c.key: f'**{c.agent}** — {c.subject}' for c in CONVERSATIONS.values()}
+        out = SETTINGS.describe(subjects)
+        if not THREADS_ENABLED:
+            out += '\n• Threads: `off` (set BRIDGET_LOG_CHANNEL_ID to enable)'
+        else:
+            out += f'\n• Threads: `on` → <#{LOG_CHANNEL_ID}>'
+            out += f'\n• Conversations tracked: **{len(CONVERSATIONS)}**'
+        out += f'\n• Correlation IDs (reply threading): `{MG_CAPS.describe()}`'
+        return out
+
+    if low == 'dm' or low.startswith('dm '):
+        arg = text[2:].strip().lower()
+        if not arg:
+            return f'DM policy is `{SETTINGS.dm_policy}`. Set with `dm <{" | ".join(DM_POLICIES)}>`.'
+        if arg not in DM_POLICIES:
+            return f'✗ unknown DM policy `{arg}`. Choose one of: {", ".join(DM_POLICIES)}.'
+        if arg != 'all' and not THREADS_ENABLED:
+            return (f'✗ `dm {arg}` needs a log channel, or suppressed mail would have\n'
+                    f'nowhere to go. Set BRIDGET_LOG_CHANNEL_ID and restart.')
+        SETTINGS.set_dm_policy(arg)
+        return f'✓ DM policy: `{arg}`.'
+
+    if low == 'mute all':
+        return ('✓ all DMs muted. Mail still threads into the log channel.'
+                if SETTINGS.set_mute_all(True) else 'All DMs were already muted.')
+
+    if low in ('unmute all', 'unmute'):
+        return ('✓ DMs unmuted.' if SETTINGS.set_mute_all(False)
+                else 'DMs were not muted.')
+
+    if low == 'mute':
+        return ('Reply `mute` inside a conversation thread to silence it, or '
+                '`mute all` to silence every DM.')
+
     if low == 'status' or low.startswith('status'):
         summary = get_status_summary()
         if len(summary) > STATUS_OUTPUT_BUDGET:
@@ -1400,6 +1586,38 @@ def handle_command(text: str) -> str:
         return summary
 
     return UNRECOGNIZED_REPLY
+
+
+def handle_thread_message(text: str, conv) -> str:
+    """A message typed inside a conversation thread.
+
+    `mute` / `unmute` act on *this* conversation — that is the whole ergonomic
+    win of threads, since the human never has to name the thing they're looking
+    at. Anything else is a reply, mailed back to the agent with the reply
+    threaded onto the conversation.
+    """
+    low = text.strip().lower()
+
+    if low == 'mute':
+        return ('🔕 muted — this conversation stops DMing you. It keeps threading '
+                'here. `unmute` to undo.' if SETTINGS.mute(conv.key)
+                else 'Already muted.')
+    if low == 'unmute':
+        return ('🔔 unmuted.' if SETTINGS.unmute(conv.key)
+                else 'This conversation was not muted.')
+    if low in ('help', '?'):
+        return ('In a thread: type a reply to mail it back to '
+                f'`{conv.agent}`, or `mute` / `unmute` this conversation.\n\n'
+                + COMMAND_LIST)
+
+    # A workflow verb typed in a thread still means what it means everywhere
+    # else — approving a design shouldn't depend on which surface you typed it
+    # into. Only free-form text becomes a reply.
+    reply = handle_command(text)
+    if reply != UNRECOGNIZED_REPLY:
+        return reply
+
+    return str(reply_in_conversation(text, conv))
 
 
 def send_channel_chat_mail(text: str, agent: str) -> str:
@@ -1427,6 +1645,56 @@ def send_channel_chat_mail(text: str, agent: str) -> str:
     return f'✗ mail failed: {(err or out).strip()[:200]}'
 
 
+def reply_in_conversation(text: str, conv) -> acks.Ack:
+    """Mail a thread reply back to the agent on the other end.
+
+    This is what the correlation-ID work buys: `--in-reply-to` threads the reply
+    onto the newest message in the chain, so the agent's mailbox shows a real
+    conversation rather than a pile of unrelated top-level mails, and the agent's
+    own reply comes back carrying References that route it to this same thread.
+    """
+    text = text.strip()
+    if not text:
+        return acks.undeliverable('empty message')
+    if not conv.agent or conv.agent == '?':
+        return acks.undeliverable(
+            'this conversation has no known sender to reply to', agent=conv.agent)
+
+    if '\n' in text:
+        subject, body = text.split('\n', 1)
+        subject, body = subject.strip(), body.rstrip()
+    else:
+        subject, body = f'Re: {conv.subject}', text
+
+    # The seam. Threading needs both a known parent id and an mg that speaks
+    # --in-reply-to; missing either, the reply still goes out, just untethered.
+    in_reply_to = conv.last_message_id if MG_CAPS.correlation_ids else ''
+
+    rc, out, err = run_mg(build_send_args(
+        conv.agent, subject, body, sender='human', in_reply_to=in_reply_to))
+
+    if rc != 0 and in_reply_to and is_unknown_flag_error(err or out):
+        # mg was swapped under us (an unrelated `go install` will do it). Our
+        # cached capability is stale — downgrade and resend, rather than telling
+        # the human their reply was undeliverable when it plainly is not.
+        print('mg rejected --in-reply-to; disabling correlation IDs for this '
+              'process and retrying without threading', file=sys.stderr)
+        MG_CAPS.downgrade()
+        in_reply_to = ''
+        rc, out, err = run_mg(build_send_args(
+            conv.agent, subject, body, sender='human'))
+
+    if rc != 0:
+        return acks.undeliverable((err or out).strip(), agent=conv.agent)
+    return acks.delivered(conv.agent, subject, in_reply_to=in_reply_to)
+
+
+def recent_conversations(limit: int = 5) -> list:
+    """(label, key) for the most recently active conversations, newest first."""
+    convs = sorted(CONVERSATIONS.values(), key=lambda c: c.updated_at, reverse=True)
+    return [(f'**{c.agent}** — {c.subject}', c.key) for c in convs[:limit]]
+
+
 def handle_channel_message(text: str, channel_entry: dict) -> str:
     """Route an inbound guild-channel message. Workflow verbs (approve/reject/
     revise/idea:/etc.) keep routing through `POGO_WORKFLOW_AGENT` exactly like
@@ -1448,6 +1716,17 @@ async def on_ready():
         print(f"user {USER_ID} not found", file=sys.stderr)
         await client.close()
         return
+    if THREADS_ENABLED:
+        print(f"threading on: conversations root in channel {LOG_CHANNEL_ID}; "
+              f"{len(CONVERSATIONS)} conversation(s) restored; "
+              f"dm_policy={SETTINGS.dm_policy}", flush=True)
+    else:
+        print("threading off: set BRIDGET_LOG_CHANNEL_ID to enable "
+              "thread-per-conversation", flush=True)
+    # Probes `mg mail send --help` once. Replies still deliver when this is
+    # off; they just arrive as new top-level mail instead of threading.
+    print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
+
     client.loop.create_task(watch_mailbox(user))
     client.loop.create_task(watch_task_transitions(user))
     client.loop.create_task(watch_idea_claims(user))
@@ -1477,13 +1756,31 @@ async def on_message(message: discord.Message):
     if message.author.id != USER_ID:
         return
 
-    if isinstance(message.channel, discord.DMChannel):
+    channel = message.channel
+
+    if isinstance(channel, discord.DMChannel):
         reply = handle_command(message.content)
+    elif isinstance(channel, discord.Thread):
+        # A conversation thread we opened: the message is a reply to that
+        # conversation. Threads we don't own (the human's own, or another
+        # bot's) are ignored, same as unmapped channels.
+        conv = CONVERSATIONS.by_thread(channel.id)
+        if conv is None:
+            return
+        SETTINGS.reload_if_changed()
+        reply = handle_thread_message(message.content, conv)
+    elif THREADS_ENABLED and channel.id == LOG_CHANNEL_ID:
+        # Free-form text in the log channel itself, outside any thread. We
+        # cannot know which conversation it answers — say so, and show what it
+        # might have meant, rather than silently doing nothing or guessing.
+        reply = handle_command(message.content)
+        if reply == UNRECOGNIZED_REPLY:
+            reply = str(acks.ambiguous(recent_conversations()))
     else:
         # Guild text channel: only respond if it's mapped for inbound routing.
         # Unmapped channels are ignored silently — bridget shouldn't chat in
         # arbitrary guild channels just because the bot is in the server.
-        channel_entry = CHANNELS_BY_SNOWFLAKE.get(message.channel.id)
+        channel_entry = CHANNELS_BY_SNOWFLAKE.get(channel.id)
         if channel_entry is None:
             return
         reply = handle_channel_message(message.content, channel_entry)

@@ -12,6 +12,8 @@ Slack, Matrix, or a terminal:
     conversations — the conversation <-> thread map, persisted across restarts.
     settings      — live-tunable mute/settings state, persisted.
     acks          — the delivery / ambiguity / undeliverable outcome model.
+    mgshim        — the mg CLI seam: detect whether this build of mg supports
+                    correlation IDs, and degrade cleanly when it does not.
 
 The Discord presentation adapter lives in the top-level `bridget` script: DM
 cards, guild threads, and the slash/keyword command surface. Keeping the split
@@ -22,6 +24,7 @@ from .acks import Ack, ambiguous, delivered, undeliverable
 from .conversations import Conversation, ConversationStore
 from .mail import conversation_key, parse_mail
 from .mailbox import MaildirWatcher
+from .mgshim import MgCapabilities, build_send_args, is_unknown_flag_error
 from .settings import SettingsStore
 
 __all__ = [
@@ -29,10 +32,13 @@ __all__ = [
     'Conversation',
     'ConversationStore',
     'MaildirWatcher',
+    'MgCapabilities',
     'SettingsStore',
     'ambiguous',
+    'build_send_args',
     'conversation_key',
     'delivered',
+    'is_unknown_flag_error',
     'parse_mail',
     'undeliverable',
 ]
