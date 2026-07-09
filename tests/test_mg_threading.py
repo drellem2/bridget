@@ -3,15 +3,28 @@
 
 Every other suite feeds the bridge hand-authored maildir fixtures. That is why
 this bug shipped: the fixtures all carried the conversation root in
-`References[0]`, and mg only ever writes it there on the first hop. From the
-second hop on, `mg mail send --in-reply-to X` — the stateless primitive both
-the bridge and every agent reply through — seeds `References: [X]`, where X is
-the *parent*. A fixture can assert whatever it likes; mg is the contract.
+`References[0]`, and mg only ever writes it there on the first hop. A fixture
+can assert whatever it likes; mg is the contract.
 
 So these tests shell out to mg and let it write the headers. They fail on the
 message that used to split the thread, and they pin the mg behaviour that makes
 the message-id index necessary, so a future reader can tell whether the index
 is still earning its keep.
+
+An agent answers its mail one of two ways, and they lose the conversation root
+at *different hops*, so both are driven here:
+
+    mg mail send --in-reply-to X   seeds `References: [X]` — the parent, and
+                                   nothing else, at every hop. Loses the root
+                                   immediately; splits on round-trip one.
+    mg mail reply AGENT/ID         extends the References of the message it
+                                   read. Carries the root through hop one, then
+                                   extends an ancestry that never knew it.
+                                   Splits on round-trip two.
+
+Covering only one of them cannot distinguish a complete fix from an incomplete
+one — which is the coverage argument that put this file here in the first place,
+applied to itself.
 
 Skipped when mg is absent, or when the mg on PATH predates correlation IDs —
 there is nothing to thread with, and the bridge is documented to degrade rather
@@ -54,6 +67,10 @@ HAVE_MG = _mg_speaks_correlation_ids()
 class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
     """A sandboxed macguffin root, a real mg, and a fake Discord."""
 
+    #: Which command the agent answers the bridge with: 'send' for
+    #: `mg mail send --in-reply-to`, 'reply' for `mg mail reply`.
+    AGENT_REPLY = 'send'
+
     def setUp(self):
         self.b = load_threaded()
         self.home = Path(self.b._fake_home)
@@ -84,37 +101,70 @@ class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.returncode, 0, f'mg {" ".join(args)} failed: {r.stderr}')
         return r.stdout
 
-    def _maildir(self, agent: str) -> Path:
-        return self.home / '.macguffin' / 'mail' / agent / 'new'
+    def _maildir(self, agent: str, box: str = 'new') -> Path:
+        return self.home / '.macguffin' / 'mail' / agent / box
 
-    def _agent_mails_human(self, subject: str, body: str, in_reply_to: str = '') -> str:
-        """What an agent does: `mg mail send --in-reply-to <the message it read>`.
+    def _mailbox(self, agent: str) -> list[str]:
+        """Every message ever delivered to `agent`. `mg mail reply` marks the
+        message it answers read, moving it from `new/` to `cur/`, so a scan of
+        `new/` alone loses mail the moment the agent uses that command."""
+        names = []
+        for box in ('new', 'cur'):
+            path = self._maildir(agent, box)
+            if path.exists():
+                names.extend(p.name for p in path.iterdir())
+        return sorted(names)
 
-        Not `mg mail reply`. The bug hid behind the assumption that agents use
-        the ancestry-extending command; overwhelmingly they use this one.
-        """
+    def _agent_sends_to_human(self, subject: str, body: str, in_reply_to: str = '') -> str:
+        """`mg mail send --in-reply-to` — the stateless primitive. Seeds
+        `References: [parent]` and nothing else, at every hop."""
         args = ['mail', 'send', 'human', '--from=mayor',
                 f'--subject={subject}', f'--body={body}', '--json']
         if in_reply_to:
             args.append(f'--in-reply-to={in_reply_to}')
         return json.loads(self._mg(*args))['msg_id']
 
+    def _agent_replies_to_human(self, body: str, parent: str) -> str:
+        """`mg mail reply` — the ancestry-extending wrapper. Seeds
+        `References: [<the parent's own references>, parent]`.
+
+        `--force` because the test drives mg as a third party: reply marks the
+        original read, and mg refuses to do that to a mailbox `$POGO_AGENT_NAME`
+        does not own.
+        """
+        out = self._mg('mail', 'reply', f'mayor/{parent}', f'--body={body}',
+                       '--force', '--json')
+        return json.loads(out)['msg_id']
+
+    def _agent_answers(self, body: str, subject: str = 'Re: design review') -> str:
+        """However this suite's agent answers the bridge's latest reply.
+
+        The two commands fail differently — `mg mail send --in-reply-to` drops
+        the root on the *first* hop, `mg mail reply` carries it for one hop and
+        drops it on the *second* — so the contract below is run under both.
+        """
+        parent = self._newest_mail_to_mayor()
+        if self.AGENT_REPLY == 'reply':
+            return self._agent_replies_to_human(body, parent)
+        return self._agent_sends_to_human(subject, body, in_reply_to=parent)
+
     def _newest_mail_to_mayor(self) -> str:
         """The id of the bridge's latest reply, as the agent would read it."""
-        unseen = sorted(p.name for p in self._maildir('mayor').iterdir()
-                        if p.name not in self.mayor_seen)
+        unseen = [n for n in self._mailbox('mayor') if n not in self.mayor_seen]
         self.assertTrue(unseen, 'the bridge sent the agent nothing')
         self.mayor_seen.update(unseen)
         return unseen[-1]
 
     async def _deliver_new_mail(self) -> None:
         """Run every unseen maildir file through the real delivery path."""
-        for path in sorted(self._maildir('human').iterdir()):
-            if path.name in self.delivered:
+        for name in self._mailbox('human'):
+            if name in self.delivered:
                 continue
-            self.delivered.add(path.name)
+            self.delivered.add(name)
+            path = next(p for p in (self._maildir('human', 'new') / name,
+                                    self._maildir('human', 'cur') / name) if p.exists())
             await self.b.deliver_mail(
-                self.user, path.name, self.b.parse_mail(path.read_text()))
+                self.user, name, self.b.parse_mail(path.read_text()))
 
     def _human_replies(self, text: str) -> None:
         conv = self.b.CONVERSATIONS.by_thread(self.channel.threads[0].id)
@@ -124,38 +174,67 @@ class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def _two_round_trips(self) -> str:
         """root -> human reply -> agent reply -> human reply -> agent reply."""
-        root = self._agent_mails_human('design review', 'what do you think?')
+        root = self._agent_sends_to_human('design review', 'what do you think?')
         await self._deliver_new_mail()
 
         self._human_replies('looks good')
-        self._agent_mails_human('Re: design review', 'shipping it',
-                                in_reply_to=self._newest_mail_to_mayor())
+        self._agent_answers('shipping it')
         await self._deliver_new_mail()
 
         self._human_replies('one more thing')
-        self._agent_mails_human('Re: design review', 'fixed',
-                                in_reply_to=self._newest_mail_to_mayor())
+        self._agent_answers('fixed')
         await self._deliver_new_mail()
         return root
 
 
 class TestMgHeaderContract(RealMgTestCase):
-    """Pin what mg actually writes. These are the facts the fixtures got wrong."""
+    """Pin what mg actually writes. These are the facts the fixtures got wrong.
 
-    def test_references_carry_the_parent_not_the_root_past_the_first_hop(self):
-        root = self._agent_mails_human('design review', 'q')
-        second = self._agent_mails_human('Re: design review', 'a', in_reply_to=root)
-        third = self._agent_mails_human('Re: design review', 'b', in_reply_to=second)
+    Neither reply command carries the conversation root past its own horizon.
+    They just lose it at different hops, which is why one of them is not enough
+    coverage to tell a complete fix from an incomplete one.
+    """
 
-        hop2 = self.b.parse_mail((self._maildir('human') / second).read_text())
-        hop3 = self.b.parse_mail((self._maildir('human') / third).read_text())
+    def _refs(self, agent: str, msg_id: str) -> list[str]:
+        path = next(p for p in (self._maildir(agent, 'new') / msg_id,
+                                self._maildir(agent, 'cur') / msg_id) if p.exists())
+        return self.b.parse_mail(path.read_text())['references']
+
+    def _human_mails_mayor(self, body: str, in_reply_to: str) -> str:
+        out = self._mg('mail', 'send', 'mayor', '--from=human', '--subject=Re: design review',
+                       f'--body={body}', f'--in-reply-to={in_reply_to}', '--json')
+        return json.loads(out)['msg_id']
+
+    def test_send_in_reply_to_names_the_parent_and_loses_the_root_at_hop_two(self):
+        root = self._agent_sends_to_human('design review', 'q')
+        second = self._agent_sends_to_human('Re: design review', 'a', in_reply_to=root)
+        third = self._agent_sends_to_human('Re: design review', 'b', in_reply_to=second)
 
         # The first hop looks exactly like every fixture in the tree...
-        self.assertEqual(hop2['references'], [root])
+        self.assertEqual(self._refs('human', second), [root])
         # ...and the second is where that assumption dies.
-        self.assertEqual(hop3['references'], [second])
-        self.assertNotIn(root, hop3['references'],
+        self.assertEqual(self._refs('human', third), [second])
+        self.assertNotIn(root, self._refs('human', third),
                          'mg now extends ancestry; the message-id index may be redundant')
+
+    def test_mg_mail_reply_extends_ancestry_but_loses_the_root_at_hop_two(self):
+        """`mg mail reply` reads the original and extends *its* References. The
+        original was seeded by `mg mail send --in-reply-to`, which carries only
+        the parent — so the extension is two ids deep and the root falls off one
+        hop later than it does for a bare send."""
+        root = self._agent_sends_to_human('design review', 'q')
+        h1 = self._human_mails_mayor('a', in_reply_to=root)
+        m2 = self._agent_replies_to_human('b', parent=h1)
+        h2 = self._human_mails_mayor('c', in_reply_to=m2)
+        m3 = self._agent_replies_to_human('d', parent=h2)
+
+        # Hop one keeps the root, which is why a `mg mail reply` chain used to
+        # survive exactly one round-trip longer than a bare send.
+        self.assertEqual(self._refs('human', m2), [root, h1])
+        # Hop two extends the ancestry of a message that never knew the root.
+        self.assertEqual(self._refs('human', m3), [m2, h2])
+        self.assertNotIn(root, self._refs('human', m3),
+                         'mg mail reply now reaches the root; the index may be redundant')
 
     def test_send_reports_the_id_it_assigned(self):
         """The bridge cannot index its own replies without this."""
@@ -166,8 +245,22 @@ class TestMgHeaderContract(RealMgTestCase):
         self.assertTrue((self._maildir('human') / msg_id).exists(),
                         'msg_id is not the maildir filename')
 
+    def test_mg_mail_reply_reports_the_id_it_assigned(self):
+        root = self._agent_sends_to_human('design review', 'q')
+        h1 = self._human_mails_mayor('a', in_reply_to=root)
+        m2 = self._agent_replies_to_human('b', parent=h1)
+        self.assertTrue(m2)
+        self.assertIn(m2, self._mailbox('human'), 'msg_id is not the maildir filename')
 
-class TestTwoRoundTrips(RealMgTestCase):
+
+class TwoRoundTripContract:
+    """What must hold whichever command the agent answers with.
+
+    A mixin, not a TestCase: the concrete classes below pair it with
+    `RealMgTestCase` once per reply command, so each variant gets its own fresh
+    sandbox rather than sharing one and hiding a failure behind the other.
+    """
+
     async def test_the_whole_exchange_stays_in_one_thread(self):
         """The regression. Before the message-id index this made three threads:
         one per inbound mail, because each reply keyed on its own parent."""
@@ -183,12 +276,21 @@ class TestTwoRoundTrips(RealMgTestCase):
                       'the conversation drifted off its root')
 
     async def test_the_bridge_indexes_the_replies_it_sends(self):
-        """The agent's reply names *our* message id and nothing older. If we
-        never recorded it, `resolve()` would miss and mint a new conversation."""
+        """The agent's reply names *our* message id. Whether that is the only
+        thing tying the answer to its conversation depends on how the agent
+        replied, so this assertion — not the thread count — is what pins the
+        outbound fold under both commands.
+
+        Under `mg mail send --in-reply-to`, our id is the whole of the answer's
+        `References`, so dropping the fold breaks threading outright. Under
+        `mg mail reply`, the answer's ancestry also names the previous *inbound*
+        message, which the store already knows, so threading limps on and only
+        this test and `test_a_restart_rejoins_the_conversation` notice.
+        """
         await self._two_round_trips()
 
         conv = next(iter(self.b.CONVERSATIONS.values()))
-        outbound = sorted(p.name for p in self._maildir('mayor').iterdir())
+        outbound = self._mailbox('mayor')
         self.assertEqual(len(outbound), 2, 'expected two replies from the human')
         for msg_id in outbound:
             self.assertIn(msg_id, conv.message_ids,
@@ -197,14 +299,13 @@ class TestTwoRoundTrips(RealMgTestCase):
     async def test_a_mute_still_applies_after_the_first_round_trip(self):
         """Mutes are keyed on the conversation. A conversation that re-keys on
         every message is a mute that silently stops applying."""
-        root = self._agent_mails_human('design review', 'q')
+        root = self._agent_sends_to_human('design review', 'q')
         await self._deliver_new_mail()
         self.b.SETTINGS.mute(root)
         dms_before = len(self.user.sent)
 
         self._human_replies('looks good')
-        self._agent_mails_human('Re: design review', 'shipping it',
-                                in_reply_to=self._newest_mail_to_mayor())
+        self._agent_answers('shipping it')
         await self._deliver_new_mail()
 
         self.assertEqual(len(self.user.sent), dms_before,
@@ -214,7 +315,7 @@ class TestTwoRoundTrips(RealMgTestCase):
 
     async def test_a_restart_rejoins_the_conversation(self):
         """The index is rebuilt from the persisted map, not held in memory."""
-        root = self._agent_mails_human('design review', 'q')
+        root = self._agent_sends_to_human('design review', 'q')
         await self._deliver_new_mail()
         self._human_replies('looks good')
         reply_id = self._newest_mail_to_mayor()
@@ -223,6 +324,30 @@ class TestTwoRoundTrips(RealMgTestCase):
         store = ConversationStore(self.b.CONVERSATIONS.path)
         self.assertEqual(store.resolve([reply_id]), root,
                          'a restarted bridge forgot the reply it had sent')
+
+
+class TestTwoRoundTripsViaSend(TwoRoundTripContract, RealMgTestCase):
+    """The agent answers with `mg mail send --in-reply-to`, as agents mostly do.
+
+    Every hop names only its parent, so an unfixed bridge splits the thread on
+    the *first* round-trip, and a bridge that indexes inbound mail but forgets
+    its own replies splits it just the same.
+    """
+
+    AGENT_REPLY = 'send'
+
+
+class TestTwoRoundTripsViaReply(TwoRoundTripContract, RealMgTestCase):
+    """The agent answers with `mg mail reply`, which extends the ancestry it
+    read instead of seeding a fresh one.
+
+    That carries the root through hop one, so an unfixed bridge splits the
+    thread on the *second* round-trip rather than the first. The two commands
+    therefore fail at different hops, and a suite covering one cannot tell a
+    complete fix from an incomplete one.
+    """
+
+    AGENT_REPLY = 'reply'
 
 
 if __name__ == '__main__':

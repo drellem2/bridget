@@ -61,9 +61,17 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   one entry per message. No mail was ever lost. Conversations are now matched by
   a message-id index, and bridget records the id `mg` assigns each reply it
   sends — the agent's answer names that id and nothing older.
-  `tests/test_mg_threading.py` drives a real `mg` through two round-trips; the
-  hand-authored `References` fixtures that let this ship could not have caught
-  it, because none of them carried the header shape `mg` actually writes.
+  `tests/test_mg_threading.py` drives a real `mg` through two round-trips, under
+  both commands an agent answers with (`mg mail send --in-reply-to` and `mg mail
+  reply`, which lose the root at different hops); the hand-authored `References`
+  fixtures that let this ship could not have caught it, because none of them
+  carried the header shape `mg` actually writes.
+
+  A consequence worth stating plainly: **conversation identity no longer depends
+  on the subject line.** Nothing keys on it. A reply whose first line becomes the
+  outbound subject (the multi-line-reply behaviour) cannot move a message out of
+  its conversation, so that behaviour is now purely cosmetic and can be changed
+  or left alone on its own merits.
 
 ### Changed
 
