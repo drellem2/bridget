@@ -159,6 +159,17 @@ class TestThreadTitle(unittest.TestCase):
     def test_strips_repeated_re(self):
         self.assertEqual(thread_title(parse_mail('Subject: Re: RE: x\n\nb')), 'x')
 
+    def test_subject_of_only_re_falls_back_to_the_sender(self):
+        """Otherwise the thread is named 'Re:', which tells the human nothing."""
+        self.assertEqual(thread_title(parse_mail('From: mayor\nSubject: Re:\n\nb')),
+                         'mail from mayor')
+        self.assertEqual(thread_title(parse_mail('From: mayor\nSubject: Re: \n\nb')),
+                         'mail from mayor')
+
+    def test_does_not_eat_a_subject_that_merely_starts_with_re(self):
+        self.assertEqual(thread_title(parse_mail('Subject: rescue the build\n\nb')),
+                         'rescue the build')
+
     def test_truncates_to_limit(self):
         title = thread_title(parse_mail('Subject: ' + 'x' * 200 + '\n\nb'))
         self.assertLessEqual(len(title), 90)

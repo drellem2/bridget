@@ -127,8 +127,8 @@ def thread_title(mail: dict, limit: int = 90) -> str:
     caps thread names at 100.
     """
     subject = (mail.get('subject') or '').strip()
-    while subject[:4].lower() == 're: ':
-        subject = subject[4:].lstrip()
+    while subject[:3].lower() == 're:':
+        subject = subject[3:].lstrip()
     if not subject or subject == '?':
         sender = mail.get('from') or 'unknown'
         subject = f'mail from {sender}'
