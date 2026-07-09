@@ -171,23 +171,17 @@ class SettingsStore:
         self.save()
         return True
 
-    def describe(self, conversation_subjects: dict | None = None) -> str:
-        """A human-readable settings dump for the `settings` command."""
-        lines = [
-            '⚙️ **bridget settings**',
-            f'• DM policy: `{self.dm_policy}`',
-            f'• Mute all DMs: `{str(self.mute_all).lower()}`',
-        ]
-        if self.muted:
-            lines.append(f'• Muted conversations: **{len(self.muted)}**')
-            subjects = conversation_subjects or {}
-            for key in sorted(self.muted)[:10]:
-                label = subjects.get(key) or key
-                lines.append(f'    – {label}')
-            if len(self.muted) > 10:
-                lines.append(f'    … and {len(self.muted) - 10} more')
-        else:
-            lines.append('• Muted conversations: none')
-        if self.updated_at:
-            lines.append(f'• Updated: {self.updated_at}')
-        return '\n'.join(lines)
+    def summary(self, conversation_subjects: dict | None = None) -> dict:
+        """The settings, as facts. The adapter renders them.
+
+        `muted` is resolved to display labels here because only the store knows
+        the keys; how many of them to show, and what a bullet looks like, is the
+        adapter's business.
+        """
+        subjects = conversation_subjects or {}
+        return {
+            'dm_policy': self.dm_policy,
+            'mute_all': self.mute_all,
+            'muted': [(key, subjects.get(key) or key) for key in sorted(self.muted)],
+            'updated_at': self.updated_at,
+        }

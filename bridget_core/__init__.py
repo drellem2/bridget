@@ -14,10 +14,19 @@ Slack, Matrix, or a terminal:
     acks          — the delivery / ambiguity / undeliverable outcome model.
     mgshim        — the mg CLI seam: detect whether this build of mg supports
                     correlation IDs, and degrade cleanly when it does not.
+    statefile     — atomic, owner-only writes for everything above.
 
 The Discord presentation adapter lives in the top-level `bridget` script: DM
 cards, guild threads, and the slash/keyword command surface. Keeping the split
 means porting the bridge to another platform is a new adapter, not a rewrite.
+
+**Nothing here renders.** The core returns outcomes and facts — an `Ack.kind`,
+a `SettingsStore.summary()` dict, a `thread_title` trimmed to whatever length
+the caller asked for. Emoji, `**bold**`, backticks and Discord's character caps
+all live in the adapter, which is the only file that knows what a message looks
+like. `tests/test_core.py::TestCoreCarriesNoPresentation` is the tripwire: the
+drift it catches is the easy kind, where someone adds one formatted string to a
+core module because that is where the data already is.
 """
 
 from .acks import Ack, ambiguous, delivered, undeliverable

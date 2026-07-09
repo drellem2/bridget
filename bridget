@@ -89,8 +89,11 @@ CREDIT_BALANCE_RE = re.compile(
 
 DISCORD_MSG_LIMIT = 1900  # leave headroom under the 2000 char limit
 
-#: Discord caps a thread name at 100 characters. The core does not know that —
-#: it renders a title to whatever length the adapter asks for.
+#: Discord's hard cap on a thread name. The core does not know it exists.
+DISCORD_THREAD_NAME_LIMIT = 100
+
+#: What we actually ask the core to trim a title to, leaving headroom under the
+#: hard cap for the ellipsis and for a subject that is all wide characters.
 THREAD_TITLE_LIMIT = 90
 STATUS_OUTPUT_BUDGET = 1700
 
@@ -725,6 +728,87 @@ def code_block(body: str, budget: int | None = None) -> str:
     return f'```\n{body}\n```'
 
 
+# -- rendering the core's outcome types -------------------------------------
+#
+# `bridget_core` hands us facts: an Ack's `kind` and the fields behind it, a
+# settings `summary()` dict. Everything below turns those into Discord — emoji,
+# `**bold**`, backticks, and the character budgets Discord imposes. It is the
+# only place that knows what a message looks like, which is what makes "port to
+# Slack" a new adapter rather than a rewrite.
+
+#: How much of a subject an ack echoes back before eliding it.
+ACK_SUBJECT_LIMIT = 60
+
+#: How much of mg's rejection we quote. Long enough to be actionable.
+ACK_REASON_LIMIT = 300
+
+#: Ambiguity candidates listed before "… and N more".
+ACK_CANDIDATE_LIMIT = 5
+
+#: Muted conversations listed by the `settings` command before eliding.
+SETTINGS_MUTED_LIMIT = 10
+
+
+def _elide(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+def render_ack(ack: acks.Ack) -> str:
+    """Turn a delivery outcome into the line the human reads."""
+    if ack.kind == acks.DELIVERED:
+        text = f'✅ delivered to `{ack.agent}`'
+        if ack.subject:
+            text += f' — "{_elide(ack.subject, ACK_SUBJECT_LIMIT)}"'
+        if ack.in_reply_to:
+            # Surfacing the threading tells the human their reply will land *in*
+            # the conversation, not as a fresh top-level mail.
+            text += '\n↳ threaded as a reply'
+        return text
+
+    if ack.kind == acks.AMBIGUOUS:
+        n = len(ack.candidates)
+        if n == 0:
+            text = (
+                "⚠️ I can't tell which conversation this replies to.\n"
+                'Reply inside a conversation thread, or use `mail <subject>` to '
+                'start a new one.'
+            )
+        else:
+            text = f'⚠️ ambiguous — this could reply to **{n}** conversations:\n'
+            text += '\n'.join(f'• {label}'
+                              for label, _ in ack.candidates[:ACK_CANDIDATE_LIMIT])
+            if n > ACK_CANDIDATE_LIMIT:
+                text += f'\n… and {n - ACK_CANDIDATE_LIMIT} more'
+            text += '\nReply inside the thread you mean.'
+        if ack.hint:
+            text += f'\n{ack.hint}'
+        return text
+
+    where = f' to `{ack.agent}`' if ack.agent else ''
+    reason = _elide(ack.reason, ACK_REASON_LIMIT) or 'unknown error'
+    return f'❌ undeliverable{where}: {reason}'
+
+
+def render_settings(summary: dict) -> str:
+    """Turn `SettingsStore.summary()` into the `settings` command's output."""
+    lines = [
+        '⚙️ **bridget settings**',
+        f"• DM policy: `{summary['dm_policy']}`",
+        f"• Mute all DMs: `{str(summary['mute_all']).lower()}`",
+    ]
+    muted = summary['muted']
+    if muted:
+        lines.append(f'• Muted conversations: **{len(muted)}**')
+        lines.extend(f'    – {label}' for _, label in muted[:SETTINGS_MUTED_LIMIT])
+        if len(muted) > SETTINGS_MUTED_LIMIT:
+            lines.append(f'    … and {len(muted) - SETTINGS_MUTED_LIMIT} more')
+    else:
+        lines.append('• Muted conversations: none')
+    if summary['updated_at']:
+        lines.append(f"• Updated: {summary['updated_at']}")
+    return '\n'.join(lines)
+
+
 def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
                      hint: str = '; use `read <mg-id>`') -> str:
     """The card for one mail. Compact by design — the DM is a to-do list, not a
@@ -835,7 +919,8 @@ async def resolve_thread(conv, mail: dict):
 
     try:
         root = await channel.send(f"📬 **{mail['from']}** — {mail['subject']}")
-        thread = await root.create_thread(name=conv.subject[:100] or 'conversation')
+        thread = await root.create_thread(
+            name=conv.subject[:DISCORD_THREAD_NAME_LIMIT] or 'conversation')
     except discord.HTTPException as e:
         print(f'thread create failed for {conv.key}: {e}', file=sys.stderr)
         return None
@@ -1706,7 +1791,7 @@ def handle_command(text: str) -> str:
 
     if low == 'settings':
         subjects = {c.key: f'**{c.agent}** — {c.subject}' for c in CONVERSATIONS.values()}
-        out = SETTINGS.describe(subjects)
+        out = render_settings(SETTINGS.summary(subjects))
         if not THREADS_ENABLED:
             out += '\n• Threads: `off` (set BRIDGET_LOG_CHANNEL_ID to enable)'
         else:
@@ -1792,7 +1877,7 @@ def handle_thread_message(text: str, conv) -> str:
         if reply != UNRECOGNIZED_REPLY:
             return reply
 
-    return str(reply_in_conversation(text, conv))
+    return render_ack(reply_in_conversation(text, conv))
 
 
 def send_channel_chat_mail(text: str, agent: str) -> str:
@@ -1961,7 +2046,7 @@ async def on_message(message: discord.Message):
         # might have meant, rather than silently doing nothing or guessing.
         reply = handle_command(message.content)
         if reply == UNRECOGNIZED_REPLY:
-            reply = str(acks.ambiguous(recent_conversations()))
+            reply = render_ack(acks.ambiguous(recent_conversations()))
     else:
         # Guild text channel: only respond if it's mapped for inbound routing.
         # Unmapped channels are ignored silently — bridget shouldn't chat in

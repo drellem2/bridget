@@ -170,7 +170,7 @@ class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
         conv = self.b.CONVERSATIONS.by_thread(self.channel.threads[0].id)
         self.assertIsNotNone(conv, 'the thread lost its conversation')
         ack = self.b.reply_in_conversation(text, conv)
-        self.assertTrue(ack.ok, f'reply not delivered: {ack.text}')
+        self.assertTrue(ack.ok, f'reply not delivered: {ack.kind}: {ack.reason}')
 
     async def _two_round_trips(self) -> str:
         """root -> human reply -> agent reply -> human reply -> agent reply."""

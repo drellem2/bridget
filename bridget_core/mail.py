@@ -174,12 +174,15 @@ def reply_target(mail: dict, fallback: str = '') -> str:
     return mail.get('message_id') or fallback
 
 
-def thread_title(mail: dict, limit: int = 90) -> str:
+def thread_title(mail: dict, limit: int | None = None) -> str:
     """A human-readable thread name for the conversation this mail roots.
 
     Strips a leading "Re: " so a thread opened from a reply reads the same as
-    one opened from the original, and trims to `limit` characters — Discord
-    caps thread names at 100.
+    one opened from the original.
+
+    `limit` is the adapter's, not ours. Discord caps a thread name at 100
+    characters; Slack does not have threads with names at all. The default is no
+    limit — a caller that has a cap passes it.
     """
     subject = (mail.get('subject') or '').strip()
     while subject[:3].lower() == 're:':
@@ -187,6 +190,6 @@ def thread_title(mail: dict, limit: int = 90) -> str:
     if not subject or subject == '?':
         sender = mail.get('from') or 'unknown'
         subject = f'mail from {sender}'
-    if len(subject) > limit:
+    if limit is not None and len(subject) > limit:
         subject = subject[: limit - 1].rstrip() + '…'
     return subject

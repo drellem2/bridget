@@ -262,9 +262,15 @@ class TestThreadTitle(unittest.TestCase):
         self.assertEqual(thread_title(parse_mail('Subject: rescue the build\n\nb')),
                          'rescue the build')
 
-    def test_truncates_to_limit(self):
-        title = thread_title(parse_mail('Subject: ' + 'x' * 200 + '\n\nb'))
+    def test_truncates_to_the_limit_the_caller_asks_for(self):
+        title = thread_title(parse_mail('Subject: ' + 'x' * 200 + '\n\nb'), limit=90)
         self.assertLessEqual(len(title), 90)
+        self.assertTrue(title.endswith('…'))
+
+    def test_no_limit_means_no_truncation(self):
+        """Discord's 100-char thread-name cap is the adapter's, not the core's."""
+        title = thread_title(parse_mail('Subject: ' + 'x' * 200 + '\n\nb'))
+        self.assertEqual(len(title), 200)
 
     def test_missing_subject_names_the_sender(self):
         self.assertEqual(thread_title(parse_mail('From: mayor\n\nb')), 'mail from mayor')
@@ -655,21 +661,34 @@ class TestSettingsStore(unittest.TestCase):
         self.path.write_text(json.dumps({'dm_policy': 'screaming'}))
         self.assertEqual(SettingsStore(self.path).dm_policy, 'all')
 
-    def test_describe_labels_muted_conversations(self):
+    def test_summary_labels_muted_conversations(self):
         s = SettingsStore(self.path)
         s.mute('k1')
-        out = s.describe({'k1': 'design review'})
-        self.assertIn('design review', out)
+        self.assertEqual(s.summary({'k1': 'design review'})['muted'],
+                         [('k1', 'design review')])
 
-    def test_describe_falls_back_to_key_when_subject_unknown(self):
+    def test_summary_falls_back_to_key_when_subject_unknown(self):
         s = SettingsStore(self.path)
         s.mute('k1')
-        self.assertIn('k1', s.describe())
+        self.assertEqual(s.summary()['muted'], [('k1', 'k1')])
 
-    def test_describe_reports_the_active_policy(self):
+    def test_summary_reports_the_active_policy(self):
         s = SettingsStore(self.path)
         s.set_dm_policy('curated')
-        self.assertIn('curated', s.describe())
+        self.assertEqual(s.summary()['dm_policy'], 'curated')
+
+    def test_summary_does_not_cap_the_muted_list(self):
+        """How many to show is the adapter's decision."""
+        s = SettingsStore(self.path)
+        for i in range(15):
+            s.mute(f'k{i}')
+        self.assertEqual(len(s.summary()['muted']), 15)
+
+    def test_summary_sorts_muted_keys(self):
+        s = SettingsStore(self.path)
+        s.mute('kb')
+        s.mute('ka')
+        self.assertEqual([k for k, _ in s.summary()['muted']], ['ka', 'kb'])
 
 
 class TestMaildirWatcher(unittest.TestCase):
@@ -1093,45 +1112,101 @@ class TestParseSentMessageId(unittest.TestCase):
 
 
 class TestAcks(unittest.TestCase):
-    def test_delivered_names_the_agent(self):
+    """An Ack is data: `kind` plus the facts behind it. What it *looks like* is
+    the adapter's business — see TestRenderAck in test_threading.py."""
+
+    def test_delivered_carries_the_agent_and_subject(self):
         ack = delivered('mayor', 'design review')
         self.assertEqual(ack.kind, DELIVERED)
         self.assertTrue(ack.ok)
-        self.assertIn('mayor', ack.text)
-        self.assertIn('design review', ack.text)
+        self.assertEqual(ack.agent, 'mayor')
+        self.assertEqual(ack.subject, 'design review')
+        self.assertEqual(ack.in_reply_to, '')
 
-    def test_delivered_flags_threading_when_replying(self):
-        self.assertIn('threaded', delivered('mayor', 's', in_reply_to='id-1').text)
-        self.assertNotIn('threaded', delivered('mayor', 's').text)
+    def test_delivered_records_what_it_threads_onto(self):
+        self.assertEqual(delivered('mayor', 's', in_reply_to='id-1').in_reply_to, 'id-1')
 
-    def test_delivered_truncates_long_subject(self):
-        self.assertIn('…', delivered('mayor', 'x' * 100).text)
+    def test_delivered_does_not_truncate_the_subject(self):
+        """A character budget is Discord's, not the core's."""
+        self.assertEqual(delivered('mayor', 'x' * 100).subject, 'x' * 100)
 
-    def test_ambiguous_with_no_candidates_tells_the_human_what_to_do(self):
+    def test_ambiguous_with_no_candidates(self):
         ack = ambiguous([])
         self.assertEqual(ack.kind, AMBIGUOUS)
         self.assertFalse(ack.ok)
-        self.assertIn('mail <subject>', ack.text)
+        self.assertEqual(ack.candidates, [])
 
-    def test_ambiguous_lists_candidates_and_caps_the_list(self):
+    def test_ambiguous_keeps_every_candidate(self):
         cands = [(f'conv {i}', f'k{i}') for i in range(8)]
         ack = ambiguous(cands)
-        self.assertIn('**8**', ack.text)
-        self.assertIn('and 3 more', ack.text)
-        self.assertEqual(len(ack.candidates), 8)
+        self.assertEqual(len(ack.candidates), 8, 'the core must not cap the list')
 
-    def test_undeliverable_surfaces_the_reason(self):
-        ack = undeliverable('mg exited 1: no such mailbox', agent='ghost')
+    def test_ambiguous_carries_a_hint(self):
+        self.assertEqual(ambiguous([], hint='try harder').hint, 'try harder')
+
+    def test_undeliverable_carries_the_reason_verbatim(self):
+        ack = undeliverable('  mg exited 1: no such mailbox  ', agent='ghost')
         self.assertEqual(ack.kind, UNDELIVERABLE)
         self.assertFalse(ack.ok)
-        self.assertIn('ghost', ack.text)
-        self.assertIn('no such mailbox', ack.text)
+        self.assertEqual(ack.agent, 'ghost')
+        self.assertEqual(ack.reason, 'mg exited 1: no such mailbox')
 
-    def test_undeliverable_with_empty_reason_still_says_something(self):
-        self.assertIn('unknown error', undeliverable('').text)
+    def test_undeliverable_does_not_truncate_a_huge_stderr_dump(self):
+        self.assertEqual(len(undeliverable('x' * 5000).reason), 5000)
 
-    def test_undeliverable_truncates_a_huge_stderr_dump(self):
-        self.assertLess(len(undeliverable('x' * 5000).text), 400)
+
+class TestCoreCarriesNoPresentation(unittest.TestCase):
+    """A5. `bridget_core` is the half of the bridge that would be identical
+    under Slack. Discord's markdown (`**bold**`) and emoji are the adapter's.
+
+    This is a tripwire, not a proof — it greps. It exists because the drift it
+    catches is the easy kind: someone adds one `f'✅ {agent}'` to a core module
+    because that is where the data already is."""
+
+    PRESENTATION = ('**', '✅', '⚠️', '❌', '📬', '⚙️', '🔕', '🔔', '💬', '•', '↳')
+
+    def _core_modules(self):
+        return sorted((REPO / 'bridget_core').glob('*.py'))
+
+    @staticmethod
+    def _code_only(src: str) -> str:
+        """The module with its docstrings and comments removed. Prose is allowed
+        to *name* `**bold**`; code is not allowed to emit it."""
+        import ast
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            body = getattr(node, 'body', None)
+            if not isinstance(body, list) or not body:
+                continue
+            first = body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                body.pop(0)
+        return ast.unparse(tree)   # ast.unparse drops comments for free
+
+    def test_no_core_module_renders_discord_markup(self):
+        offenders = []
+        for path in self._core_modules():
+            code = self._code_only(path.read_text())
+            offenders.extend(f'{path.name}: {t!r}' for t in self.PRESENTATION if t in code)
+        self.assertEqual(offenders, [], f'presentation leaked into the core: {offenders}')
+
+    def test_the_tripwire_would_actually_fire(self):
+        """Guard the guard: a stripped module must still contain its code."""
+        code = self._code_only("'''docstring with ** bold **'''\nX = '✅ hi'\n")
+        self.assertNotIn('docstring', code)
+        self.assertIn('✅', code)
+
+    def test_no_core_module_imports_a_chat_library(self):
+        for path in self._core_modules():
+            self.assertNotIn('import discord', path.read_text())
+
+    def test_thread_title_has_no_built_in_limit(self):
+        """Discord caps a thread name at 100. The core does not know that."""
+        long = thread_title(parse_mail('Subject: ' + 'x' * 500 + '\n\nb'))
+        self.assertEqual(len(long), 500)
+        self.assertEqual(len(thread_title(parse_mail('Subject: ' + 'x' * 500 + '\n\nb'),
+                                          limit=90)), 90)
 
 
 if __name__ == '__main__':

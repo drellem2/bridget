@@ -1,4 +1,15 @@
 # bridget_core.acks — delivery outcome model. GPL-3.0-or-later.
+# Copyright (C) 2026 Clover Ross
+# Copyright (C) 2026 Daniel Miller (fork maintainer)
+#
+# This file is part of bridget. bridget is free software: you can redistribute
+# it and/or modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation, either version 3 of the License,
+# or (at your option) any later version. It is distributed WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
 """The three things that can happen when the human replies, made explicit.
 
 Silence after typing a reply is the worst outcome a bridge can produce: the
@@ -11,8 +22,11 @@ resolves to exactly one `Ack`, and the adapter always renders it.
     undeliverable  — there is nowhere to send it, or `mg` refused. The reason
                      is surfaced verbatim rather than swallowed into a log.
 
-`kind` is the machine-readable outcome; `text` is what the human reads. The
-split keeps tests asserting on `kind` rather than on emoji.
+An `Ack` is *data*, not a message: `kind` plus the facts behind it. It carries
+no emoji, no `**bold**`, and no character budget, because all three of those
+are Discord's opinions and this module is the part of the bridge that would be
+identical under Slack. The adapter turns an `Ack` into a string — see
+`render_ack` in the `bridget` script. Tests assert on `kind` and on the fields.
 """
 from __future__ import annotations
 
@@ -25,57 +39,41 @@ UNDELIVERABLE = 'undeliverable'
 
 @dataclass
 class Ack:
+    """The outcome of one inbound reply, in machine-readable form."""
+
     kind: str
-    text: str
-    #: For AMBIGUOUS: the conversations the reply might have belonged to.
+    #: DELIVERED / UNDELIVERABLE: the agent on the other end. May be '' when
+    #: there was no agent to name.
+    agent: str = ''
+    #: DELIVERED: the subject the reply went out under.
+    subject: str = ''
+    #: DELIVERED: the id this reply threads onto, or '' if it went out
+    #: untethered (an mg too old for correlation IDs, or no known parent).
+    in_reply_to: str = ''
+    #: UNDELIVERABLE: why, verbatim from mg or from us.
+    reason: str = ''
+    #: AMBIGUOUS: the conversations the reply might have belonged to, as
+    #: (label, key) pairs.
     candidates: list = field(default_factory=list)
+    #: AMBIGUOUS: an extra line of guidance for the human, if we have one.
+    hint: str = ''
 
     @property
     def ok(self) -> bool:
         return self.kind == DELIVERED
 
-    def __str__(self) -> str:
-        return self.text
-
 
 def delivered(agent: str, subject: str = '', *, in_reply_to: str = '') -> Ack:
     """The reply was mailed to `agent`."""
-    text = f'✅ delivered to `{agent}`'
-    if subject:
-        trimmed = subject if len(subject) <= 60 else subject[:59] + '…'
-        text += f' — "{trimmed}"'
-    if in_reply_to:
-        # Surfacing the threading tells the human their reply will land *in*
-        # the conversation, not as a fresh top-level mail.
-        text += '\n↳ threaded as a reply'
-    return Ack(DELIVERED, text)
+    return Ack(DELIVERED, agent=agent, subject=subject, in_reply_to=in_reply_to)
 
 
 def ambiguous(candidates: list, *, hint: str = '') -> Ack:
     """The reply could belong to more than one conversation (or to none we can
     name). `candidates` are (label, key) pairs the human can choose between."""
-    n = len(candidates)
-    if n == 0:
-        text = (
-            "⚠️ I can't tell which conversation this replies to.\n"
-            'Reply inside a conversation thread, or use `mail <subject>` to '
-            'start a new one.'
-        )
-    else:
-        text = f'⚠️ ambiguous — this could reply to **{n}** conversations:\n'
-        text += '\n'.join(f'• {label}' for label, _ in candidates[:5])
-        if n > 5:
-            text += f'\n… and {n - 5} more'
-        text += '\nReply inside the thread you mean.'
-    if hint:
-        text += f'\n{hint}'
-    return Ack(AMBIGUOUS, text, candidates=list(candidates))
+    return Ack(AMBIGUOUS, candidates=list(candidates), hint=hint)
 
 
 def undeliverable(reason: str, *, agent: str = '') -> Ack:
     """There was nowhere to send the reply, or the send failed."""
-    where = f' to `{agent}`' if agent else ''
-    detail = reason.strip()
-    if len(detail) > 300:
-        detail = detail[:299] + '…'
-    return Ack(UNDELIVERABLE, f'❌ undeliverable{where}: {detail or "unknown error"}')
+    return Ack(UNDELIVERABLE, agent=agent, reason=reason.strip())

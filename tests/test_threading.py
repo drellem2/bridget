@@ -295,6 +295,96 @@ class TestAllowedMentions(unittest.TestCase):
         self.assertFalse(am.roles)
 
 
+# --- A5: rendering lives in the adapter ------------------------------------
+
+class TestRenderAck(unittest.TestCase):
+    """The Discord presentation of a core `Ack`. The core owns the outcome; the
+    emoji, the `**bold**` and the character budgets are ours."""
+
+    def setUp(self):
+        self.b = load_bridget()
+        self.acks = self.b.acks
+
+    def test_delivered_names_the_agent_and_subject(self):
+        out = self.b.render_ack(self.acks.delivered('mayor', 'design review'))
+        self.assertIn('✅', out)
+        self.assertIn('mayor', out)
+        self.assertIn('design review', out)
+
+    def test_delivered_flags_threading_only_when_replying(self):
+        self.assertIn('threaded', self.b.render_ack(
+            self.acks.delivered('mayor', 's', in_reply_to='id-1')))
+        self.assertNotIn('threaded', self.b.render_ack(self.acks.delivered('mayor', 's')))
+
+    def test_delivered_elides_a_long_subject(self):
+        out = self.b.render_ack(self.acks.delivered('mayor', 'x' * 100))
+        self.assertIn('…', out)
+        self.assertLess(len(out), 100 + 40)
+
+    def test_delivered_with_no_subject_omits_the_quotes(self):
+        self.assertNotIn('"', self.b.render_ack(self.acks.delivered('mayor')))
+
+    def test_ambiguous_with_no_candidates_tells_the_human_what_to_do(self):
+        out = self.b.render_ack(self.acks.ambiguous([]))
+        self.assertIn('mail <subject>', out)
+
+    def test_ambiguous_lists_candidates_and_caps_the_list(self):
+        cands = [(f'conv {i}', f'k{i}') for i in range(8)]
+        out = self.b.render_ack(self.acks.ambiguous(cands))
+        self.assertIn('**8**', out)
+        self.assertIn('and 3 more', out)
+        self.assertIn('conv 0', out)
+        self.assertNotIn('conv 7', out)
+
+    def test_ambiguous_appends_a_hint(self):
+        self.assertIn('try the thread',
+                      self.b.render_ack(self.acks.ambiguous([], hint='try the thread')))
+
+    def test_undeliverable_surfaces_the_reason_and_the_agent(self):
+        out = self.b.render_ack(
+            self.acks.undeliverable('mg exited 1: no such mailbox', agent='ghost'))
+        self.assertIn('❌', out)
+        self.assertIn('ghost', out)
+        self.assertIn('no such mailbox', out)
+
+    def test_undeliverable_with_empty_reason_still_says_something(self):
+        self.assertIn('unknown error', self.b.render_ack(self.acks.undeliverable('')))
+
+    def test_undeliverable_truncates_a_huge_stderr_dump(self):
+        self.assertLess(len(self.b.render_ack(self.acks.undeliverable('x' * 5000))), 400)
+
+    def test_undeliverable_without_an_agent_omits_the_to_clause(self):
+        self.assertNotIn(' to ', self.b.render_ack(self.acks.undeliverable('boom')))
+
+
+class TestRenderSettings(unittest.TestCase):
+    def setUp(self):
+        self.b = load_bridget()
+
+    def test_reports_the_active_policy_and_mute_all(self):
+        self.b.SETTINGS.set_dm_policy('all')
+        out = self.b.render_settings(self.b.SETTINGS.summary())
+        self.assertIn('⚙️', out)
+        self.assertIn('`all`', out)
+        self.assertIn('Mute all DMs: `false`', out)
+
+    def test_no_mutes_says_none(self):
+        self.assertIn('Muted conversations: none',
+                      self.b.render_settings(self.b.SETTINGS.summary()))
+
+    def test_muted_conversations_are_labelled(self):
+        self.b.SETTINGS.mute('k1')
+        out = self.b.render_settings(self.b.SETTINGS.summary({'k1': 'design review'}))
+        self.assertIn('design review', out)
+
+    def test_the_muted_list_is_capped_by_the_adapter(self):
+        for i in range(15):
+            self.b.SETTINGS.mute(f'k{i:02d}')
+        out = self.b.render_settings(self.b.SETTINGS.summary())
+        self.assertIn('… and 5 more', out)
+        self.assertEqual(out.count('    – '), self.b.SETTINGS_MUTED_LIMIT)
+
+
 # --- A3: a body cannot escape its code fence -------------------------------
 
 class TestCodeFenceIsInescapable(unittest.TestCase):
@@ -889,7 +979,7 @@ class TestReplyInConversation(unittest.TestCase):
         self.assertIn('mayor', args)
         self.assertIn('--from=human', args)
         self.assertTrue(ack.ok)
-        self.assertIn('threaded', ack.text)
+        self.assertTrue(ack.in_reply_to, 'the reply was not threaded')
 
     def test_reply_subject_defaults_to_re_conversation(self):
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
@@ -913,14 +1003,14 @@ class TestReplyInConversation(unittest.TestCase):
             ack = self.b.reply_in_conversation('hi', conv)
         self.assertFalse(any(a.startswith('--in-reply-to') for a in run.call_args[0][0]))
         self.assertTrue(ack.ok)
-        self.assertNotIn('threaded', ack.text)
+        self.assertFalse(ack.in_reply_to, 'the reply was threaded unexpectedly')
 
     def test_failed_send_is_undeliverable_with_the_reason(self):
         with mock.patch.object(self.b, 'run_mg', return_value=(1, '', 'no such mailbox')):
             ack = self.b.reply_in_conversation('hi', self.conv)
         self.assertEqual(ack.kind, 'undeliverable')
-        self.assertIn('no such mailbox', ack.text)
-        self.assertIn('mayor', ack.text)
+        self.assertIn('no such mailbox', ack.reason)
+        self.assertEqual(ack.agent, 'mayor')
 
     def test_empty_reply_is_undeliverable(self):
         with mock.patch.object(self.b, 'run_mg') as run:
@@ -997,7 +1087,7 @@ class TestCorrelationIdSeam(unittest.TestCase):
         self.assertNotIn('--in-reply-to=id-7', run.call_args[0][0])
         self.assertNotIn('--json', run.call_args[0][0])
         self.assertTrue(ack.ok, 'reply must still deliver without threading')
-        self.assertNotIn('threaded', ack.text)
+        self.assertFalse(ack.in_reply_to, 'the reply was threaded unexpectedly')
 
     def test_an_mg_that_rejects_json_alone_downgrades_rather_than_failing(self):
         """With no parent id to thread onto, `--json` goes out on its own, so it
@@ -1018,7 +1108,7 @@ class TestCorrelationIdSeam(unittest.TestCase):
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
             ack = self.b.reply_in_conversation('hi', self.conv)
         self.assertIn('--in-reply-to=id-7', run.call_args[0][0])
-        self.assertIn('threaded', ack.text)
+        self.assertTrue(ack.in_reply_to, 'the reply was not threaded')
 
     def test_capability_is_autodetected_from_mg_help(self):
         help_with = 'Flags:\n      --in-reply-to string   MSG-ID\n'
@@ -1060,7 +1150,7 @@ class TestCorrelationIdSeam(unittest.TestCase):
             ack = self.b.reply_in_conversation('hi', self.conv)
         self.assertEqual(run.call_count, 1, 'must not retry a non-flag error')
         self.assertEqual(ack.kind, 'undeliverable')
-        self.assertIn('no such mailbox', ack.text)
+        self.assertIn('no such mailbox', ack.reason)
 
     def test_correlation_ids_mode_is_configurable(self):
         self.assertEqual(load_threaded(BRIDGET_CORRELATION_IDS='off').MG_CAPS.mode, 'off')
