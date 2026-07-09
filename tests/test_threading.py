@@ -109,10 +109,26 @@ class FakeUser:
         self.sent.append(content)
 
 
+class FakeAllowedMentions:
+    """Mirrors discord.AllowedMentions closely enough that the adapter's
+    `none()` call is observable — the whole point of A2 is that bridget never
+    constructs a Client without it."""
+
+    def __init__(self, everyone=True, users=True, roles=True):
+        self.everyone = everyone
+        self.users = users
+        self.roles = roles
+
+    @classmethod
+    def none(cls):
+        return cls(everyone=False, users=False, roles=False)
+
+
 class FakeClient:
     def __init__(self, *a, **kw):
         self.channels = {}
         self._closed = False
+        self.allowed_mentions = kw.get('allowed_mentions')
 
     def event(self, fn):
         return fn
@@ -140,6 +156,7 @@ def fake_discord_module():
     m.User = FakeUser
     m.Message = FakeMessage
     m.Client = FakeClient
+    m.AllowedMentions = FakeAllowedMentions
 
     class _Intents:
         @staticmethod
@@ -262,6 +279,72 @@ class TestConfig(unittest.TestCase):
         src = SCRIPT.read_text()
         self.assertNotIn('DISCORD_BOT_TOKEN=', src.replace("'DISCORD_BOT_TOKEN'", ''))
         self.assertIn("lookup('DISCORD_BOT_TOKEN')", src)
+
+
+# --- A2: nothing bridget posts may ping anyone -----------------------------
+
+class TestAllowedMentions(unittest.TestCase):
+    """Everything bridget renders is text an agent wrote. A mail subject of
+    `@everyone the build is broken` must read as those characters."""
+
+    def test_client_is_constructed_with_mentions_suppressed(self):
+        am = load_bridget().client.allowed_mentions
+        self.assertIsNotNone(am, 'discord.Client built without allowed_mentions')
+        self.assertFalse(am.everyone)
+        self.assertFalse(am.users)
+        self.assertFalse(am.roles)
+
+
+# --- A3: a body cannot escape its code fence -------------------------------
+
+class TestCodeFenceIsInescapable(unittest.TestCase):
+    def setUp(self):
+        self.b = load_bridget()
+
+    def _fences(self, text):
+        """Runs of 3+ backticks — exactly what Discord treats as a fence."""
+        import re
+        return re.findall('`{3,}', text)
+
+    def test_a_body_containing_a_fence_does_not_close_the_block(self):
+        body = 'here is code:\n```python\nprint("hi")\n```\ndone'
+        card = self.b.format_mail_card(mail(body=body))
+        # Only our own opening and closing fences survive as real fences.
+        self.assertEqual(len(self._fences(card)), 2)
+        self.assertTrue(card.rstrip().endswith('```'))
+
+    def test_the_backticks_are_still_visible_to_the_reader(self):
+        """We defuse by inserting a zero-width space, not by deleting."""
+        card = self.b.format_mail_card(mail(body='a ``` b'))
+        self.assertEqual(card.count('`'), 3 + 3 + 3)  # body's 3 + our 2 fences
+        self.assertIn(self.b.ZERO_WIDTH_SPACE, card)
+
+    def test_a_longer_backtick_run_is_defused_too(self):
+        card = self.b.format_mail_card(mail(body='`````'))
+        self.assertEqual(len(self._fences(card)), 2)
+
+    def test_one_and_two_backticks_are_left_alone(self):
+        """Inline code inside a block is literal; only 3+ opens a fence."""
+        self.assertEqual(self.b.defuse_fences('a `x` and ``y``'), 'a `x` and ``y``')
+
+    def test_truncation_never_severs_the_closing_fence(self):
+        card = self.b.format_mail_card(mail(body='x' * 50_000))
+        self.assertLessEqual(len(card), self.b.DISCORD_MSG_LIMIT)
+        self.assertTrue(card.rstrip().endswith('```'))
+        self.assertEqual(len(self._fences(card)), 2)
+
+    def test_a_pathological_subject_cannot_squeeze_out_the_body(self):
+        card = self.b.format_mail_card(mail(subject='S' * 5000, body='the body'))
+        self.assertLessEqual(len(card), self.b.DISCORD_MSG_LIMIT)
+        self.assertIn('the body', card)
+        self.assertTrue(card.rstrip().endswith('```'))
+
+    def test_the_thread_link_footer_survives_a_long_body(self):
+        card = self.b.format_mail_card(mail(body='x' * 50_000),
+                                       thread_link='https://discord.com/x')
+        self.assertLessEqual(len(card), self.b.DISCORD_MSG_LIMIT)
+        self.assertTrue(card.endswith('https://discord.com/x'))
+        self.assertEqual(len(self._fences(card)), 2)
 
 
 # --- DM gating (the calm inbox) --------------------------------------------

@@ -490,7 +490,15 @@ intents.dm_messages = True
 intents.guilds = True
 intents.guild_messages = True
 
-client = discord.Client(intents=intents)
+# Never ping anyone. Everything bridget posts is text it did not write: mail
+# subjects and bodies composed by agents, and mg's own output. A subject of
+# "@everyone deploy is broken" must render as those characters, not notify the
+# server. Suppressing mentions at the client is the only place this holds for
+# every send — a per-message escape has to be remembered at each call site.
+client = discord.Client(
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 
 # parse_mail, the seen-set, the conversation map and the settings store all live
@@ -675,6 +683,51 @@ def agent_cycle_paren(name: str) -> str:
 
 MAIL_BODY_PREVIEW = 1200
 
+#: Ceiling on the "📬 **sender** — subject" line of a card. The sender and the
+#: subject are both text an agent chose; without a bound a long one leaves no
+#: room for the body.
+MAIL_HEADER_LIMIT = 400
+
+#: Discord opens a code block on a run of three or more backticks. Everything we
+#: put inside a fence is text somebody else wrote — a mail body, mg's stdout —
+#: and agents post code constantly, so a body carrying its own fence is the
+#: common case, not the adversarial one. Left alone it closes our block early
+#: and the remainder renders as raw markdown.
+BACKTICK_RUN_RE = re.compile('`{3,}')
+ZERO_WIDTH_SPACE = '​'
+
+#: The overhead `code_block` adds around the body: the two fences and the two
+#: newlines that must hug them for Discord to recognize the block.
+_FENCE_OVERHEAD = len('```\n\n```')
+
+
+def defuse_fences(text: str) -> str:
+    """Break every run of three-or-more backticks so it cannot close a fence.
+
+    A zero-width space between the backticks is invisible in Discord and leaves
+    the run readable as the backticks it was.
+    """
+    return BACKTICK_RUN_RE.sub(
+        lambda m: ZERO_WIDTH_SPACE.join('`' * len(m.group(0))), text)
+
+
+def code_block(body: str, budget: int | None = None) -> str:
+    """Render `body` as a fenced block that is always closed.
+
+    Truncation happens *inside* the fence. Chopping the rendered string — which
+    is what a naive `msg[:limit]` does — is how you lose the closing fence and
+    let the tail of a long mail render as markdown.
+    """
+    body = defuse_fences(body)
+    if budget is not None:
+        room = budget - _FENCE_OVERHEAD
+        if room < 1:
+            # No room for a block at all; the caller's header ate the budget.
+            return ''
+        if len(body) > room:
+            body = body[:room - 1] + '…'
+    return f'```\n{body}\n```'
+
 
 def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
                      hint: str = '; use `read <mg-id>`') -> str:
@@ -683,16 +736,14 @@ def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
     body_preview = mail['body']
     if len(body_preview) > MAIL_BODY_PREVIEW:
         body_preview = body_preview[:MAIL_BODY_PREVIEW] + f'\n…[truncated{hint}]'
-    msg = (
-        f"{prefix}"
-        f"📬 **{mail['from']}** — {mail['subject']}\n"
-        f"```\n{body_preview}\n```"
-    )
-    if thread_link:
-        msg += f"\n💬 reply in thread: {thread_link}"
-    if len(msg) > DISCORD_MSG_LIMIT:
-        msg = msg[:DISCORD_MSG_LIMIT] + '…'
-    return msg
+    header = f"{prefix}📬 **{mail['from']}** — {mail['subject']}\n"
+    footer = f"\n💬 reply in thread: {thread_link}" if thread_link else ''
+    # A subject is attacker-adjacent text too: bound the header so it can never
+    # squeeze the body's fence out of the message entirely.
+    if len(header) > MAIL_HEADER_LIMIT:
+        header = header[:MAIL_HEADER_LIMIT - 2] + '…\n'
+    block = code_block(body_preview, budget=DISCORD_MSG_LIMIT - len(header) - len(footer))
+    return header + block + footer
 
 
 def wants_attention(mail: dict) -> bool:
@@ -804,9 +855,10 @@ async def post_to_thread(conv, mail: dict) -> str:
     if thread is None:
         return ''
     body = mail['body'] or '(no body)'
-    text = f"**{mail['from']}** — {mail['subject']}\n```\n{body}\n```"
-    if len(text) > DISCORD_MSG_LIMIT:
-        text = text[:DISCORD_MSG_LIMIT] + '…'
+    header = f"**{mail['from']}** — {mail['subject']}\n"
+    if len(header) > MAIL_HEADER_LIMIT:
+        header = header[:MAIL_HEADER_LIMIT - 2] + '…\n'
+    text = header + code_block(body, budget=DISCORD_MSG_LIMIT - len(header))
     try:
         await thread.send(text)
     except discord.HTTPException as e:
@@ -1432,7 +1484,7 @@ def handle_command(text: str) -> str:
             f'--tag={INBOX_TAG}',
             f'--repo={INBOX_REPO}',
         ])
-        return f"✓ next idea filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
+        return f"✓ next idea filed:\n{code_block(out.strip())}" if rc == 0 else f"✗ failed: {err or out}"
 
     if low.startswith('explain mg-'):
         parts = text.split(None, 2)
@@ -1588,7 +1640,7 @@ def handle_command(text: str) -> str:
         for t in extra_tags:
             args.append(f'--tag={t}')
         rc, out, err = run_mg(args)
-        return f"✓ idea filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
+        return f"✓ idea filed:\n{code_block(out.strip())}" if rc == 0 else f"✗ failed: {err or out}"
 
     if low.startswith('bug:'):
         body = text[4:].strip()
@@ -1613,7 +1665,7 @@ def handle_command(text: str) -> str:
         for t in extra_tags:
             args.append(f'--tag={t}')
         rc, out, err = run_mg(args)
-        return f"✓ bug filed:\n```\n{out.strip()}\n```" if rc == 0 else f"✗ failed: {err or out}"
+        return f"✓ bug filed:\n{code_block(out.strip())}" if rc == 0 else f"✗ failed: {err or out}"
 
     if low == 'quiet' or low.startswith('quiet '):
         rest = text.split()[1:]
