@@ -1,10 +1,21 @@
 # bridget_core.conversations — conversation <-> thread map. GPL-3.0-or-later.
 """The conversation <-> thread map, persisted across restarts.
 
-A *conversation* is a reply chain, keyed by the root message id (see
-`bridget_core.mail.conversation_key`). A *thread* is whatever the presentation
+A *conversation* is a reply chain. A *thread* is whatever the presentation
 adapter uses to render one — a Discord thread id, a Slack thread timestamp. The
 core neither knows nor cares which; it stores an opaque integer or string.
+
+The conversation's key is the id of the message that first rooted it, but a
+later message in the chain cannot be counted on to *name* that root: `mg mail
+send --in-reply-to X` seeds `References: [X]` and nothing else, so from the
+second hop onward the chain carries only the parent. The store therefore keeps
+a message-id -> key index over every message it has folded in, and `resolve()`
+walks a message's ancestry against it. Without that index, threading would
+survive exactly one round-trip before every reply rooted a fresh thread.
+
+For the index to span the round-trip, the bridge must fold in the ids of the
+replies *it* sends as well as the mail it receives — an agent replying to our
+reply names our message id, which we would otherwise never have seen.
 
 Persistence is the point. Discord threads outlive the bridge process, so if the
 map lived only in memory a restart would orphan every open thread and root a
@@ -27,6 +38,12 @@ SCHEMA_VERSION = 1
 #: Generous — an entry is a few hundred bytes, and forgetting a conversation
 #: means its next message roots a duplicate thread.
 DEFAULT_MAX_CONVERSATIONS = 2000
+
+#: Message ids remembered per conversation, newest last. These are what
+#: `resolve()` matches an incoming reply against, so the cap is also the depth
+#: of ancestry a straggler can name and still find its way home. A reply names
+#: its parent, which is the newest id here, so the tail is what matters.
+MAX_MESSAGE_IDS = 50
 
 
 def _utcnow() -> str:
@@ -71,7 +88,23 @@ class ConversationStore:
         self._clock = clock
         self._conversations: dict[str, Conversation] = {}
         self._by_thread: dict[object, str] = {}
+        self._by_message: dict[str, str] = {}
         self.load()
+
+    # -- the message-id index ---------------------------------------------
+
+    def _index(self, conv: Conversation) -> None:
+        """Point every id this conversation owns at its key."""
+        self._by_message[conv.key] = conv.key
+        for mid in conv.message_ids:
+            self._by_message[mid] = conv.key
+
+    def _deindex(self, conv: Conversation) -> None:
+        """Drop this conversation's ids. An id another conversation has since
+        claimed stays put — the newer owner is the right answer."""
+        for mid in [conv.key, *conv.message_ids]:
+            if self._by_message.get(mid) == conv.key:
+                self._by_message.pop(mid, None)
 
     # -- persistence ------------------------------------------------------
 
@@ -81,6 +114,7 @@ class ConversationStore:
         """
         self._conversations = {}
         self._by_thread = {}
+        self._by_message = {}
         if not self.path.exists():
             return
         try:
@@ -107,6 +141,7 @@ class ConversationStore:
                 updated_at=value.get('updated_at', ''),
             )
             self._conversations[key] = conv
+            self._index(conv)
             if conv.thread_id is not None:
                 self._by_thread[conv.thread_id] = key
 
@@ -124,6 +159,19 @@ class ConversationStore:
 
     def get(self, key: str) -> Conversation | None:
         return self._conversations.get(key)
+
+    def resolve(self, candidates) -> str | None:
+        """The key of the conversation owning the first of `candidates` we know.
+
+        `candidates` is a message's ancestry, nearest first — see
+        `bridget_core.mail.correlation_candidates`. Returns None when we have
+        seen none of them, which means the message roots a new conversation.
+        """
+        for candidate in candidates:
+            key = self._by_message.get(candidate)
+            if key is not None and key in self._conversations:
+                return key
+        return None
 
     def by_thread(self, thread_id) -> Conversation | None:
         """Resolve the conversation a thread renders. This is the inbound path:
@@ -154,19 +202,30 @@ class ConversationStore:
         a later message in the same chain does not rename the thread out from
         under the human, and a reply from a different sender does not silently
         redirect where the human's replies go.
+
+        Call this for the replies the bridge *sends*, too, passing the id mg
+        assigned them. The agent's next reply names that id and nothing older,
+        so a conversation that never records its own outbound ids goes dark to
+        `resolve()` after one round-trip.
         """
         conv = self._conversations.get(key)
         if conv is None:
             conv = Conversation(key=key, subject=subject, agent=agent)
             self._conversations[key] = conv
+        self._by_message[key] = key
 
         if message_id:
             conv.last_message_id = message_id
             if message_id not in conv.message_ids:
                 conv.message_ids.append(message_id)
                 # Bound per-conversation growth; only the tail is ever read.
-                if len(conv.message_ids) > 50:
-                    conv.message_ids = conv.message_ids[-50:]
+                if len(conv.message_ids) > MAX_MESSAGE_IDS:
+                    dropped = conv.message_ids[:-MAX_MESSAGE_IDS]
+                    conv.message_ids = conv.message_ids[-MAX_MESSAGE_IDS:]
+                    for mid in dropped:
+                        if mid != key and self._by_message.get(mid) == key:
+                            self._by_message.pop(mid, None)
+            self._by_message[message_id] = key
 
         conv.updated_at = self._clock()
         self._prune()
@@ -190,6 +249,7 @@ class ConversationStore:
         conv = self._conversations.pop(key, None)
         if conv is None:
             return False
+        self._deindex(conv)
         if conv.thread_id is not None:
             self._by_thread.pop(conv.thread_id, None)
         self.save()
@@ -203,5 +263,6 @@ class ConversationStore:
         stale = sorted(self._conversations.values(), key=lambda c: c.updated_at)[:excess]
         for conv in stale:
             self._conversations.pop(conv.key, None)
+            self._deindex(conv)
             if conv.thread_id is not None:
                 self._by_thread.pop(conv.thread_id, None)

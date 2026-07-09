@@ -340,6 +340,36 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.threads), 1, 'reply rooted a duplicate thread')
         self.assertEqual(len(self.channel.threads[0].sent), 2)
 
+    async def test_a_reply_naming_only_its_parent_joins_the_same_thread(self):
+        """Past the first hop, `mg mail send --in-reply-to X` writes
+        `References: [X]` — the parent, not the root. The store's message-id
+        index is the only thing that ties id-3 back to the conversation.
+        See tests/test_mg_threading.py, which proves mg really does this."""
+        await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
+        await self.b.deliver_mail(
+            self.user, 'f2',
+            mail(subject='Re: hello', msg_id='id-2', in_reply_to='id-1', refs='id-1'))
+        await self.b.deliver_mail(
+            self.user, 'f3',
+            mail(subject='Re: hello', msg_id='id-3', in_reply_to='id-2', refs='id-2'))
+        self.assertEqual(len(self.channel.threads), 1,
+                         'the second round-trip rooted a duplicate thread')
+        self.assertEqual(len(self.b.CONVERSATIONS), 1)
+        self.assertEqual(len(self.channel.threads[0].sent), 3)
+
+    async def test_a_conversation_keeps_the_key_it_was_rooted_on(self):
+        await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
+        await self.b.deliver_mail(
+            self.user, 'f2', mail(msg_id='id-2', in_reply_to='id-1', refs='id-1'))
+        self.assertEqual(list(self.b.CONVERSATIONS.keys()), ['id-1'])
+
+    async def test_a_redelivered_mail_rejoins_its_own_thread(self):
+        """A DM failure makes the watcher retry the mail. It must not root a
+        second thread for a message already in one."""
+        await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
+        await self.b.deliver_mail(self.user, 'f1', mail(msg_id='id-1'))
+        self.assertEqual(len(self.channel.threads), 1)
+
     async def test_unrelated_mail_roots_a_separate_thread(self):
         await self.b.deliver_mail(self.user, 'f1', mail(subject='a', msg_id='id-1'))
         await self.b.deliver_mail(self.user, 'f2', mail(subject='b', msg_id='id-9'))
@@ -735,6 +765,36 @@ class TestReplyInConversation(unittest.TestCase):
             self.b.reply_in_conversation('hi', conv)
         self.assertIn('--in-reply-to=id-9', run.call_args[0][0])
 
+    def test_reply_asks_mg_for_the_id_it_assigned(self):
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '{}', '')) as run:
+            self.b.reply_in_conversation('hi', self.conv)
+        self.assertIn('--json', run.call_args[0][0])
+
+    def test_the_sent_reply_is_folded_into_the_conversation(self):
+        """So the agent's answer — which names *this* id and nothing older —
+        resolves back to this conversation instead of rooting a new thread."""
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '{"msg_id":"out-1"}', '')):
+            ack = self.b.reply_in_conversation('looks good', self.conv)
+        self.assertTrue(ack.ok)
+        conv = self.b.CONVERSATIONS.get('id-1')
+        self.assertIn('out-1', conv.message_ids)
+        self.assertEqual(conv.last_message_id, 'out-1',
+                         'a second reply must thread onto the first, not behind it')
+        self.assertEqual(self.b.CONVERSATIONS.resolve(['out-1']), 'id-1')
+
+    def test_a_send_that_reports_no_id_still_delivers(self):
+        """Degrade by one hop of threading, never by failing a sent reply."""
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, 'who knows', '')):
+            ack = self.b.reply_in_conversation('hi', self.conv)
+        self.assertTrue(ack.ok)
+        self.assertEqual(self.b.CONVERSATIONS.get('id-1').last_message_id, 'id-7')
+
+    def test_a_failed_send_is_not_folded_in(self):
+        with mock.patch.object(self.b, 'run_mg', return_value=(1, '{"msg_id":"out-1"}', 'boom')):
+            ack = self.b.reply_in_conversation('hi', self.conv)
+        self.assertFalse(ack.ok)
+        self.assertNotIn('out-1', self.b.CONVERSATIONS.get('id-1').message_ids)
+
 
 class TestCorrelationIdSeam(unittest.TestCase):
     """The bridge must never hard-depend on `mg mail send --in-reply-to`.
@@ -757,8 +817,23 @@ class TestCorrelationIdSeam(unittest.TestCase):
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
             ack = self.b.reply_in_conversation('hi', self.conv)
         self.assertNotIn('--in-reply-to=id-7', run.call_args[0][0])
+        self.assertNotIn('--json', run.call_args[0][0])
         self.assertTrue(ack.ok, 'reply must still deliver without threading')
         self.assertNotIn('threaded', ack.text)
+
+    def test_an_mg_that_rejects_json_alone_downgrades_rather_than_failing(self):
+        """With no parent id to thread onto, `--json` goes out on its own, so it
+        is the flag an ancient mg names. `mode='on'` skips the help probe, which
+        is exactly how an operator gets here."""
+        self._force(True)
+        self.b.CONVERSATIONS.record('id-4', subject='s', agent='mayor')
+        conv = self.b.CONVERSATIONS.get('id-4')
+        outcomes = [(1, '', 'unknown flag: --json'), (0, '', '')]
+        with mock.patch.object(self.b, 'run_mg', side_effect=outcomes) as run:
+            ack = self.b.reply_in_conversation('hi', conv)
+        self.assertTrue(ack.ok, 'a reply that plainly went out was reported undeliverable')
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn('--json', run.call_args[0][0])
 
     def test_flag_passed_when_mg_has_the_capability(self):
         self._force(True)

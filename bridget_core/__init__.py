@@ -22,9 +22,14 @@ means porting the bridge to another platform is a new adapter, not a rewrite.
 
 from .acks import Ack, ambiguous, delivered, undeliverable
 from .conversations import Conversation, ConversationStore
-from .mail import conversation_key, parse_mail
+from .mail import conversation_key, correlation_candidates, parse_mail
 from .mailbox import MaildirWatcher
-from .mgshim import MgCapabilities, build_send_args, is_unknown_flag_error
+from .mgshim import (
+    MgCapabilities,
+    build_send_args,
+    is_unknown_flag_error,
+    parse_sent_message_id,
+)
 from .settings import SettingsStore
 
 __all__ = [
@@ -37,8 +42,10 @@ __all__ = [
     'ambiguous',
     'build_send_args',
     'conversation_key',
+    'correlation_candidates',
     'delivered',
     'is_unknown_flag_error',
     'parse_mail',
+    'parse_sent_message_id',
     'undeliverable',
 ]

@@ -77,24 +77,63 @@ def parse_mail(content: str) -> dict:
     }
 
 
+def correlation_candidates(mail: dict, fallback: str = '') -> list[str]:
+    """Every id that could tie `mail` to a conversation already on record.
+
+    Ordered nearest-ancestor first, because the nearest ancestor is the one a
+    live conversation is most likely to know:
+
+        In-Reply-To    — the parent
+        References     — the ancestry chain, reversed to walk parent-ward
+        Message-Id     — this message itself; a hit means we have already seen
+                         it (a redelivery after a failed DM), so it must land
+                         back in the conversation it already belongs to
+        fallback       — the maildir filename, which is the message id for mail
+                         written before macguffin stamped Message-Id
+
+    Callers probe these against `ConversationStore.resolve` *before* minting a
+    new key with `conversation_key`. This is what makes threading survive past
+    the first round-trip: `mg mail send --in-reply-to X` is a stateless
+    primitive that seeds `References: [X]` and nothing else, so from the second
+    hop onward the chain no longer carries its own root and `References[0]` is
+    merely the parent. Only the store knows which conversation that parent sits
+    in.
+    """
+    ids = []
+    if mail.get('in_reply_to'):
+        ids.append(mail['in_reply_to'])
+    ids.extend(reversed(mail.get('references') or []))
+    if mail.get('message_id'):
+        ids.append(mail['message_id'])
+    if fallback:
+        ids.append(fallback)
+
+    seen: set[str] = set()
+    return [i for i in ids if i and not (i in seen or seen.add(i))]
+
+
 def conversation_key(mail: dict, fallback: str = '') -> str:
-    """Return the stable id of the conversation this message belongs to.
+    """Mint the key for a conversation this message is the first we've seen of.
 
-    The key is the *root* of the reply chain, so every message in a thread
-    resolves to the same value regardless of where in the chain it sits:
+    This is the *fallback* path. It runs only when no id in
+    `correlation_candidates` matched a conversation already in the store —
+    otherwise the message joins that conversation instead.
 
-        References[0]  — the root, when macguffin seeded a chain
+    The key is the oldest ancestor this message can name, so that two messages
+    that both root a conversation the store has forgotten still land together:
+
+        References[0]  — the oldest ancestor still in the chain
         In-Reply-To    — the parent, when this is a direct reply with no chain
         Message-Id     — this message is itself a root
         fallback       — pre-gh#66 mail with no headers at all; callers pass
                          the maildir filename, which is what macguffin uses as
                          the message id anyway
 
-    Caveat: macguffin caps `References` at the last 20 ids. A conversation that
-    runs past 20 messages loses its true root, and messages beyond the cap key
-    on the oldest id still in the chain — they start a second thread rather
-    than joining the first. That is a bounded, visible degradation (a fresh
-    thread appears) and not a correctness bug in the map.
+    `References[0]` is *not* reliably the true root of the chain — macguffin
+    caps `References` at the last 20 ids, and `mg mail send --in-reply-to`
+    seeds it with the parent alone. Neither costs us a thread any more: the
+    store's message-id index resolves those messages onto their conversation
+    before this function is consulted.
     """
     refs = mail.get('references') or []
     if refs:

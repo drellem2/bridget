@@ -55,8 +55,13 @@ from bridget_core import (  # noqa: E402
     is_unknown_flag_error,
     parse_mail,
 )
-from bridget_core.mail import reply_target, thread_title  # noqa: E402
+from bridget_core.mail import (  # noqa: E402
+    correlation_candidates,
+    reply_target,
+    thread_title,
+)
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
+from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
 
 HOME = Path.home()
@@ -827,7 +832,12 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     it on the next poll. A mail deliberately suppressed by policy returns True:
     it was handled, not dropped.
     """
-    key = conversation_key(mail, fallback=filename)
+    # Join the conversation any of this message's ancestors already belongs to;
+    # only mint a fresh key when we recognize none of them. Probing first is
+    # what carries a thread past its first round-trip — a reply's `References`
+    # names its parent, not the root the conversation is keyed on.
+    key = (CONVERSATIONS.resolve(correlation_candidates(mail, fallback=filename))
+           or conversation_key(mail, fallback=filename))
 
     if THREADS_ENABLED:
         conv = CONVERSATIONS.record(
@@ -1750,6 +1760,11 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
     onto the newest message in the chain, so the agent's mailbox shows a real
     conversation rather than a pile of unrelated top-level mails, and the agent's
     own reply comes back carrying References that route it to this same thread.
+
+    That last clause only holds because we fold the id mg assigned *this* reply
+    back into the conversation. The agent answers our message, so its reply
+    names our id and no other; a conversation that forgot what it said could not
+    recognize the answer, and would root a second thread for it.
     """
     text = text.strip()
     if not text:
@@ -1766,17 +1781,24 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
 
     # The seam. Threading needs both a known parent id and an mg that speaks
     # --in-reply-to; missing either, the reply still goes out, just untethered.
-    in_reply_to = conv.last_message_id if MG_CAPS.correlation_ids else ''
+    threading = MG_CAPS.correlation_ids
+    in_reply_to = conv.last_message_id if threading else ''
 
     rc, out, err = run_mg(build_send_args(
-        conv.agent, subject, body, sender='human', in_reply_to=in_reply_to))
+        conv.agent, subject, body, sender='human', in_reply_to=in_reply_to,
+        want_msg_id=threading))
 
-    if rc != 0 and in_reply_to and is_unknown_flag_error(err or out):
-        # mg was swapped under us (an unrelated `go install` will do it). Our
-        # cached capability is stale — downgrade and resend, rather than telling
-        # the human their reply was undeliverable when it plainly is not.
-        print('mg rejected --in-reply-to; disabling correlation IDs for this '
-              'process and retrying without threading', file=sys.stderr)
+    rejected = err or out
+    if rc != 0 and threading and (is_unknown_flag_error(rejected)
+                                  or is_unknown_flag_error(rejected, FLAG_JSON)):
+        # mg was swapped under us (an unrelated `go install` will do it), or an
+        # operator forced correlation IDs on for a build too old to have them.
+        # Either way the cached capability is stale — downgrade and resend,
+        # rather than telling the human their reply was undeliverable when it
+        # plainly is not. We check both flags: with no parent id to thread onto
+        # `--json` goes out alone, and it is then the one mg names.
+        print('mg rejected a correlation-ID flag; disabling correlation IDs for '
+              'this process and retrying without threading', file=sys.stderr)
         MG_CAPS.downgrade()
         in_reply_to = ''
         rc, out, err = run_mg(build_send_args(
@@ -1784,6 +1806,10 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
 
     if rc != 0:
         return acks.undeliverable((err or out).strip(), agent=conv.agent)
+
+    sent_id = parse_sent_message_id(out)
+    if sent_id:
+        CONVERSATIONS.record(conv.key, message_id=sent_id)
     return acks.delivered(conv.agent, subject, in_reply_to=in_reply_to)
 
 

@@ -36,12 +36,17 @@ from bridget_core import (  # noqa: E402
     undeliverable,
 )
 from bridget_core.acks import AMBIGUOUS, DELIVERED, UNDELIVERABLE  # noqa: E402
-from bridget_core.mail import reply_target, thread_title  # noqa: E402
+from bridget_core.mail import (  # noqa: E402
+    correlation_candidates,
+    reply_target,
+    thread_title,
+)
 from bridget_core.mgshim import (  # noqa: E402
     MgCapabilities,
     build_send_args,
     help_advertises_in_reply_to,
     is_unknown_flag_error,
+    parse_sent_message_id,
 )
 
 
@@ -150,6 +155,36 @@ class TestConversationKey(unittest.TestCase):
 
     def test_reply_target_falls_back_to_filename(self):
         self.assertEqual(reply_target(parse_mail('From: a\n\nb'), fallback='fn'), 'fn')
+
+
+class TestCorrelationCandidates(unittest.TestCase):
+    """The ids a message offers up when asking "do you already know me?"."""
+
+    def test_ordered_nearest_ancestor_first(self):
+        mail = parse_mail('Message-Id: id-4\nIn-Reply-To: id-3\nReferences: id-1 id-2 id-3\n\nb')
+        self.assertEqual(correlation_candidates(mail),
+                         ['id-3', 'id-2', 'id-1', 'id-4'])
+
+    def test_deduplicated_preserving_first_position(self):
+        mail = parse_mail('Message-Id: id-2\nIn-Reply-To: id-1\nReferences: id-1\n\nb')
+        self.assertEqual(correlation_candidates(mail), ['id-1', 'id-2'])
+
+    def test_a_reply_seeded_by_mg_offers_its_parent(self):
+        """What `mg mail send --in-reply-to` actually writes past the first hop:
+        References is the parent alone, and the root appears nowhere."""
+        mail = parse_mail('Message-Id: id-9\nIn-Reply-To: id-8\nReferences: id-8\n\nb')
+        self.assertEqual(correlation_candidates(mail), ['id-8', 'id-9'])
+
+    def test_own_id_is_offered_so_a_redelivery_rejoins_its_conversation(self):
+        mail = parse_mail('Message-Id: id-1\n\nb')
+        self.assertEqual(correlation_candidates(mail), ['id-1'])
+
+    def test_headerless_mail_offers_only_the_filename(self):
+        self.assertEqual(correlation_candidates(parse_mail('From: a\n\nb'), fallback='fn'),
+                         ['fn'])
+
+    def test_no_ids_at_all_offers_nothing(self):
+        self.assertEqual(correlation_candidates(parse_mail('From: a\n\nb')), [])
 
 
 class TestThreadTitle(unittest.TestCase):
@@ -290,6 +325,73 @@ class TestConversationStore(unittest.TestCase):
         self.assertEqual(raw['version'], 1)
         self.assertIn('k1', raw['conversations'])
         self.assertNotIn('key', raw['conversations']['k1'])
+
+
+class TestConversationStoreResolve(unittest.TestCase):
+    """The message-id index: what keeps a thread alive past its first
+    round-trip, once `References` stops naming the root."""
+
+    def setUp(self):
+        self.path = tmpdir('bridget-resolve-') / 'conversations.json'
+        self.store = ConversationStore(self.path)
+
+    def test_resolves_a_recorded_message_to_its_conversation(self):
+        self.store.record('k1', message_id='m1')
+        self.assertEqual(self.store.resolve(['m1']), 'k1')
+
+    def test_resolves_the_key_itself(self):
+        self.store.record('k1')
+        self.assertEqual(self.store.resolve(['k1']), 'k1')
+
+    def test_first_known_candidate_wins(self):
+        self.store.record('k1', message_id='m1')
+        self.assertEqual(self.store.resolve(['unknown', 'm1', 'k1']), 'k1')
+
+    def test_unknown_ids_resolve_to_nothing(self):
+        self.store.record('k1', message_id='m1')
+        self.assertIsNone(self.store.resolve(['m9', 'm8']))
+        self.assertIsNone(self.store.resolve([]))
+
+    def test_an_outbound_reply_keeps_the_chain_resolvable(self):
+        """The bug, in miniature. The agent's next reply names `out-1`, an id
+        the store only knows because it recorded the reply it sent."""
+        self.store.record('k1', agent='mayor', message_id='in-1')
+        self.store.record('k1', message_id='out-1')
+        self.assertEqual(self.store.resolve(['out-1']), 'k1')
+
+    def test_index_survives_a_restart(self):
+        self.store.record('k1', message_id='m1')
+        self.assertEqual(ConversationStore(self.path).resolve(['m1']), 'k1')
+
+    def test_forget_drops_the_ids(self):
+        self.store.record('k1', message_id='m1')
+        self.store.forget('k1')
+        self.assertIsNone(self.store.resolve(['m1', 'k1']))
+
+    def test_prune_drops_the_ids(self):
+        ticks = iter(f'2026-01-01T00:00:{i:02d}+00:00' for i in range(60))
+        store = ConversationStore(self.path, max_conversations=1, clock=lambda: next(ticks))
+        store.record('a', message_id='m-a')
+        store.record('b', message_id='m-b')
+        self.assertIsNone(store.resolve(['m-a', 'a']))
+        self.assertEqual(store.resolve(['m-b']), 'b')
+
+    def test_trimmed_message_ids_leave_no_index_entry(self):
+        """`message_ids` is capped; the index must be capped with it, or it is
+        the unbounded map the cap exists to prevent."""
+        from bridget_core.conversations import MAX_MESSAGE_IDS
+        for i in range(MAX_MESSAGE_IDS + 5):
+            self.store.record('k1', message_id=f'm{i}')
+        self.assertIsNone(self.store.resolve(['m0']), 'a trimmed id still indexed')
+        self.assertEqual(self.store.resolve([f'm{MAX_MESSAGE_IDS + 4}']), 'k1')
+        self.assertEqual(self.store.resolve(['k1']), 'k1',
+                         'the key itself must never be trimmed away')
+
+    def test_an_id_reclaimed_by_another_conversation_is_not_stolen_back(self):
+        self.store.record('k1', message_id='m1')
+        self.store.record('k2', message_id='m1')
+        self.store.forget('k1')
+        self.assertEqual(self.store.resolve(['m1']), 'k2')
 
 
 class TestSettingsStore(unittest.TestCase):
@@ -736,6 +838,32 @@ class TestBuildSendArgs(unittest.TestCase):
 
     def test_sender_is_overridable(self):
         self.assertIn('--from=bot', build_send_args('a', 's', 'b', sender='bot'))
+
+    def test_json_requested_only_when_the_caller_wants_the_id(self):
+        self.assertNotIn('--json', build_send_args('a', 's', 'b'))
+        self.assertIn('--json', build_send_args('a', 's', 'b', want_msg_id=True))
+
+
+class TestParseSentMessageId(unittest.TestCase):
+    """The bridge must learn the id of the reply it just sent — the agent's
+    answer will name that id and no other."""
+
+    def test_reads_msg_id_from_json(self):
+        out = ('{"msg_id":"1783.88.9","from":"human","to":"mayor",'
+               '"mailbox_created":false,"in_reply_to":""}')
+        self.assertEqual(parse_sent_message_id(out), '1783.88.9')
+
+    def test_falls_back_to_the_delivered_line(self):
+        """Older mg, or a caller that didn't ask for --json. The maildir
+        basename *is* the message id."""
+        out = 'Delivered: human → mayor/new/1783.88.9  (new mailbox created)'
+        self.assertEqual(parse_sent_message_id(out), '1783.88.9')
+
+    def test_unparseable_output_yields_no_id_rather_than_raising(self):
+        """One hop of lost threading beats telling the human that a reply which
+        plainly went out was undeliverable."""
+        for out in ('', '   ', 'surprise!', '{"other":"shape"}', '[1,2]', '{'):
+            self.assertEqual(parse_sent_message_id(out), '', repr(out))
 
 
 class TestAcks(unittest.TestCase):

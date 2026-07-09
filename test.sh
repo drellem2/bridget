@@ -11,4 +11,8 @@ python3 tests/test_env_defaults.py
 python3 tests/test_channels.py
 python3 tests/test_threading.py
 python3 tests/test_secrets.py
+# Shells out to the real mg; self-skips when the mg on PATH lacks correlation
+# IDs. Hand-authored References fixtures cannot catch a thread that splits on
+# the second hop — only mg writes those headers the way mg writes them.
+python3 tests/test_mg_threading.py
 echo "test.sh: ok"

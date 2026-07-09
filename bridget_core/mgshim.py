@@ -22,12 +22,19 @@ undeliverable.
 """
 from __future__ import annotations
 
+import json
+import re
 import sys
 
 FLAG_IN_REPLY_TO = '--in-reply-to'
+FLAG_JSON = '--json'
 
 MODES = ('auto', 'on', 'off')
 DEFAULT_MODE = 'auto'
+
+#: `Delivered: human → mayor/new/1783613368062470000.88512.0`, the human-readable
+#: form of what `--json` reports as `msg_id`. Parsed only as a backstop.
+_DELIVERED_RE = re.compile(r'/new/(\S+)')
 
 
 def help_advertises_in_reply_to(help_text: str) -> bool:
@@ -106,9 +113,20 @@ class MgCapabilities:
 
 
 def build_send_args(agent: str, subject: str, body: str, *,
-                    sender: str = 'human', in_reply_to: str = '') -> list[str]:
-    """The argv for one `mg mail send`. `in_reply_to` is appended only when the
-    caller has decided mg supports it."""
+                    sender: str = 'human', in_reply_to: str = '',
+                    want_msg_id: bool = False) -> list[str]:
+    """The argv for one `mg mail send`.
+
+    `in_reply_to` is appended only when the caller has decided mg supports it.
+    `want_msg_id` asks for `--json`, whose `msg_id` is the id of the message
+    just delivered — the id the recipient's reply will name, and so the id the
+    conversation store must remember to keep the thread alive past this hop.
+
+    Requesting `--json` is safe wherever `--in-reply-to` is safe: `mg mail
+    --json` (macguffin 08cfa39) predates the correlation-ID work (e306af3), so
+    any build advertising the latter emits the former. Callers still tolerate a
+    missing id rather than assuming one.
+    """
     args = [
         'mail', 'send', agent,
         f'--from={sender}',
@@ -117,4 +135,32 @@ def build_send_args(agent: str, subject: str, body: str, *,
     ]
     if in_reply_to:
         args.append(f'{FLAG_IN_REPLY_TO}={in_reply_to}')
+    if want_msg_id:
+        args.append(FLAG_JSON)
     return args
+
+
+def parse_sent_message_id(output: str) -> str:
+    """The id mg assigned the message it just sent, or '' if it didn't say.
+
+    Reads `--json`'s `msg_id`, falling back to the maildir path in the
+    human-readable `Delivered:` line — whose basename *is* the message id, as
+    macguffin names each file after the id it stamps into `Message-Id`.
+
+    An unparseable output is not an error. It costs the conversation one hop of
+    threading, which is exactly the pre-existing behaviour; a raised exception
+    would instead tell the human their delivered reply was undeliverable.
+    """
+    text = (output or '').strip()
+    if not text:
+        return ''
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        if isinstance(payload, dict):
+            return str(payload.get('msg_id') or '')
+        return ''
+    match = _DELIVERED_RE.search(text)
+    return match.group(1) if match else ''
