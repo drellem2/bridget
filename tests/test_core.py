@@ -38,6 +38,8 @@ from bridget_core import (  # noqa: E402
 from bridget_core.acks import AMBIGUOUS, DELIVERED, UNDELIVERABLE  # noqa: E402
 from bridget_core.conversations import MAX_MESSAGE_IDS  # noqa: E402
 from bridget_core.mail import (  # noqa: E402
+    _is_field_name,
+    _split_headers,
     correlation_candidates,
     reply_target,
     thread_title,
@@ -111,6 +113,58 @@ class TestParseMail(unittest.TestCase):
         mail = parse_mail(raw)
         self.assertEqual(mail['references'], ['id-1', 'id-2', 'id-3', 'id-4', 'id-5'])
         self.assertEqual(mail['from'], 'a')
+
+    # -- A6: the separator is the first colon, not the first colon-space -----
+
+    def test_an_empty_value_header_does_not_swallow_the_rest(self):
+        """RFC 5322 makes the space after the colon optional. Keying on ': '
+        turned `Subject:` into a body line and lost every header after it —
+        including In-Reply-To, so the mail rooted a fresh thread."""
+        raw = ('Message-Id: id-1\nFrom: agent-x\nSubject:\n'
+               'In-Reply-To: id-0\n\nreal body')
+        mail = parse_mail(raw)
+        self.assertEqual(mail['subject'], '')
+        self.assertEqual(mail['in_reply_to'], 'id-0')
+        self.assertEqual(mail['body'], 'real body')
+
+    def test_a_header_with_no_space_after_the_colon(self):
+        mail = parse_mail('Message-Id:id-1\nFrom:agent-x\n\nbody')
+        self.assertEqual(mail['message_id'], 'id-1')
+        self.assertEqual(mail['from'], 'agent-x')
+
+    def test_crlf_line_endings_parse(self):
+        mail = parse_mail('Message-Id: id-1\r\nFrom: a\r\nIn-Reply-To: id-0\r\n\r\nbody')
+        self.assertEqual(mail['message_id'], 'id-1')
+        self.assertEqual(mail['in_reply_to'], 'id-0')
+        self.assertEqual(mail['body'], 'body')
+
+    def test_a_colon_in_a_subject_value_is_not_a_separator(self):
+        mail = parse_mail('Subject: Re: build: broken\nFrom: a\n\nbody')
+        self.assertEqual(mail['subject'], 'Re: build: broken')
+        self.assertEqual(mail['from'], 'a')
+
+    def test_a_headerless_body_line_with_a_colon_starts_the_body(self):
+        """`hello: world` has a space in its 'field name', so it is not one."""
+        headers, body = _split_headers('From: a\nhello there: world\n\nrest')
+        self.assertEqual(set(headers), {'from'})
+        self.assertEqual(body, 'hello there: world\n\nrest')
+
+    def test_header_values_are_stripped(self):
+        mail = parse_mail('Subject:   padded   \nFrom: a\n\nbody')
+        self.assertEqual(mail['subject'], 'padded')
+
+    def test_a_leading_continuation_with_no_header_starts_the_body(self):
+        headers, body = _split_headers('  indented first line\nFrom: a\n\nbody')
+        self.assertEqual(headers, {})
+        self.assertEqual(body, '  indented first line\nFrom: a\n\nbody')
+
+    def test_field_name_predicate(self):
+        self.assertTrue(_is_field_name('In-Reply-To'))
+        self.assertTrue(_is_field_name('X_Weird!Header'))
+        self.assertFalse(_is_field_name(''))
+        self.assertFalse(_is_field_name('has space'))
+        self.assertFalse(_is_field_name('has:colon'))
+        self.assertFalse(_is_field_name('tab\there'))
 
     def test_body_containing_colon_lines_is_not_eaten(self):
         mail = parse_mail('From: a\nSubject: s\n\nkey: value in body\nmore')
@@ -326,6 +380,51 @@ class TestConversationStore(unittest.TestCase):
         self.assertEqual(raw['version'], 2)
         self.assertIn('k1', raw['conversations'])
         self.assertNotIn('key', raw['conversations']['k1'])
+
+
+class TestStoreDefensiveBranches(unittest.TestCase):
+    """A16. The `except`/`isinstance` arms that only a corrupt file reaches.
+    They exist so a hand-edited state file degrades instead of crashing the
+    bridge; untested, that is an aspiration rather than a property."""
+
+    def setUp(self):
+        self.dir = tmpdir('bridget-defensive-')
+        self.path = self.dir / 'conversations.json'
+
+    def test_a_non_dict_conversation_entry_is_skipped_not_fatal(self):
+        self.path.write_text(json.dumps({
+            'version': 2,
+            'conversations': {'good': {'subject': 's'}, 'bad': 'not-an-object', 'worse': [1]},
+        }))
+        store = ConversationStore(self.path)
+        self.assertEqual(set(store.keys()), {'good'})
+
+    def test_a_conversations_value_that_is_not_an_object_yields_an_empty_store(self):
+        self.path.write_text(json.dumps({'version': 2, 'conversations': ['nope']}))
+        self.assertEqual(len(ConversationStore(self.path)), 0)
+
+    def test_a_top_level_json_array_yields_an_empty_store(self):
+        self.path.write_text('[]')
+        self.assertEqual(len(ConversationStore(self.path)), 0)
+
+    def test_a_store_write_leaves_no_temp_file(self):
+        store = ConversationStore(self.path)
+        store.record('k1', subject='s', agent='a', message_id='m1')
+        self.assertEqual([p.name for p in self.dir.iterdir()], ['conversations.json'])
+
+    def test_a_non_list_muted_yields_no_mutes(self):
+        p = self.dir / 'settings.json'
+        p.write_text(json.dumps({'version': 1, 'muted': {'k1': True}, 'dm_policy': 'all'}))
+        self.assertEqual(SettingsStore(p).muted, set())
+
+    def test_an_unreadable_seen_file_yields_an_empty_set(self):
+        """mailbox._load_seen's OSError arm: a directory where a file belongs,
+        an EACCES, an EIO. The bridge must still start."""
+        seen = self.dir / 'seen-as-a-directory'
+        seen.mkdir()
+        (self.dir / 'new').mkdir()
+        w = MaildirWatcher(self.dir / 'new', seen)
+        self.assertEqual(w.seen, set())
 
 
 class TestPostedGuard(unittest.TestCase):

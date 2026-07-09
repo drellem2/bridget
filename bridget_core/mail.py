@@ -16,6 +16,17 @@ one, keyed on its own id.
 from __future__ import annotations
 
 
+def _is_field_name(name: str) -> bool:
+    """RFC 5322 `ftext`: one or more printable ASCII characters, no colon.
+
+    This is what separates `Subject:` (a header with an empty value) from a
+    body line that happens to contain a colon. A space disqualifies it, which
+    is why `hello: world, how are you` reads as body and `In-Reply-To:` does
+    not.
+    """
+    return bool(name) and all('!' <= c <= '~' and c != ':' for c in name)
+
+
 def _split_headers(content: str) -> tuple[dict, str]:
     """Split a raw maildir message into (headers, body).
 
@@ -23,6 +34,14 @@ def _split_headers(content: str) -> tuple[dict, str]:
     beginning with space or tab) are appended to the preceding header, which
     matters for `References` — it can carry up to 20 ids and may be wrapped.
     The header block ends at the first empty line, as macguffin writes it.
+
+    The separator is the first colon, not the first colon-space. RFC 5322 makes
+    that space optional, so `Subject:` with an empty value is a legal header —
+    and keying on `': '` made it a body line, silently swallowing every header
+    after it. A mail whose `Subject` was empty would lose its `In-Reply-To` and
+    root a fresh thread. Today's `mg` never emits an empty-value header
+    (`--subject` is required non-empty), so this was latent rather than live;
+    it is not a property we want to depend on.
     """
     lines = content.splitlines()
     headers: dict[str, str] = {}
@@ -36,12 +55,12 @@ def _split_headers(content: str) -> tuple[dict, str]:
         if line[:1] in (' ', '\t') and last_key is not None:
             headers[last_key] += ' ' + line.strip()
             continue
-        if ': ' in line:
-            k, v = line.split(': ', 1)
-            last_key = k.lower()
-            headers[last_key] = v
+        name, sep, value = line.partition(':')
+        if sep and _is_field_name(name):
+            last_key = name.lower()
+            headers[last_key] = value.strip()
         else:
-            # A non-folded line with no "key: value" shape. macguffin never
+            # A non-folded line with no "field-name:" shape. macguffin never
             # writes one; treat it as the start of the body rather than
             # silently swallowing it.
             body_start = i
