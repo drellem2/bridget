@@ -32,9 +32,12 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   `~/.pogo/bridget.settings.json` and hot-reloaded. Muting silences the DM but
   never the thread, so muting cannot lose mail.
 - **`bridget_core`** — the transport-agnostic core (maildir watching, mg shim,
-  conversation map, settings, acks), importing no chat library. A Slack or
-  Matrix port is a new adapter, not a rewrite. `tests/test_core.py` does not
-  stub `discord`, so the split is enforced by the suite.
+  conversation map, settings, acks, state-file writes), importing no chat
+  library and rendering nothing. It returns outcomes and facts; the adapter
+  turns them into emoji and `**bold**`. A Slack or Matrix port is a new adapter,
+  not a rewrite. `tests/test_core.py` does not stub `discord`, and
+  `TestCoreCarriesNoPresentation` fails the build if presentation drifts back
+  in, so the split is enforced by the suite rather than merely intended.
 - **`BRIDGET_CORRELATION_IDS`** (`auto` / `on` / `off`) — whether to thread
   replies with `mg mail send --in-reply-to` (macguffin gh#66). `auto` probes
   `mg mail send --help` once. Replies always deliver; without the flag they
@@ -49,6 +52,25 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 - **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
   or any real secret value is committed, if a config key is undocumented, or if
   `TOKEN` is referenced anywhere but `client.run`.
+
+### Security
+
+- **Nothing bridget posts can ping anyone.** `discord.Client` was constructed
+  without `allowed_mentions`, so a mail subject containing `@everyone` or `@here`
+  pinged the server if the bot had Mention Everyone. Everything bridget renders
+  is text somebody else wrote — mail subjects and bodies composed by agents, and
+  `mg`'s own output — so mentions are now suppressed at the client, where it
+  holds for every send rather than at each call site that has to remember.
+- **State files are owner-only.** `~/.pogo/bridget.{conversations,settings,
+  task-states,idea-claims}.json`, `bridget.seen`, and `quiet.json` were written
+  at `0644` under the default umask. None hold the bot token, but they do hold
+  mail subjects, agent names, and which conversations you muted. All six now go
+  through one atomic writer that creates the temp file `0600` *before* it holds
+  anything. `install.sh` tightens `~/.pogo` itself to `0700`.
+- **`.gitignore` covers `*.env`.** The real env file lives at
+  `~/.pogo/bridget.env`, out of tree — but `cp bridget.env.example bridget.env`
+  in the checkout is the obvious thing to try, and the next `git add -A` would
+  commit a bot token. (`bridget.env.example` is unaffected.)
 
 ### Fixed
 
@@ -73,6 +95,32 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   made the multi-line-reply behaviour purely cosmetic, and free to decide on its
   own merits — see "a multi-line reply in a thread" under Changed.
 
+- **Mail delivery is at-least-once, and a redelivery cannot duplicate a thread
+  post.** `poll()` persisted the seen-set *before* the caller delivered.
+  `unsee()` covers a graceful send failure but structurally cannot cover a
+  SIGKILL, OOM, or power loss in the window between the seen-set hitting the
+  disk and the mail hitting Discord — a killed process does not get to run
+  `unsee()`. That mail was marked seen forever and, because bridget is
+  observe-only, it stayed unread in `new/` where nothing would ever surface it
+  again. The watcher now commits a mail only once it has landed. Making
+  redelivery routine exposed a second bug: `post_to_thread` runs before
+  `user.send`, so a failed DM re-posted the same mail into the thread. The
+  conversation store tracks which messages it has already rendered. The DM
+  itself is not deduplicated — Discord offers no idempotency key — so the trade
+  is explicit: a duplicate DM is recoverable by reading it twice, a lost mail is
+  not.
+- **A code block cannot be escaped by the text inside it.** A mail body
+  containing a triple backtick closed bridget's code fence early, and the
+  remainder rendered as raw markdown. Agents post code constantly, so this was
+  the common case, not the adversarial one. Truncation of a long mail now
+  happens inside the fence, too — chopping the rendered string is how the
+  closing fence used to get lost.
+- **A header with an empty value no longer swallows the headers after it.**
+  `_split_headers` keyed on `': '` (colon-space), but RFC 5322 makes that space
+  optional; `Subject:` read as a body line, taking `In-Reply-To` with it, and
+  the mail rooted a fresh thread. Latent rather than live — `mg` requires a
+  non-empty `--subject` — but not a property worth depending on.
+
 ### Changed
 
 - **A multi-line reply in a thread keeps the conversation's subject.** Typing
@@ -84,6 +132,20 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   behaviour broke subject continuity for the agent and put the human's first
   sentence in its inbox as a non-sequitur. `send_channel_chat_mail` — free-form
   text in a mapped channel, where the human *is* composing — still splits.
+
+- **The core no longer renders.** `Ack` carries `kind` plus the facts behind it
+  and no longer truncates a subject or a stderr dump; `SettingsStore.describe()`
+  became `summary()`, a dict; `thread_title(limit=...)` no longer bakes in
+  Discord's 100-character thread-name cap. `render_ack()` and `render_settings()`
+  in the adapter hold everything that moved. Internal — no user-visible change.
+- **`install.sh --no-venv`** skips venv creation and the dependency install, the
+  only step that needs the network. It exists so the installer can be tested by
+  actually running it (`tests/test_install.py`), and is useful if you manage the
+  venv yourself.
+- **Every source file carries a copyright line, an SPDX tag, and the GPL's
+  warranty disclaimer**, with a GPL-3.0 §5(a) modification notice on the files
+  that came from upstream. `AUTHORS` describes what is there rather than
+  overstating it.
 
 - `install.sh` now tightens `~/.pogo/bridget.env` to `600` on every run, not
   only the run that created it. bridget warns at startup if it is readable
