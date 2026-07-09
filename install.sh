@@ -8,17 +8,25 @@
 #
 # With --setup, additionally prompts for the Discord credentials and writes them
 # into the env file. The bot token is read with the terminal echo off and is
-# never printed, logged, or passed on a command line — only a masked
-# confirmation (last 4 characters) is shown back.
+# never printed, logged, or passed on a command line. *No* part of it is echoed
+# back — not even a last-4 confirmation, because a partial token is still a
+# leaked token and this output may land in a terminal transcript. A paste error
+# is caught by validating the token's shape instead (see token_shape_ok).
 set -euo pipefail
 
 SETUP=0
+NO_VENV=0
 for arg in "$@"; do
     case "$arg" in
         --setup) SETUP=1 ;;
+        --no-venv) NO_VENV=1 ;;
         -h|--help)
-            printf 'usage: install.sh [--setup]\n\n'
-            printf '  --setup   prompt for Discord credentials (token entry is masked)\n'
+            printf 'usage: install.sh [--setup] [--no-venv]\n\n'
+            printf '  --setup     prompt for Discord credentials (token entry is masked)\n'
+            printf '  --no-venv   skip venv creation and dependency install. Everything\n'
+            printf '              else still runs. This is the only step that needs the\n'
+            printf '              network, so it is what the test suite skips; also useful\n'
+            printf '              if you manage the venv yourself.\n'
             exit 0 ;;
         *) printf 'install.sh: unknown argument %s\n' "$arg" >&2; exit 2 ;;
     esac
@@ -44,16 +52,20 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # 1. venv
-if [[ ! -d "$VENV_DIR" ]]; then
-    log "creating venv at $VENV_DIR"
-    python3 -m venv "$VENV_DIR"
+if (( NO_VENV )); then
+    log "skipping venv and dependency install (--no-venv)"
 else
-    log "venv already exists at $VENV_DIR"
-fi
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log "creating venv at $VENV_DIR"
+        python3 -m venv "$VENV_DIR"
+    else
+        log "venv already exists at $VENV_DIR"
+    fi
 
-log "installing requirements"
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
+    log "installing requirements"
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
+fi
 
 # 2. symlink ~/.pogo/bin/bridget → repo script
 mkdir -p "$BIN_DIR"
@@ -183,8 +195,9 @@ if command -v mg >/dev/null 2>&1; then
     log "found mg: $(command -v mg)"
 else
     warn "mg not found on PATH."
-    warn "install pogo (https://github.com/CloverRoss/pogo) and ensure mg is reachable,"
-    warn "or set MG_BIN in $ENV_FILE."
+    warn "mg ships with pogo (the maintainer's own repository — bridget does not"
+    warn "vendor it). Install pogo and ensure mg is reachable, or set MG_BIN in"
+    warn "$ENV_FILE."
 fi
 
 cat <<EOF

@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Smoke test: bridget with only required Discord env vars set.
+"""Smoke test: every command works on a freshly-installed bridget.
 
-Asserts no command emits the "is unavailable: set ..." config-error
-pattern that mg-26f7 removed. Re-introducing such a branch would fail
-this test.
+Drives `handle_command` against a throwaway $HOME holding nothing but the three
+required Discord keys — the state a user is in the moment install.sh finishes.
+Asserts no command emits the "is unavailable: set ..." config-error pattern that
+mg-26f7 removed. Re-introducing such a branch would fail this test.
+
+This does **not** run install.sh; it fabricates the state install.sh leaves
+behind. `tests/test_install.py` is what actually executes the installer. The two
+are complements: that one checks the installer produces this state, this one
+checks bridget is usable once it has.
+
+Needs the real `discord` module, so it runs out of the bridget venv via
+`smoke-fresh-install.sh` and skips when that venv is absent.
 """
 import importlib.util
 import os
@@ -24,11 +33,15 @@ def main() -> int:
     os.environ['HOME'] = str(fake_home)
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
-    (env_dir / 'bridget.env').write_text(
+    env_file = env_dir / 'bridget.env'
+    env_file.write_text(
         'DISCORD_BOT_TOKEN=fake-token-for-smoke-test\n'
         'DISCORD_USER_ID=1\n'
         'DISCORD_SERVER_ID=2\n'
     )
+    # As install.sh leaves it — otherwise bridget correctly warns about a
+    # world-readable token file and the warning drowns the smoke output.
+    os.chmod(env_file, 0o600)
 
     # bridget has no .py extension, so spec_from_file_location can't infer
     # a loader — pass SourceFileLoader explicitly.
