@@ -162,7 +162,7 @@ and `discord.py`'s own logging is disabled (`log_handler=None`).
 - `idea: [tag] <text>` — file with an extra scope tag (e.g. `[bridget]`).
 - `bug: <text>` — file a new bug (existing software is broken, not a new feature). *(Requires `POGO_INBOX_REPO`.)*
 - `bug: [tag] <text>` — file a bug with an extra scope tag (e.g. `[discord-bridge]`).
-- `mail <subject>\n<body>` — send a mail to the configured recipient (default `mayor`; override via `POGO_MAIL_RECIPIENT`). Without a newline, the whole text becomes the subject.
+- `mail <subject>\n<body>` — send a mail to the configured recipient (default `mayor`; override via `POGO_MAIL_RECIPIENT`). Without a newline, the whole text becomes the *body*, under a subject derived from it. Nothing you type is ever dropped: the body always carries the message whole, and the subject is a bounded label that, when shortened, says so — `… [truncated N chars; full text in body]`.
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
@@ -405,8 +405,11 @@ messages — it does not have to match the agent name or the channel name.
   `revise` / `explain` / `next` / `idea:` / `bug:`) keep routing through
   `POGO_WORKFLOW_AGENT` exactly as they do in DMs — design coordination
   doesn't change identity based on which channel you typed in. Free-form text
-  in an inbound-mapped channel becomes `mg mail send <channel-agent>` with
-  the first line as subject and the rest as body.
+  in an inbound-mapped channel becomes `mg mail send <channel-agent>` with the
+  **whole message as the body** and a bounded, derived label as the subject.
+  Chat is talking, not composing mail: there is no subject line, only a first
+  sentence, and lifting that sentence into the subject once let an agent read a
+  mid-clause fragment as a complete instruction.
 - **Outbound (agent → channel).** When a watcher would normally DM the user
   about an event involving an agent that has an outbound mapping, bridget
   posts to the mapped channel *instead of* DMing — so channels declutter your

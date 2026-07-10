@@ -1100,11 +1100,28 @@ class TestReplyInConversation(unittest.TestCase):
             self.b.reply_in_conversation('hi', conv)
         self.assertIn('--subject=Re: mail from mayor', run.call_args[0][0])
 
-    def test_the_mail_verb_still_splits_subject_from_body(self):
-        """A4 is scoped to in-thread replies. Composing a fresh mail in a mapped
-        channel still takes its subject from the first line."""
+    def test_channel_chat_puts_the_whole_message_in_the_body(self):
+        """Channel chat is talking, not composing mail, so the body gets it all.
+
+        This reverses an earlier decision (chat took its subject from the first
+        line, like the `mail` verb). A chat message has no subject line — only a
+        first sentence — and lifting that sentence into the subject is how
+        mg-7e0c read a mid-clause fragment ("…you can delete and recreate if")
+        as a complete instruction. The subject is now a derived label; the body
+        is the message.
+        """
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
             self.b.send_channel_chat_mail('ship it\nafter CI passes', 'mayor')
+        args = run.call_args[0][0]
+        self.assertIn('--body=ship it\nafter CI passes', args)
+        # One-line label, whitespace collapsed; the body still holds every byte.
+        self.assertIn('--subject=ship it after CI passes', args)
+
+    def test_the_mail_verb_still_splits_subject_from_body(self):
+        """A4 is scoped to in-thread replies. The `mail` verb is the one place
+        the human deliberately composes a subject, so its split is honoured."""
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
+            self.b.handle_command('mail ship it\nafter CI passes')
         args = run.call_args[0][0]
         self.assertIn('--subject=ship it', args)
         self.assertIn('--body=after CI passes', args)

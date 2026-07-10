@@ -30,6 +30,7 @@ Covers:
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -59,16 +60,24 @@ from bridget_core.mail import (  # noqa: E402
     thread_title,
 )
 from bridget_core.mgshim import (  # noqa: E402
+    MG_SUBJECT_LIMIT,
     MgCapabilities,
     build_send_args,
+    compose_subject_body,
     help_advertises_in_reply_to,
     is_unknown_flag_error,
     parse_sent_message_id,
+    subject_label,
 )
 
 
 def tmpdir(prefix: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=prefix))
+
+
+def subject_arg(args: list[str]) -> str:
+    """The value of `--subject=` in an mg argv."""
+    return next(a for a in args if a.startswith('--subject='))[len('--subject='):]
 
 
 class TestNoTransportImport(unittest.TestCase):
@@ -1104,6 +1113,127 @@ class TestMgCapabilities(unittest.TestCase):
         self.assertEqual(MgCapabilities(lambda: HELP_WITH, mode='off').describe(), 'off (forced)')
 
 
+#: The reply that authorized a repo deletion, as it *arrived* — cut mid-clause
+#: on the word "if", which read as a complete sentence. mg-7e0c.
+CLIPPED = 'Sleep wake is not a critical repo you can delete and recreate if'
+
+
+class TestComposeSubjectBody(unittest.TestCase):
+    """The mg-7e0c invariant: no byte the human typed is ever dropped.
+
+    A silent truncation of a human instruction is the worst failure this
+    component has, because a truncated authorization can invert its meaning:
+    "you can delete and recreate if <condition>" and "you can delete and
+    recreate" are different instructions.
+    """
+
+    def assert_nothing_dropped(self, text: str) -> tuple[str, str]:
+        subject, body = compose_subject_body(text)
+        args = build_send_args('mayor', subject, body)
+        delivered = subject_arg(args) + '\n' + next(
+            a for a in args if a.startswith('--body='))[len('--body='):]
+        stripped = text.strip()
+        self.assertIn(stripped, delivered,
+                      f'{len(stripped)} chars in, tail lost on the way out')
+        return subject, body
+
+    def test_a_long_one_line_instruction_survives_whole(self):
+        # Longer than the subject cap, with the operative clause at the end —
+        # exactly the shape that lost its meaning.
+        text = (CLIPPED + ' you first confirm nothing else depends on it. '
+                + 'Context context context. ' * 40
+                + 'FINAL: do not delete anything.')
+        self.assertGreater(len(text), MG_SUBJECT_LIMIT)
+        subject, body = self.assert_nothing_dropped(text)
+        self.assertEqual(body, text)
+        self.assertIn('[truncated', subject)
+        self.assertNotEqual(body, '(no body)')
+
+    def test_short_chat_message_is_not_stranded_in_the_subject(self):
+        # It fits, so it is not truncated — but it must still reach the body.
+        # An agent reading only the body used to find the string '(no body)'.
+        subject, body = self.assert_nothing_dropped(CLIPPED)
+        self.assertEqual(subject, CLIPPED)
+        self.assertEqual(body, CLIPPED)
+
+    def test_explicit_subject_line_split_is_honoured(self):
+        subject, body = self.assert_nothing_dropped('deploy plan\nship it on friday')
+        self.assertEqual(subject, 'deploy plan')
+        self.assertEqual(body, 'ship it on friday')
+
+    def test_an_overlong_first_line_is_a_sentence_not_a_subject(self):
+        # We would have to elide it to use it as a subject, so it goes to the
+        # body whole and the subject becomes a derived label.
+        text = 'x' * (MG_SUBJECT_LIMIT + 1) + '\ntail'
+        subject, body = self.assert_nothing_dropped(text)
+        self.assertEqual(body, text)
+        self.assertIn('[truncated', subject)
+
+    def test_the_marker_tells_the_truth_about_how_much_it_dropped(self):
+        label = 'w' * 5000
+        subject = subject_label(label)
+        dropped = int(re.search(r'truncated (\d+) chars', subject).group(1))
+        head = subject[:subject.index('… [truncated')]
+        self.assertEqual(dropped, len(label) - len(head))
+        self.assertLessEqual(len(subject), MG_SUBJECT_LIMIT)
+
+    def test_the_label_never_exceeds_its_limit(self):
+        # The marker's own length is charged against the budget, at every limit
+        # and every input length — including the ones where it doesn't fit.
+        for limit in (1, 2, 20, 44, 45, 46, 80, MG_SUBJECT_LIMIT):
+            for n in (0, limit - 1, limit, limit + 1, limit * 4, 9000):
+                if n < 0:
+                    continue
+                self.assertLessEqual(len(subject_label('q' * n, limit=limit)), limit,
+                                     f'limit={limit} n={n}')
+
+    def test_multiline_body_keeps_its_newlines(self):
+        subject, body = self.assert_nothing_dropped('subj\nline one\nline two')
+        self.assertEqual(body, 'line one\nline two')
+
+    def test_empty_text_composes_nothing(self):
+        self.assertEqual(compose_subject_body('   \n  '), ('', ''))
+
+    def test_positive_control_the_check_detects_the_old_composition(self):
+        """A check that cannot fail is not a check.
+
+        `assert_nothing_dropped` is the guard for every test above it. Run it
+        against the composition bridget shipped before this fix and it must
+        report the loss — otherwise it proves nothing about the code that
+        replaced it.
+        """
+        def legacy_compose(text):
+            # bridget as it was: single-line message -> whole thing in the
+            # subject, placeholder in the body, then a bare slice at 200.
+            if '\n' in text:
+                head, rest = text.split('\n', 1)
+                return head.strip(), rest.rstrip()
+            return text, '(no body)'
+
+        text = 'Delete the repo if ' + 'and only if. ' * 40
+        self.assertGreater(len(text), MG_SUBJECT_LIMIT)
+
+        subject, body = legacy_compose(text)
+        delivered = subject[:MG_SUBJECT_LIMIT] + '\n' + body
+        self.assertNotIn(text, delivered, 'the old path must fail this check')
+
+        # The same check, same input, against the code that ships.
+        self.assert_nothing_dropped(text)
+
+    def test_subject_label_neutralizes_controls_and_bounds(self):
+        # Each control char becomes one space; ordinary spacing is preserved.
+        self.assertEqual(subject_label('a\n\tb  c'), 'a  b  c')
+        self.assertEqual(len(subject_label('z' * 999)), MG_SUBJECT_LIMIT)
+        self.assertEqual(subject_label('short', limit=80), 'short')
+
+    def test_deliberate_subject_line_keeps_its_exact_spacing(self):
+        # The `mail` verb path: a composed subject line loses nothing, not even
+        # doubled spaces, because mg accepts them (mg-7e0c review follow-up).
+        subject, body = compose_subject_body('Ship  v2   now\nbody text')
+        self.assertEqual(subject, 'Ship  v2   now')
+        self.assertEqual(body, 'body text')
+
+
 class TestBuildSendArgs(unittest.TestCase):
     def test_basic_args(self):
         args = build_send_args('mayor', 'subj', 'body')
@@ -1120,10 +1250,31 @@ class TestBuildSendArgs(unittest.TestCase):
     def test_empty_body_becomes_placeholder(self):
         self.assertIn('--body=(no body)', build_send_args('a', 's', ''))
 
-    def test_subject_is_truncated(self):
+    def test_subject_is_bounded_and_visibly_elided(self):
         args = build_send_args('a', 'x' * 500, 'b')
-        subject = next(a for a in args if a.startswith('--subject='))
-        self.assertEqual(len(subject) - len('--subject='), 200)
+        subject = subject_arg(args)
+        self.assertLessEqual(len(subject), MG_SUBJECT_LIMIT)
+        # A shortened label must say so. It used to end on a bare 'x', leaving a
+        # sentence that merely appeared to stop early.
+        self.assertIn('[truncated', subject)
+        self.assertTrue(subject.endswith('full text in body]'))
+
+    def test_body_is_never_truncated(self):
+        # The subject is a label and may be elided; the body is the payload and
+        # may not. mg stores whatever we hand it. (mg-7e0c)
+        body = 'y' * 20_000
+        self.assertIn(f'--body={body}', build_send_args('a', 's', body))
+
+    def test_subject_neutralizes_control_chars_but_keeps_spacing(self):
+        # mg rejects a header with a control character, so newlines and tabs
+        # become spaces. Ordinary spacing mg accepts, so it is left as typed —
+        # a subject the human composed with two spaces keeps them.
+        subject = subject_arg(build_send_args('a', 'first\nsecond\tthird', 'b'))
+        self.assertEqual(subject, 'first second third')
+        self.assertNotIn('\n', subject)
+        self.assertNotIn('\t', subject)
+        kept = subject_arg(build_send_args('a', 'Fix:  the  bug', 'b'))
+        self.assertEqual(kept, 'Fix:  the  bug')
 
     def test_sender_is_overridable(self):
         self.assertIn('--from=bot', build_send_args('a', 's', 'b', sender='bot'))

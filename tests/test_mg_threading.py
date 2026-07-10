@@ -49,6 +49,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -362,6 +363,84 @@ class TestTwoRoundTripsViaReply(TwoRoundTripContract, RealMgTestCase):
     """
 
     AGENT_REPLY = 'reply'
+
+
+class TestInboundMessageSurvivesRoundTrip(RealMgTestCase):
+    """A long inbound message reaches the agent's mailbox with every byte intact.
+
+    mg-7e0c. The unit tests assert the argv bridget builds; this asserts what
+    lands in the maildir, through the real `mg`. Only the real thing can show
+    that mg stores an over-long subject rather than clipping it — which is what
+    proves the 200-char cap was bridget's invention, not a limit it was obeying.
+    """
+
+    #: Longer than MG_SUBJECT_LIMIT, with the operative clause last. If any hop
+    #: truncates, the authorization inverts: "you can delete and recreate" with
+    #: its condition and its refusal both gone.
+    LONG = (
+        'Sleep wake is not a critical repo you can delete and recreate if '
+        'you first confirm nothing else depends on it. '
+        + 'Here is some more context that pushes us past the cap. ' * 8
+        + 'FINAL INSTRUCTION: do not delete anything.'
+    )
+
+    def _only_mail(self, agent: str) -> dict:
+        box = self._maildir(agent)
+        paths = sorted(box.iterdir())
+        self.assertEqual(len(paths), 1, f'expected exactly one mail in {box}')
+        return self.b.parse_mail(paths[0].read_text())
+
+    def test_long_channel_chat_arrives_whole(self):
+        self.assertGreater(len(self.LONG), 200)
+        reply = self.b.handle_channel_message(self.LONG, {'agent': 'mayor'})
+        self.assertTrue(reply.startswith('✓ mailed'), reply)
+
+        mail = self._only_mail('mayor')
+        self.assertEqual(mail['body'], self.LONG)
+        self.assertTrue(mail['body'].endswith('do not delete anything.'))
+        self.assertNotEqual(mail['body'], '(no body)')
+        # The subject is a label: bounded, one line, and visibly shortened —
+        # with a marker, not a bare slice that reads as a finished sentence.
+        self.assertLessEqual(len(mail['subject']), 200)
+        self.assertIn('[truncated', mail['subject'])
+        self.assertNotIn('\n', mail['subject'])
+
+    def test_long_mail_verb_arrives_whole(self):
+        # The `mail` verb used to build its own argv and skip build_send_args.
+        reply = self.b.handle_command('mail ' + self.LONG)
+        self.assertTrue(reply.startswith('✓ mailed'), reply)
+        mail = self._only_mail(self.b.CONFIG['mail_recipient'])
+        self.assertEqual(mail['body'], self.LONG)
+
+    async def test_on_message_delivers_a_long_channel_message_whole(self):
+        """The Discord event handler itself, end to end, into a real maildir.
+
+        `handle_channel_message` sits one call below `on_message`; this drives
+        the entrypoint Discord actually calls, so the routing is covered too.
+        The bytes are compared against what the human 'typed', which is the
+        acceptance test as specified: send > cap, read it back, compare.
+        """
+        channel = FakeTextChannel(777, client=self.b.client)
+        self.b.CHANNELS_BY_SNOWFLAKE[777] = {'agent': 'mayor', 'inbound': True}
+        message = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=self.b.USER_ID, bot=False),
+            channel=channel, content=self.LONG)
+
+        await self.b.on_message(message)
+
+        self.assertTrue(channel.sent, 'bridget acknowledged nothing')
+        self.assertTrue(channel.sent[0].startswith('✓ mailed'), channel.sent[0])
+        mail = self._only_mail('mayor')
+        self.assertEqual(mail['from'], 'human')
+        self.assertEqual(mail['body'], self.LONG)
+
+    def test_mg_itself_stores_an_overlong_subject(self):
+        # The premise of the fix. If this ever fails, mg grew a cap of its own
+        # and bridget must start splitting or marking rather than eliding.
+        subject = 'S' * 500
+        self._mg('mail', 'send', 'mayor', '--from=human',
+                 f'--subject={subject}', '--body=b')
+        self.assertEqual(self._only_mail('mayor')['subject'], subject)
 
 
 if __name__ == '__main__':

@@ -68,9 +68,11 @@ from bridget_core import (  # noqa: E402
     SettingsStore,
     acks,
     build_send_args,
+    compose_subject_body,
     conversation_key,
     is_unknown_flag_error,
     parse_mail,
+    subject_label,
 )
 from bridget_core.mail import (  # noqa: E402
     correlation_candidates,
@@ -142,7 +144,7 @@ COMMAND_LIST = (
     "• `idea: [tag] <text>` — file with extra scope tag (e.g. `[bridget]`)\n"
     "• `bug: <text>` — file a new bug (existing software is broken, not a new feature)\n"
     "• `bug: [tag] <text>` — file a bug with extra scope tag (e.g. `[discord-bridge]`)\n"
-    "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the subject)\n"
+    "• `mail <subject>\\n<body>` — send a mail (without a newline, the whole text becomes the body)\n"
     "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
     "• `dismiss all` — inbox-zero everything\n"
     "• `status` — global pull view (unread mail + in-flight work)\n"
@@ -1825,22 +1827,14 @@ def handle_command(text: str) -> str:
 
     if low == 'mail' or low.startswith('mail '):
         rest = text[len('mail'):].lstrip()
-        if '\n' in rest:
-            subject, body = rest.split('\n', 1)
-            subject = subject.strip()
-            body = body.rstrip()
-        else:
-            subject = rest.strip()
-            body = '(no body)'
+        # Honours an explicit `subject\nbody` split, and otherwise puts the
+        # whole message in the body under a derived label. Either way no byte
+        # of what the human typed is dropped (mg-7e0c).
+        subject, body = compose_subject_body(rest)
         if not subject:
             return 'Usage: mail <subject>\n[optional body, multi-line OK]'
         recipient = CONFIG['mail_recipient']
-        rc, out, err = run_mg([
-            'mail', 'send', recipient,
-            '--from=human',
-            f'--subject={subject}',
-            f'--body={body}',
-        ])
+        rc, out, err = run_mg(build_send_args(recipient, subject, body, sender='human'))
         if rc == 0:
             return f'✓ mailed {recipient}: "{subject[:60]}"'
         return f'✗ mail failed: {(err or out).strip()[:200]}'
@@ -2021,18 +2015,19 @@ def handle_thread_message(text: str, conv) -> str:
 
 def send_channel_chat_mail(text: str, agent: str) -> str:
     """Plain-text message in a mapped guild channel becomes a mail to that
-    channel's agent. Splits on the first newline to mimic the `mail` verb's
-    subject/body convention so the recipient sees a proper subject line."""
+    channel's agent.
+
+    A human chatting in a channel is talking, not composing mail: there is no
+    subject line, only a first sentence. So the entire message is the body, and
+    the subject is a label derived from it. This used to mimic the `mail` verb
+    and split on the first newline — which meant a one-line message became a
+    subject with '(no body)' under it, and lost everything past
+    MG_SUBJECT_LIMIT (mg-7e0c).
+    """
     text = text.strip()
     if not text:
         return ''
-    if '\n' in text:
-        subject, body = text.split('\n', 1)
-        subject = subject.strip()
-        body = body.rstrip()
-    else:
-        subject = text
-        body = '(no body)'
+    subject, body = subject_label(text), text
     rc, out, err = run_mg(build_send_args(agent, subject, body, sender='human'))
     if rc == 0:
         return f'✓ mailed `{agent}`: "{subject[:60]}"'

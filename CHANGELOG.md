@@ -96,6 +96,49 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **Inbound messages were silently truncated at 200 characters.** Free-form chat
+  in a mapped channel put the *entire message* in `--subject` whenever it had no
+  newline, leaving the body as the literal string `(no body)`. `build_send_args`
+  then sliced that subject to 200 characters with a bare `subject[:200]` — no
+  error, no marker, `mg` exiting 0. Subjects are bounded; bodies are not.
+
+  This is not cosmetic. A reply authorizing a repository deletion reached the
+  mayor as *"Sleep wake is not a critical repo you can delete and recreate if"*
+  — stopping mid-clause, on the condition, and reading as a complete sentence.
+  **A truncated authorization can invert its own meaning:** "you can delete and
+  recreate *if* ⟨condition⟩" and "you can delete and recreate" are different
+  instructions, and only the second one arrived. Nothing was destroyed, because
+  the mayor declined to act irreversibly on a sentence that stopped mid-clause.
+  That caution should not have been the only safeguard.
+
+  The 200-character cap was bridget's own invention, not a limit it was obeying:
+  mg stores a 500-character subject and returns it intact, which
+  `test_mg_itself_stores_an_overlong_subject` now pins. So the fix does not need
+  to split or mark anything — it needs to stop putting the payload in the
+  header. `compose_subject_body` now guarantees that **every byte the human
+  typed survives into the subject or the body**, and `build_send_args` never
+  truncates a body. The subject became what it always was: a bounded, one-line
+  label — control characters, which mg rejects in a header, become spaces while
+  ordinary spacing is left as typed — and, when it must be shortened, elided
+  with an explicit, truthful marker rather than a bare slice:
+
+      … [truncated 4843 chars; full text in body]
+
+  A bare `[:200]` leaves a grammatical sentence that merely happens to stop
+  early, and the reader gets no signal. That matters more than it sounds,
+  because truncating an instruction is biased toward the dangerous reading:
+  English puts the imperative first and the guard clause last ("delete it
+  *unless* …", "go ahead, *but* not production"), so clipping the tail strips
+  the condition and keeps the command. The result stays syntactically
+  plausible. The marker is the signal that a condition may have been stripped.
+
+  Channel chat no longer takes its subject from the first line either — a
+  reversal of an earlier decision. A person chatting has no subject line, only a
+  first sentence, and promoting that sentence to the subject is the same defect
+  wearing a different hat. The `mail` verb still honours an explicit
+  `subject⏎body` split, because there the human really is composing mail, and it
+  now routes through `build_send_args` instead of hand-rolling its own argv.
+
 - **`bridget-supervise` could pin itself to a deleted worktree and respawn into
   a FATAL forever, silently.** `BRIDGET_BIN` was resolved once at startup and
   re-exec'd unchanged on every restart, so a supervisor started against

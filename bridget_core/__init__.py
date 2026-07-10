@@ -48,10 +48,13 @@ from .conversations import Conversation, ConversationStore
 from .mail import conversation_key, correlation_candidates, parse_mail
 from .mailbox import MaildirWatcher
 from .mgshim import (
+    MG_SUBJECT_LIMIT,
     MgCapabilities,
     build_send_args,
+    compose_subject_body,
     is_unknown_flag_error,
     parse_sent_message_id,
+    subject_label,
 )
 from .settings import SettingsStore
 
@@ -59,16 +62,19 @@ __all__ = [
     'Ack',
     'Conversation',
     'ConversationStore',
+    'MG_SUBJECT_LIMIT',
     'MaildirWatcher',
     'MgCapabilities',
     'SettingsStore',
     'ambiguous',
     'build_send_args',
+    'compose_subject_body',
     'conversation_key',
     'correlation_candidates',
     'delivered',
     'is_unknown_flag_error',
     'parse_mail',
     'parse_sent_message_id',
+    'subject_label',
     'undeliverable',
 ]
