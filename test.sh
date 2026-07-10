@@ -32,6 +32,11 @@ python3 tests/test_threading.py
 # some ids twice (live + archived tombstone), and a line-by-line diff
 # re-announced them on every single poll.
 python3 tests/test_task_transitions.py
+# The inbound send path (mg-3f94): a message the human types — as a `mail`/
+# `idea:`/`bug:` DM or a mapped-channel chat — reaches the agent's `--body`
+# verbatim, while every label cut from it (the ack echo, the mg title) carries
+# a visible '…'. Stubs discord; runs under system python3.
+python3 tests/test_dm_echo.py
 # The watch_task_transitions silent-death fix (mg-3499): a single transient
 # `mg list` timeout must not kill the watcher thread, and a liveness heartbeat
 # whose mtime ticks every cycle must go stale only when the watcher is truly

@@ -137,6 +137,16 @@ THREAD_TITLE_LIMIT = 90
 #: clip mid-word ('…I want it to be mo') and read as a whole sentence, so every
 #: trim goes through `_elide` to leave a '…' the reader can act on. See mg-2635.
 TASK_TITLE_LABEL_LIMIT = 80
+
+#: How far the first line of an `idea:`/`bug:` DM is trimmed to become the mg
+#: item's `--title`. The title is a *label*: the human's full text is preserved
+#: verbatim in `--body`, so trimming loses nothing — but, like every other
+#: label here, it must be trimmed *visibly*. A bare `[:60]` slice of an
+#: instruction ("file a bug: the retry loop never backs off, so under load it")
+#: reads as a finished sentence and hides that the qualifier was dropped; the
+#: '…' `_elide` leaves is the signal that the title is not the whole story.
+#: See mg-2635 (label markers) and mg-7e0c (never truncate the payload).
+MG_TITLE_LABEL_LIMIT = 60
 STATUS_OUTPUT_BUDGET = 1700
 
 UNRECOGNIZED_REPLY = "Unrecognized. Send `help` for the full command list."
@@ -1913,7 +1923,11 @@ def handle_command(text: str) -> str:
         recipient = CONFIG['mail_recipient']
         rc, out, err = run_mg(build_send_args(recipient, subject, body, sender='human'))
         if rc == 0:
-            return f'✓ mailed {recipient}: "{subject[:60]}"'
+            # The body already carries every byte the human typed (mg-7e0c). This
+            # echo is a *label*, so elide it visibly rather than bare-slicing: a
+            # `subject[:60]` clips the tail with no marker, and a person watching
+            # their own long DM come back stopped mid-clause reads it as complete.
+            return f'✓ mailed {recipient}: "{_elide(subject, ACK_SUBJECT_LIMIT)}"'
         return f'✗ mail failed: {(err or out).strip()[:200]}'
 
     if low in ('help', '?', 'commands'):
@@ -1930,7 +1944,9 @@ def handle_command(text: str) -> str:
             body = m.group(2).strip()
         if not body:
             return "Usage: `idea: [optional-tag] <description>`"
-        title = body.splitlines()[0][:60]
+        # `--body` below carries the human's text whole; the title is only a
+        # label on the item, so elide it visibly instead of bare-slicing.
+        title = _elide(body.splitlines()[0], MG_TITLE_LABEL_LIMIT)
         args = [
             'new', '--type=idea',
             f'--title={title}',
@@ -1955,7 +1971,9 @@ def handle_command(text: str) -> str:
             body = m.group(2).strip()
         if not body:
             return "Usage: `bug: [optional-tag] <description>`"
-        title = body.splitlines()[0][:60]
+        # `--body` below carries the human's text whole; the title is only a
+        # label on the item, so elide it visibly instead of bare-slicing.
+        title = _elide(body.splitlines()[0], MG_TITLE_LABEL_LIMIT)
         args = [
             'new', '--type=bug',
             f'--title={title}',
@@ -2107,7 +2125,9 @@ def send_channel_chat_mail(text: str, agent: str) -> str:
     subject, body = subject_label(text), text
     rc, out, err = run_mg(build_send_args(agent, subject, body, sender='human'))
     if rc == 0:
-        return f'✓ mailed `{agent}`: "{subject[:60]}"'
+        # Body carries the message whole; the echo is a label — elide visibly,
+        # never bare-slice (mirrors the `mail` verb; mg-2635 / mg-7e0c).
+        return f'✓ mailed `{agent}`: "{_elide(subject, ACK_SUBJECT_LIMIT)}"'
     return f'✗ mail failed: {(err or out).strip()[:200]}'
 
 

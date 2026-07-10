@@ -175,6 +175,21 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   act on — the same visible-marker principle as the inbound fix, sized for a card
   title where the mg id already points at the full text. (mg-2635)
 
+- **A message the human *sent* echoed back bare-sliced, with no `…` marker.**
+  Daniel reported (2026-07-10) that a long DM he sent came back looking cut off,
+  while the mail he *receives* is correctly marked (mg-2635). The report was a
+  real asymmetry: the payload was never in danger — `mail`/`idea:`/`bug:` DMs and
+  mapped-channel chat all reach the agent's `--body` verbatim, as
+  `test_dm_echo.py`'s `InboundPayloadIsVerbatim` now pins — but four *labels*
+  derived from that text were still trimmed with a bare slice. The `mail` and
+  channel-chat acks echoed `subject[:60]`, and the `idea:`/`bug:` verbs cut the
+  mg item title with `body.splitlines()[0][:60]`. Each clips the tail with no
+  signal, so a person watching their own instruction come back stopped mid-clause
+  reads it as complete — the same dangerous reading mg-7e0c and mg-2635 close,
+  arriving on the one surface still missing the marker. All four now route through
+  `_elide`, so an over-long echo or title ends with a `…`; the full text still
+  reaches the agent, and the label finally admits it is only a label. (mg-3f94)
+
 - **`bridget-supervise` could pin itself to a deleted worktree and respawn into
   a FATAL forever, silently.** `BRIDGET_BIN` was resolved once at startup and
   re-exec'd unchanged on every restart, so a supervisor started against
