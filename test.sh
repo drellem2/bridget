@@ -29,6 +29,9 @@ python3 tests/test_env_defaults.py
 python3 tests/test_channels.py
 python3 tests/test_threading.py
 python3 tests/test_secrets.py
+# Drives the real script under a venv that provably lacks discord.py, so the
+# re-exec into ~/.pogo/venv-bridget is exercised, not just described.
+python3 tests/test_venv_reexec.py
 # Actually executes install.sh against a throwaway $HOME (--no-venv skips the
 # one step that needs the network). Source-greps cannot see a symlink, a 0600,
 # or the --setup awk rewrite.

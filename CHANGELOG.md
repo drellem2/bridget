@@ -74,6 +74,17 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **Every documented way to run bridget crashed on `import discord`.** The
+  shebang is `/usr/bin/env python3`, so the `~/.pogo/bin/bridget` symlink from
+  the quick start, the launchd plist and the systemd unit all ran under the
+  *system* interpreter — which has no `discord.py`. It is in the venv
+  `install.sh` builds, and nothing ever used that venv. bridget now re-execs
+  itself into `BRIDGET_VENV_DIR` (default `~/.pogo/venv-bridget`) when
+  `discord` is not importable, guarded against an exec loop, and still reports
+  config errors under whichever interpreter you started it with. An install
+  that put `discord.py` on the system interpreter (`install.sh --no-venv`)
+  imports it directly and never re-execs.
+
 - **Threading no longer collapses after the first round-trip.** Conversations
   were keyed on `References[0]`, assumed to be the reply-chain root. It is not:
   `mg mail send --in-reply-to X` seeds `References: [X]` — the parent — and it

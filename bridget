@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib.util
 import json
 import os
 import re
@@ -324,6 +325,7 @@ def load_config() -> dict:
         'token': lookup('DISCORD_BOT_TOKEN'),
         'user_id': user_id,
         'server_id': server_id,
+        'venv_dir': lookup('BRIDGET_VENV_DIR'),
         'mg_bin': mg_bin,
         'pogo_bin': pogo_bin,
         'mail_parent': mail_parent,
@@ -501,6 +503,60 @@ CHANNELS, CHANNELS_BY_SNOWFLAKE, OUTBOUND_BY_AGENT = load_channels()
 # parent of the recipient dir is the multi-agent mail root.
 MAIL_ROOT = MAIL_DIR.parent.parent
 
+
+VENV_REEXEC_GUARD = 'BRIDGET_VENV_REEXEC'
+
+
+def venv_python() -> Path:
+    """The interpreter install.sh installs discord.py into."""
+    venv = CONFIG['venv_dir'] or HOME / '.pogo' / 'venv-bridget'
+    return Path(venv) / 'bin' / 'python3'
+
+
+def discord_importable() -> bool:
+    # sys.modules is checked first because the test suite stubs `discord` there;
+    # find_spec ignores sys.modules and would send the tests off to re-exec.
+    if 'discord' in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec('discord') is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def reexec_into_venv_if_needed() -> None:
+    """Hand off to the venv interpreter when discord.py isn't importable here.
+
+    bridget's shebang is `/usr/bin/env python3`, so the symlink install.sh drops
+    at ~/.pogo/bin/bridget — which is what the README quick start, the launchd
+    plist and the systemd unit all invoke — runs under the *system* interpreter.
+    discord.py is not there; it is in the venv install.sh built. Re-exec once
+    into that interpreter rather than making every caller spell out its path.
+
+    An installation that put discord.py on the system interpreter (install.sh
+    --no-venv) imports it directly and never reaches the exec.
+    """
+    if discord_importable():
+        return
+    py = venv_python()
+    if os.environ.get(VENV_REEXEC_GUARD):
+        die(
+            f"re-executed under {py}, but discord.py is still not importable.\n"
+            f"  that venv is missing its dependencies — re-run install.sh."
+        )
+    if not py.exists():
+        die(
+            f"discord.py is not importable, and there is no venv interpreter\n"
+            f"  at {py}.\n"
+            f"  run install.sh to create it, or install discord.py into the\n"
+            f"  interpreter you run bridget with.\n"
+            f"  see {INSTALL_DOCS_URL} for setup instructions."
+        )
+    os.environ[VENV_REEXEC_GUARD] = '1'
+    os.execv(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+reexec_into_venv_if_needed()
 
 import discord  # noqa: E402  (deferred so config errors don't require the venv)
 

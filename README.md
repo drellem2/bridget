@@ -99,6 +99,7 @@ All config lives in `~/.pogo/bridget.env`. See
 | `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Default: `~/.pogo/inbox`. |
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
 | `BRIDGET_REPO_DIR`   | no  | Override for the bridget git checkout. Default: self-detected from the script's location (works for the install.sh-managed symlink). |
+| `BRIDGET_VENV_DIR`   | no  | Virtualenv holding `discord.py`; bridget re-execs into its interpreter when `discord` isn't importable. Default: `~/.pogo/venv-bridget` (what `install.sh` builds). |
 
 ### Behavioural knobs
 
@@ -496,7 +497,10 @@ sync.
 ## Running as a service
 
 For v0.1, bridget is just a long-running Python process — supervise it however
-you'd supervise any other foreground service. A few options:
+you'd supervise any other foreground service. None of these need to know where
+the venv is: bridget's shebang finds the system interpreter, notices `discord`
+is missing there, and re-execs itself into `BRIDGET_VENV_DIR`
+(default `~/.pogo/venv-bridget`). A few options:
 
 - **macOS (launchd):** wrap `~/.pogo/bin/bridget` in a `~/Library/LaunchAgents/`
   plist with `RunAtLoad`, `KeepAlive`, and `StandardOutPath` /
@@ -523,6 +527,10 @@ Common failure modes:
   `bin/` isn't on the PATH that bridget sees (this is common under launchd,
   which runs with a minimal PATH). Set `MG_BIN` (and optionally `POGO_BIN`)
   in `~/.pogo/bridget.env` to absolute paths.
+- **`discord.py is not importable, and there is no venv interpreter`** — you
+  are running an interpreter without `discord.py` and bridget could not find a
+  venv to hand off to. Run `./install.sh` to build `~/.pogo/venv-bridget`, or
+  point `BRIDGET_VENV_DIR` at a venv you manage yourself.
 - **`config file not found: ~/.pogo/bridget.env`** — re-run `./install.sh`
   from the repo, or copy `bridget.env.example` to `~/.pogo/bridget.env`
   manually.
