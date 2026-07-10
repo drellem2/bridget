@@ -114,6 +114,14 @@ DISCORD_THREAD_NAME_LIMIT = 100
 #: What we actually ask the core to trim a title to, leaving headroom under the
 #: hard cap for the ellipsis and for a subject that is all wide characters.
 THREAD_TITLE_LIMIT = 90
+
+#: How far we trim an mg task/idea title before it becomes a label on a Discord
+#: card (transition announcements, idea-claim announcements, the status board's
+#: in-flight list). These are *labels* — the full title lives in the mg item the
+#: card names — so trimming is fine, but it must be *visible*: a bare slice can
+#: clip mid-word ('…I want it to be mo') and read as a whole sentence, so every
+#: trim goes through `_elide` to leave a '…' the reader can act on. See mg-2635.
+TASK_TITLE_LABEL_LIMIT = 80
 STATUS_OUTPUT_BUDGET = 1700
 
 UNRECOGNIZED_REPLY = "Unrecognized. Send `help` for the full command list."
@@ -696,7 +704,7 @@ def format_transition(task: dict, new_status: str):
     fmt = _TRANSITION_FORMATS.get(new_status)
     if fmt is None:
         return None
-    title = (task.get('title') or '?')[:80]
+    title = _elide(task.get('title') or '?', TASK_TITLE_LABEL_LIMIT)
     by = ''
     if new_status == 'claimed':
         assignee = (task.get('assignee') or '').strip()
@@ -1274,7 +1282,7 @@ async def watch_idea_claims(user: discord.User):
                 if not iid:
                     continue
                 fresh.add(iid)
-                titles[iid] = (item.get('title') or '?')[:80]
+                titles[iid] = _elide(item.get('title') or '?', TASK_TITLE_LABEL_LIMIT)
                 assignees[iid] = (item.get('assignee') or '').strip()
 
             new_ids = fresh - claimed
@@ -1574,7 +1582,7 @@ def get_status_summary() -> str:
         for d in in_flight:
             iid = d.get('id', '?')
             status = d.get('status', '?')
-            title = (d.get('title') or '?')[:80]
+            title = _elide(d.get('title') or '?', TASK_TITLE_LABEL_LIMIT)
             assignee = d.get('assignee') or '—'
             parts.append(f"• [{iid}] {status}: {title} (→ {assignee})")
     else:

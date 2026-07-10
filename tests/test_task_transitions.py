@@ -177,5 +177,44 @@ class ReconcileTaskStatesTest(unittest.TestCase):
         self.assertEqual([t['id'] for t in announce], ['mg-dddd'])
 
 
+class FormatTransitionTitleTest(unittest.TestCase):
+    """The card carries a *label*; the full title lives in the mg item. A trim
+    is fine, but a bare slice clips mid-word and reads as a whole sentence — the
+    mg-7615 failure ('…I want it to be mo'). So a trimmed title must show a '…'
+    the reader can act on. See mg-2635."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bridget = load_bridget()
+
+    def test_short_title_is_untouched(self):
+        line = self.bridget.format_transition(
+            {'id': 'mg-1', 'title': 'ship it'}, 'done')
+        self.assertIn('ship it', line)
+        self.assertNotIn('…', line)
+
+    def test_long_title_is_visibly_elided_not_bare_sliced(self):
+        limit = self.bridget.TASK_TITLE_LABEL_LIMIT
+        long = 'x' * (limit + 40)
+        line = self.bridget.format_transition(
+            {'id': 'mg-2', 'title': long}, 'claimed')
+        # A reader must be able to tell the title was cut.
+        self.assertIn('…', line)
+        # The label stays within the cap it always had (no length regression).
+        self.assertNotIn('x' * (limit + 1), line)
+
+    def test_title_exactly_at_the_cap_is_not_marked(self):
+        limit = self.bridget.TASK_TITLE_LABEL_LIMIT
+        exact = 'y' * limit
+        line = self.bridget.format_transition(
+            {'id': 'mg-3', 'title': exact}, 'done')
+        self.assertIn(exact, line)
+        self.assertNotIn('…', line)
+
+    def test_missing_title_falls_back_without_error(self):
+        line = self.bridget.format_transition({'id': 'mg-4'}, 'shelved')
+        self.assertIn('mg-4', line)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -139,6 +139,21 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   `subject⏎body` split, because there the human really is composing mail, and it
   now routes through `build_send_args` instead of hand-rolling its own argv.
 
+- **Outbound task-title labels were bare-sliced with no truncation marker.** The
+  inbound fix above stopped the *dangerous* case (a payload silently clipped in
+  a mail header). Its point-3 audit noted the outbound path — an mg task/idea
+  title rendered onto a Discord card — is safer, because the full title always
+  survives in the mg item the card names. But three of those renders trimmed the
+  title with a bare `(title or '?')[:80]`: transition announcements
+  (`format_transition`), idea-claim announcements, and the status board's
+  in-flight list. A label may be trimmed, but the trim must be *visible* — a bare
+  slice clips mid-word and reads as a whole sentence, exactly the mg-7615 card
+  whose title stopped at *"…I want it to be mo"*. If that card is the only place
+  the task is seen, a reader acts on a sentence that ends at "mo". All three now
+  route through `_elide`, so an over-long title ends with a `…` the reader can
+  act on — the same visible-marker principle as the inbound fix, sized for a card
+  title where the mg id already points at the full text. (mg-2635)
+
 - **`bridget-supervise` could pin itself to a deleted worktree and respawn into
   a FATAL forever, silently.** `BRIDGET_BIN` was resolved once at startup and
   re-exec'd unchanged on every restart, so a supervisor started against
