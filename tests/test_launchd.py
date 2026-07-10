@@ -40,12 +40,41 @@ SUPERVISE = REPO / 'bridget-supervise'
 PLIST_EXAMPLE = REPO / 'com.pogo.bridget.plist.example'
 
 
-def fake_bridget(tmp: Path, body: str) -> Path:
+def fake_bridget(tmp: Path, body: str, name: str = 'fake-bridget') -> Path:
     """A stand-in for the bridget script, so no Discord token is ever needed."""
-    p = tmp / 'fake-bridget'
+    p = tmp / name
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('#!/bin/bash\n' + textwrap.dedent(body))
     p.chmod(0o755)
     return p
+
+
+def alert_sink(tmp: Path) -> Path:
+    """Stand in for `mg mail send mayor`, recording subject+body to a file.
+
+    Every test in this module sets BRIDGET_ALERT_CMD to one of these. The
+    supervisor's default notifier really does shell out to `mg`, and a suite
+    that mails the mayor on each run is a suite nobody runs twice.
+    """
+    sink = tmp / 'alerts'
+    cmd = tmp / 'alert-cmd'
+    cmd.write_text('#!/bin/bash\nprintf "%s\\n%s\\n---\\n" "$1" "$2" >> ' + str(sink) + '\n')
+    cmd.chmod(0o755)
+    return cmd
+
+
+def supervise_env(tmp: Path, **overrides) -> dict:
+    """Base env: alerts captured, never mailed; alert stamp inside the tmpdir.
+
+    Every inherited BRIDGET_* is dropped first. A developer with BRIDGET_BIN
+    exported — the very habit that caused mg-1679 — would otherwise silently
+    steer the tests that exist to catch it.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith('BRIDGET_')}
+    env['BRIDGET_ALERT_CMD'] = str(alert_sink(tmp))
+    env['BRIDGET_ALERT_STAMP'] = str(tmp / 'alert.stamp')
+    env.update(overrides)
+    return env
 
 
 class SuperviseRestartTest(unittest.TestCase):
@@ -60,9 +89,9 @@ class SuperviseRestartTest(unittest.TestCase):
             """)
             r = subprocess.run(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(child),
-                     'BRIDGET_MIN_BACKOFF': '0', 'BRIDGET_MAX_SPAWNS': '3',
-                     'BRIDGET_HEALTHY_RUNTIME': '9999'},
+                env=supervise_env(tmp, BRIDGET_BIN=str(child),
+                                  BRIDGET_MIN_BACKOFF='0', BRIDGET_MAX_SPAWNS='3',
+                                  BRIDGET_HEALTHY_RUNTIME='9999'),
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(marks.read_text().count('run'), 3,
                              'wrapper must restart the child, not exit with it')
@@ -76,21 +105,279 @@ class SuperviseRestartTest(unittest.TestCase):
             child = fake_bridget(tmp, 'exit 1\n')
             r = subprocess.run(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(child),
-                     'BRIDGET_MIN_BACKOFF': '0', 'BRIDGET_MAX_SPAWNS': '3',
-                     'BRIDGET_HEALTHY_RUNTIME': '9999'},
+                env=supervise_env(tmp, BRIDGET_BIN=str(child),
+                                  BRIDGET_MIN_BACKOFF='0', BRIDGET_MAX_SPAWNS='3',
+                                  BRIDGET_HEALTHY_RUNTIME='9999'),
                 capture_output=True, text=True, timeout=30)
             self.assertIn('(too fast)', r.stdout)
             self.assertNotIn('(healthy run)', r.stdout)
 
     def test_missing_bridget_is_fatal_not_a_hot_loop(self):
+        """A path the operator named that does not exist is not silently swapped.
+
+        Nothing is running yet, so there is no service to preserve by falling
+        back to $HOME/.pogo/bin/bridget — and papering over a bad BRIDGET_BIN
+        would leave someone debugging a bridget they did not start.
+        """
         with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            durable = fake_bridget(tmp, 'exit 5\n', name='.pogo/bin/bridget')
             r = subprocess.run(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(Path(td) / 'nope')},
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(tmp / 'nope')),
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(r.returncode, 1)
             self.assertIn('FATAL', r.stdout)
+            self.assertTrue(durable.exists(), 'fixture sanity: a fallback existed')
+            self.assertNotIn('fell back', r.stdout,
+                             'a missing target at startup must not silently '
+                             'substitute the durable default')
+
+
+class SuperviseEphemeralTargetTest(unittest.TestCase):
+    """BRIDGET_BIN must never be pinned to a path that outlives nothing.
+
+    A supervisor started against `~/.pogo/polecats/<id>/bridget` kept that path
+    after the worktree was reaped, and launchd (KeepAlive, ThrottleInterval=10)
+    respawned it into `FATAL: no bridget at …` every ten seconds for eighteen
+    minutes on 2026-07-10. `launchctl list` showed a pid throughout and
+    `pogo doctor --check` stayed green, so nothing raised a hand: a human found
+    it. These tests pin all three defenses and, just as importantly, the noise
+    (mg-1679).
+    """
+
+    def polecat_bin(self, tmp: Path, marker: Path, rc: int = 5) -> Path:
+        return fake_bridget(tmp, f'echo ephemeral >> {marker}\nexit {rc}\n',
+                            name='.pogo/polecats/0655/bridget')
+
+    def durable_bin(self, tmp: Path, marker: Path, rc: int = 5) -> Path:
+        return fake_bridget(tmp, f'echo durable >> {marker}\nexit {rc}\n',
+                            name='.pogo/bin/bridget')
+
+    def alerts(self, tmp: Path) -> str:
+        sink = tmp / 'alerts'
+        return sink.read_text() if sink.exists() else ''
+
+    def test_refuses_to_supervise_a_path_inside_a_polecat_worktree(self):
+        """Even a working binary. Ephemeral is invalid by construction."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            child = self.polecat_bin(tmp, marker)
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(child)),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse(marker.exists(),
+                             'the supervisor executed an ephemeral target')
+            self.assertIn('polecats', r.stdout)
+            self.assertIn('mg-1679', self.alerts(tmp))
+
+    def test_refuses_when_the_durable_symlink_resolves_into_a_worktree(self):
+        """The botched install: BRIDGET_BIN is unset and the default is a lie.
+
+        `~/.pogo/bin/bridget` is a symlink install.sh drops into the checkout.
+        Run install.sh from a polecat worktree and it points there instead. The
+        literal path looks durable; only the resolved one tells the truth.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            real = self.polecat_bin(tmp, marker)
+            link = tmp / '.pogo' / 'bin' / 'bridget'
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(real)
+
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp)),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse(marker.exists(),
+                             'a symlink into a worktree defeated the guard')
+            self.assertIn('polecats', r.stdout)
+
+    def test_an_ephemeral_target_falls_back_to_the_durable_default(self):
+        """Refusing the path and dying are separable. Only refuse the path."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            child = self.polecat_bin(tmp, marker)
+            self.durable_bin(tmp, marker)
+
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(child),
+                                  BRIDGET_MAX_SPAWNS='1'),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 5, 'the durable bridget ran')
+            self.assertEqual(marker.read_text().split(), ['durable'])
+            self.assertIn('fell back', self.alerts(tmp))
+
+    def test_the_override_supervises_the_worktree_path_deliberately(self):
+        """A polecat smoke-testing its own build opts in, explicitly."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            child = self.polecat_bin(tmp, marker)
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(child),
+                                  BRIDGET_ALLOW_EPHEMERAL_BIN='1',
+                                  BRIDGET_MAX_SPAWNS='1'),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 5)
+            self.assertEqual(marker.read_text().split(), ['ephemeral'])
+            self.assertEqual(self.alerts(tmp), '', 'an opt-in must not page anyone')
+
+    def test_a_target_deleted_mid_life_falls_back_instead_of_dying(self):
+        """The startup guard cannot see this: the path was fine when we checked.
+
+        This is why the target is re-resolved before every spawn rather than
+        pinned once — a worktree is reaped while its bridget is supervised.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            pinned = fake_bridget(
+                tmp, f'echo pinned >> {marker}\nrm -f "$0"\nexit 1\n',
+                name='live/bridget')
+            self.durable_bin(tmp, marker)
+
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(pinned),
+                                  BRIDGET_MIN_BACKOFF='0', BRIDGET_MAX_SPAWNS='2',
+                                  BRIDGET_HEALTHY_RUNTIME='9999'),
+                capture_output=True, text=True, timeout=30)
+            self.assertFalse(pinned.exists(), 'fixture sanity: the target vanished')
+            self.assertEqual(r.returncode, 5, 'the durable bridget ran')
+            self.assertEqual(marker.read_text().split(), ['pinned', 'durable'])
+            self.assertIn('fell back', self.alerts(tmp))
+
+    def test_a_target_that_turns_ephemeral_mid_life_falls_back(self):
+        """Durable at 14:40, a symlink into a worktree at 14:48."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / 'ran'
+            worktree = self.polecat_bin(tmp, marker)
+            # $0 is the symlink, so the child repoints the name it was invoked
+            # by and never unlinks the file bash is reading it from.
+            stage = fake_bridget(
+                tmp,
+                f'echo pinned >> {marker}\nrm -f "$0"\nln -s {worktree} "$0"\nexit 1\n',
+                name='stage/bridget')
+            pinned = tmp / 'live' / 'bridget'
+            pinned.parent.mkdir(parents=True, exist_ok=True)
+            pinned.symlink_to(stage)
+            self.durable_bin(tmp, marker)
+
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp), BRIDGET_BIN=str(pinned),
+                                  BRIDGET_MIN_BACKOFF='0', BRIDGET_MAX_SPAWNS='2',
+                                  BRIDGET_HEALTHY_RUNTIME='9999'),
+                capture_output=True, text=True, timeout=30)
+            self.assertTrue(pinned.is_symlink(), 'fixture sanity: it repointed')
+            self.assertEqual(r.returncode, 5)
+            self.assertEqual(marker.read_text().split(), ['pinned', 'durable'],
+                             'the supervisor followed a symlink into a worktree')
+            self.assertIn('fell back', self.alerts(tmp))
+
+
+class SuperviseAlertTest(unittest.TestCase):
+    """A supervisor that cannot exec its target must not fail quietly.
+
+    The 2026-07-10 outage was not caused by the pinned path. It was caused by
+    the pinned path failing in a `launchctl`-green, `pogo doctor`-green, 10s
+    respawn loop that emitted nothing anyone read (mg-1679).
+    """
+
+    def vanishing_bin(self, tmp: Path) -> Path:
+        return fake_bridget(tmp, 'rm -f "$0"\nexit 1\n', name='live/bridget')
+
+    def run_until_fatal(self, tmp: Path, **overrides):
+        return subprocess.run(
+            ['bash', str(SUPERVISE)],
+            env=supervise_env(tmp, HOME=str(tmp),
+                              BRIDGET_BIN=str(self.vanishing_bin(tmp)),
+                              BRIDGET_MIN_BACKOFF='0',
+                              BRIDGET_HEALTHY_RUNTIME='9999', **overrides),
+            capture_output=True, text=True, timeout=30)
+
+    def test_an_unrunnable_target_with_no_fallback_is_loud_on_both_streams(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            r = self.run_until_fatal(tmp)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('FATAL', r.stdout)
+            self.assertIn('FATAL', r.stderr,
+                          'launchd routes stderr to bridget.err.log, which is '
+                          'where a human tails a dying daemon')
+            self.assertIn('cannot run bridget', (tmp / 'alerts').read_text(),
+                          'the mayor was never told')
+
+    def test_the_alert_is_rate_limited_across_respawns(self):
+        """launchd respawns us every 10s. 360 mails an hour is its own silence.
+
+        The stamp has to be on disk: each respawn is a fresh process, so an
+        in-memory counter would rate-limit exactly nothing.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            first = self.run_until_fatal(tmp)
+            second = self.run_until_fatal(tmp)   # same stamp: the next respawn
+
+            self.assertEqual([first.returncode, second.returncode], [1, 1])
+            self.assertEqual((tmp / 'alerts').read_text().count('---'), 1,
+                             'the second respawn re-mailed inside the cooldown')
+            self.assertIn('throttled', second.stdout)
+            self.assertIn('FATAL', second.stdout,
+                          'throttling the mail must never throttle the log')
+
+    def test_the_cooldown_expires(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            self.run_until_fatal(tmp, BRIDGET_ALERT_COOLDOWN='0')
+            self.run_until_fatal(tmp, BRIDGET_ALERT_COOLDOWN='0')
+            self.assertEqual((tmp / 'alerts').read_text().count('---'), 2)
+
+    def test_a_broken_notifier_does_not_stop_the_supervisor_from_exiting(self):
+        """Alerting is best-effort. `mg` may not even be on launchd's PATH."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp),
+                                  BRIDGET_BIN=str(tmp / 'nope'),
+                                  BRIDGET_ALERT_CMD=str(tmp / 'no-such-notifier')),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('FATAL', r.stdout)
+
+    def test_a_hung_notifier_cannot_hold_the_supervisor_open(self):
+        """`mg` is allowed to be slow. Dying is not allowed to wait for it.
+
+        Output goes to /dev/null rather than a pipe: an orphaned notifier would
+        otherwise hold the pipe open and this test would measure the notifier's
+        lifetime instead of the supervisor's.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            hung = fake_bridget(tmp, 'sleep 60\n', name='hung-notifier')
+            began = time.time()
+            r = subprocess.run(
+                ['bash', str(SUPERVISE)],
+                env=supervise_env(tmp, HOME=str(tmp),
+                                  BRIDGET_BIN=str(tmp / 'nope'),
+                                  BRIDGET_ALERT_CMD=str(hung),
+                                  BRIDGET_ALERT_TIMEOUT='2'),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+            elapsed = time.time() - began
+            self.assertEqual(r.returncode, 1)
+            self.assertLess(elapsed, 30,
+                            'the supervisor waited out a wedged notifier')
 
 
 class SuperviseSignalTest(unittest.TestCase):
@@ -106,7 +393,7 @@ class SuperviseSignalTest(unittest.TestCase):
             """)
             proc = subprocess.Popen(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(child)},
+                env=supervise_env(tmp, BRIDGET_BIN=str(child)),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.time() + 15
@@ -147,9 +434,9 @@ class SuperviseSignalTest(unittest.TestCase):
             """)
             proc = subprocess.Popen(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(child),
-                     'BRIDGET_MIN_BACKOFF': str(backoff),
-                     'BRIDGET_HEALTHY_RUNTIME': '9999'},
+                env=supervise_env(tmp, BRIDGET_BIN=str(child),
+                                  BRIDGET_MIN_BACKOFF=str(backoff),
+                                  BRIDGET_HEALTHY_RUNTIME='9999'),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.time() + 15
@@ -188,8 +475,8 @@ class SuperviseSignalTest(unittest.TestCase):
             """)
             proc = subprocess.Popen(
                 ['bash', str(SUPERVISE)],
-                env={**os.environ, 'BRIDGET_BIN': str(child),
-                     'BRIDGET_MIN_BACKOFF': '0'},
+                env=supervise_env(tmp, BRIDGET_BIN=str(child),
+                                  BRIDGET_MIN_BACKOFF='0'),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.time() + 15

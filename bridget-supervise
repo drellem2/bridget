@@ -48,10 +48,59 @@
 # Signals: SIGTERM/SIGINT are forwarded to bridget and then honored. We do not
 # trap-and-ignore them — `launchctl bootout` and `kickstart -k` must work, and a
 # daemon that refuses to die is worse than one that needs a kick.
+#
+# The target: a long-lived supervisor may only ever supervise a *durable* path.
+# BRIDGET_BIN used to be resolved once at startup and exec'd unchanged forever,
+# so a supervisor that inherited a path into a polecat worktree kept that path
+# after the worktree was deleted. On 2026-07-10, 14:40Z-14:58Z, that is exactly
+# what happened: `FATAL: no bridget at ~/.pogo/polecats/0655/bridget`, exit 1,
+# KeepAlive respawn, same FATAL, every ThrottleInterval=10 seconds, for 18
+# minutes. Nothing noticed. `launchctl list` reported a pid the whole time and
+# `pogo doctor --check` stayed green, because both of them ask whether a process
+# exists, not whether it works. A human re-pointed the path by hand (mg-1679).
+#
+# Three defenses. They do different jobs; none of them subsumes another:
+#
+#   1. Never exec a target under ~/.pogo/polecats/ (symlinks resolved). An
+#      ephemeral path is invalid by construction as a long-lived supervisor's
+#      target, whoever asked for it. This is the guard that makes the class
+#      impossible to enter. What it cannot do is keep us out of the class: it
+#      is one check, and a path that is durable at 14:40 is deleted at 14:48.
+#   2. Re-check the target before *every* spawn, not once at startup. This is
+#      what catches the target vanishing under a running supervisor, or the
+#      ~/.pogo/bin/bridget symlink being repointed into a worktree. It is (1)'s
+#      blind spot exactly.
+#   3. When (1) or (2) rejects the target, fall back to $DEFAULT_BIN and keep
+#      supervising. (2) without (3) merely notices the outage. (3) without (2)
+#      never gets the chance.
+#
+# Refusing an ephemeral path and dying are separable, and we do the first
+# without the second: with a durable default sitting right there, exiting 1
+# would leave bridget down for no benefit anyone can name. The one exception is
+# a target that is merely *missing* at startup — nothing is running yet, so
+# there is no service to preserve, and a path the operator named that does not
+# exist is a mistake to surface, not to paper over.
+#
+# And whichever of the three fires: SAY SO. A supervisor that will not exec its
+# configured target mails the mayor (rate-limited, so a 10s respawn loop is not
+# a mail flood) and logs to stderr as well as stdout. The 18-minute outage was
+# not caused by the pinned path. It was caused by the pinned path failing where
+# nothing was looking.
 
 set -uo pipefail   # deliberately not -e: bridget's nonzero exit is data, not fatal.
 
-BRIDGET_BIN="${BRIDGET_BIN:-$HOME/.pogo/bin/bridget}"
+# The durable install target: a symlink install.sh drops into the checkout. This
+# is the only path a supervisor is entitled to assume outlives it.
+DEFAULT_BIN="$HOME/.pogo/bin/bridget"
+BRIDGET_BIN="${BRIDGET_BIN:-$DEFAULT_BIN}"
+
+# Where pogo puts its ephemeral polecat worktrees. Anything under here is
+# deleted without warning when the polecat that owns it is reaped.
+EPHEMERAL_ROOT="$HOME/.pogo/polecats"
+# Escape hatch for a polecat smoke-testing its own build: `BRIDGET_ALLOW_
+# EPHEMERAL_BIN=1 ./bridget-supervise`. Opt-in and explicit, which is the whole
+# point — the outage came from an *inherited* BRIDGET_BIN that nobody chose.
+ALLOW_EPHEMERAL="${BRIDGET_ALLOW_EPHEMERAL_BIN:-0}"
 
 # Restart backoff. A bridget that dies instantly (bad token, missing env file)
 # must not become a fork bomb; a bridget that dies after a week of uptime must
@@ -64,11 +113,131 @@ HEALTHY_RUNTIME="${BRIDGET_HEALTHY_RUNTIME:-60}"
 # Test hook: stop after N spawns instead of looping forever. 0 = never stop.
 MAX_SPAWNS="${BRIDGET_MAX_SPAWNS:-0}"
 
+# Alerting. `mg mail send` unless overridden; BRIDGET_ALERT_CMD names a program
+# invoked as `cmd <subject> <body>` (a program, not a shell string — nothing
+# here word-splits a command).
+ALERT_TO="${BRIDGET_ALERT_TO:-mayor}"
+ALERT_CMD="${BRIDGET_ALERT_CMD:-}"
+# launchd respawns us every ThrottleInterval=10s. Alerting on every one of those
+# would mail the mayor 360 times an hour, which is its own kind of silence. The
+# stamp is on disk because each respawn is a fresh process with no memory of the
+# last: an in-process counter would rate-limit nothing.
+ALERT_COOLDOWN="${BRIDGET_ALERT_COOLDOWN:-900}"
+ALERT_STAMP="${BRIDGET_ALERT_STAMP:-$HOME/.pogo/bridget-supervise.alert}"
+# A hung notifier must never keep us from exiting.
+ALERT_TIMEOUT="${BRIDGET_ALERT_TIMEOUT:-10}"
+
 log() { printf '[supervise %s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 child=""
 sleep_pid=""
+notify_pid=""
 terminating=0
+
+# Chase symlinks to a physical path. Not `realpath`/`readlink -f`: neither is
+# portable to the bash 3.2 + BSD userland this runs on by default.
+resolve_path() {
+    local p="$1" target dir hops=0
+    while [[ -L "$p" ]]; do
+        if (( ++hops > 40 )); then   # a symlink cycle; report what we have
+            printf '%s\n' "$p"
+            return 0
+        fi
+        target="$(readlink "$p")"
+        [[ "$target" == /* ]] || target="$(dirname "$p")/$target"
+        p="$target"
+    done
+    # The leaf need not exist; its directory usually does, and a symlinked
+    # directory component is just as capable of pointing into a worktree.
+    if dir="$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)"; then
+        printf '%s/%s\n' "${dir%/}" "$(basename -- "$p")"
+    else
+        printf '%s\n' "$p"
+    fi
+}
+
+# The root resolved too, or the comparison is decided by whether two paths
+# happened to be spelled with the same symlinks: on macOS `/var/…/polecats/x`
+# and `/private/var/…/polecats/x` are the same file and neither is a prefix of
+# the other. Falls back to the literal when the root does not exist yet.
+EPHEMERAL_ROOT_REAL="$(resolve_path "$EPHEMERAL_ROOT")"
+[[ -n "$EPHEMERAL_ROOT_REAL" ]] || EPHEMERAL_ROOT_REAL="$EPHEMERAL_ROOT"
+
+# Both the literal path and its resolved form: `~/.pogo/polecats/x/bridget` is
+# ephemeral even once deleted and no longer resolvable, and `~/.pogo/bin/bridget`
+# is ephemeral when the symlink install.sh dropped lands in a worktree.
+is_ephemeral() {
+    case "$1" in "$EPHEMERAL_ROOT"/*) return 0 ;; esac
+    case "$(resolve_path "$1")" in
+        "$EPHEMERAL_ROOT"/* | "$EPHEMERAL_ROOT_REAL"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# True when the target is ephemeral and the operator has not said otherwise.
+ephemeral_veto() {
+    [[ "$ALLOW_EPHEMERAL" == 1 ]] && return 1
+    is_ephemeral "$1"
+}
+
+runnable() { [[ -x "$1" || -f "$1" ]]; }
+
+# One alert per ALERT_COOLDOWN seconds across every respawn of this script.
+alert_due() {
+    local now last
+    now="$(date +%s)"
+    if [[ -r "$ALERT_STAMP" ]]; then
+        last="$(cat "$ALERT_STAMP" 2>/dev/null)"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        (( now - last < ALERT_COOLDOWN )) && return 1
+    fi
+    mkdir -p "$(dirname "$ALERT_STAMP")" 2>/dev/null || true
+    printf '%s\n' "$now" >"$ALERT_STAMP" 2>/dev/null || true
+    return 0
+}
+
+notify() {
+    local subject="$1" body="$2"
+    if [[ -n "$ALERT_CMD" ]]; then
+        "$ALERT_CMD" "$subject" "$body" || log "alert command $ALERT_CMD failed"
+        return 0
+    fi
+    if ! command -v mg >/dev/null 2>&1; then
+        log "mg is not on PATH; this alert exists only in the log"
+        return 0
+    fi
+    mg mail send "$ALERT_TO" --from=bridget-supervise \
+        --subject="$subject" --body="$body" >/dev/null 2>&1 \
+        || log "mg mail send to $ALERT_TO failed; this alert exists only in the log"
+}
+
+# Loud on both streams: launchd routes them to bridget.log and bridget.err.log,
+# and a human tailing the failure of a daemon tails the error log.
+alert() {
+    local subject="$1" body="$2"
+    log "ALERT: $subject — $body"
+    log "ALERT: $subject — $body" >&2
+    if ! alert_due; then
+        log "alert to $ALERT_TO throttled (last one <${ALERT_COOLDOWN}s ago)"
+        return 0
+    fi
+    # Backgrounded so a wedged notifier cannot stall bridget's restart. The
+    # FATAL paths drain it before exiting; the recovery path lets it finish
+    # while bridget comes back up.
+    notify "$subject" "$body" &
+    notify_pid=$!
+}
+
+drain_alert() {
+    [[ -n "$notify_pid" ]] || return 0
+    local waited=0
+    while kill -0 "$notify_pid" 2>/dev/null && (( waited < ALERT_TIMEOUT )); do
+        sleep 1 || true   # bounded; see the `|| true` rationale at the backoff
+        waited=$((waited + 1))
+    done
+    kill -TERM "$notify_pid" 2>/dev/null || true
+    notify_pid=""
+}
 
 on_signal() {
     local sig="$1"
@@ -83,6 +252,9 @@ on_signal() {
     if [[ -n "$sleep_pid" ]] && kill -0 "$sleep_pid" 2>/dev/null; then
         kill -TERM "$sleep_pid" 2>/dev/null || true
     fi
+    if [[ -n "$notify_pid" ]] && kill -0 "$notify_pid" 2>/dev/null; then
+        kill -TERM "$notify_pid" 2>/dev/null || true
+    fi
     # 128 + signal number, the convention bridget's exit 143 (128+15) follows.
     case "$sig" in
         TERM) exit 143 ;;
@@ -93,10 +265,58 @@ on_signal() {
 trap 'on_signal TERM' TERM
 trap 'on_signal INT'  INT
 
-[[ -x "$BRIDGET_BIN" || -f "$BRIDGET_BIN" ]] || {
-    log "FATAL: no bridget at $BRIDGET_BIN — run install.sh"
+die_loudly() {
+    alert "bridget-supervise cannot run bridget" "$1"
+    drain_alert
     exit 1
 }
+
+# Defenses 1-3. Called once before the loop and again before every spawn, which
+# is the whole of defense 2. Returns with BRIDGET_BIN naming something runnable
+# and durable, or does not return at all.
+#
+# `phase` is `startup` or `respawn`, and it decides one thing: whether a target
+# that is merely missing may fall back. See the header.
+resolve_target() {
+    local phase="$1" why="" real=""
+
+    if ephemeral_veto "$BRIDGET_BIN"; then
+        # Name the resolved path only when it differs, or a plain path prints as
+        # "X resolves to X" and reads like a bug in the thing reporting the bug.
+        real="$(resolve_path "$BRIDGET_BIN")"
+        if [[ "$real" == "$BRIDGET_BIN" ]]; then
+            real=""
+        else
+            real=" (a symlink to $real)"
+        fi
+        why="$BRIDGET_BIN$real is under the ephemeral worktree root
+$EPHEMERAL_ROOT. That path is deleted when the polecat owning it is reaped, so
+it is never a valid target for a supervisor meant to outlive it (mg-1679). To
+supervise it anyway: BRIDGET_ALLOW_EPHEMERAL_BIN=1."
+    elif ! runnable "$BRIDGET_BIN"; then
+        [[ "$phase" == startup ]] && die_loudly \
+            "FATAL: no bridget at $BRIDGET_BIN — run install.sh"
+        why="$BRIDGET_BIN disappeared while it was being supervised."
+    else
+        return 0
+    fi
+
+    if [[ "$BRIDGET_BIN" != "$DEFAULT_BIN" ]] \
+        && runnable "$DEFAULT_BIN" && ! ephemeral_veto "$DEFAULT_BIN"; then
+        alert "bridget-supervise fell back to $DEFAULT_BIN" "$why
+Falling back to the durable default $DEFAULT_BIN and continuing to supervise.
+bridget is up; whatever set BRIDGET_BIN to a path that could not outlive this
+supervisor still wants fixing."
+        BRIDGET_BIN="$DEFAULT_BIN"
+        return 0
+    fi
+
+    die_loudly "FATAL: $why
+$DEFAULT_BIN is not a usable fallback, so bridget is down and this supervisor
+cannot bring it back. Run install.sh."
+}
+
+resolve_target startup
 
 backoff="$MIN_BACKOFF"
 spawns=0
@@ -104,6 +324,8 @@ spawns=0
 log "supervising $BRIDGET_BIN (pid $$)"
 
 while true; do
+    resolve_target respawn
+
     started="$SECONDS"
     spawns=$((spawns + 1))
     log "starting bridget (spawn #$spawns)"

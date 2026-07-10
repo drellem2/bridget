@@ -96,6 +96,29 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **`bridget-supervise` could pin itself to a deleted worktree and respawn into
+  a FATAL forever, silently.** `BRIDGET_BIN` was resolved once at startup and
+  re-exec'd unchanged on every restart, so a supervisor started against
+  `~/.pogo/polecats/<id>/bridget` kept that path after the worktree was reaped:
+  launchd (`KeepAlive`, `ThrottleInterval=10`) then respawned it into
+  `FATAL: no bridget at …` every ten seconds until a human re-pointed the path
+  by hand — eighteen minutes, on 2026-07-10. It emitted no alert, and neither
+  `launchctl list` nor `pogo doctor --check` could see it, because both ask
+  whether a process exists and a respawn loop always has one. Three changes,
+  because none of them subsumes the others: the supervisor refuses to exec any
+  target resolving under `~/.pogo/polecats/` (`BRIDGET_ALLOW_EPHEMERAL_BIN=1`
+  overrides, for smoke-testing a build in place); it re-checks the target before
+  *every* spawn rather than pinning it, which is what catches a path that goes
+  away — or a `~/.pogo/bin/bridget` symlink that gets repointed into a worktree
+  — after startup; and when it rejects the target it falls back to the durable
+  `~/.pogo/bin/bridget` and keeps supervising instead of dying. A `BRIDGET_BIN`
+  merely *missing at startup* still refuses to start, since nothing is running
+  yet and substituting a different binary for the one the operator named would
+  be its own bug. Above all it is now loud: any target it will not exec is
+  logged to stderr as well as stdout and mailed to `mayor`, rate-limited to one
+  per `BRIDGET_ALERT_COOLDOWN` (900s) through an on-disk stamp, since every
+  respawn is a fresh process and 360 mails an hour would be its own silence.
+
 - **`bridget-supervise` ignored SIGTERM for the whole of its restart backoff.**
   bash runs a trap only once the current *foreground* command returns, so the
   backoff's `sleep "$backoff"` deferred the `on_signal` handler for up to

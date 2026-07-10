@@ -561,6 +561,49 @@ the cure is:
 launchctl kickstart gui/$(id -u)/com.pogo.bridget
 ```
 
+### What the supervisor will and will not supervise
+
+`bridget-supervise` runs `$BRIDGET_BIN`, default `~/.pogo/bin/bridget` — the
+symlink `install.sh` drops into your checkout. That default is *durable*: it
+outlives the supervisor. Not every path is.
+
+On 2026-07-10 a supervisor was started with `BRIDGET_BIN` pointing inside a
+throwaway `~/.pogo/polecats/<id>/` worktree. The worktree was reaped eight
+minutes later, and because the path was resolved once at startup and re-exec'd
+unchanged, launchd (`KeepAlive`, `ThrottleInterval=10`) respawned the supervisor
+into `FATAL: no bridget at …` every ten seconds for eighteen minutes. Nothing
+raised a hand: `launchctl list` showed a pid the whole time, because a pid is
+what a respawn loop has a lot of. A human noticed and re-pointed the path.
+
+So the supervisor now:
+
+- **refuses to exec anything under `~/.pogo/polecats/`** (symlinks resolved, so
+  a `~/.pogo/bin/bridget` symlink into a worktree is caught too);
+- **re-checks the target before every spawn**, not once at startup, which is
+  what catches a path that was durable when it started and is not any more;
+- **falls back to `~/.pogo/bin/bridget`** and keeps supervising, rather than
+  dying, whenever it rejects the target and that default is usable. The one
+  exception is a `BRIDGET_BIN` that is merely *missing at startup*: nothing is
+  running yet, so there is nothing to preserve, and quietly substituting a
+  different binary for the one you named is worse than refusing;
+- **says so**, every time, on stdout and stderr and by mailing `mg` agent
+  `mayor`. A supervisor that cannot exec its target and mentions this to no one
+  is the actual defect; the pinned path was only the trigger.
+
+The mail is rate-limited to one per `BRIDGET_ALERT_COOLDOWN` seconds (default
+900) via a stamp at `~/.pogo/bridget-supervise.alert`. It has to be on disk:
+every launchd respawn is a fresh process, so nothing held in memory could
+rate-limit anything, and 360 identical mails an hour is its own kind of silence.
+
+| Variable | Default | |
+|---|---|---|
+| `BRIDGET_BIN` | `~/.pogo/bin/bridget` | what to supervise |
+| `BRIDGET_ALLOW_EPHEMERAL_BIN` | `0` | set to `1` to supervise a worktree path anyway — for smoke-testing a build in place, and deliberately not the default, because the outage came from a `BRIDGET_BIN` nobody chose to set |
+| `BRIDGET_ALERT_TO` | `mayor` | `mg` recipient for the alert |
+| `BRIDGET_ALERT_CMD` | (unset) | a program run as `cmd <subject> <body>` instead of `mg mail send` |
+| `BRIDGET_ALERT_COOLDOWN` | `900` | seconds between alerts |
+| `BRIDGET_ALERT_STAMP` | `~/.pogo/bridget-supervise.alert` | where that cooldown is remembered |
+
 ### Is it actually alive?
 
 Do not infer liveness from the last line in `~/.pogo/bridget.log` — a quiet
