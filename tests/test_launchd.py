@@ -126,6 +126,56 @@ class SuperviseSignalTest(unittest.TestCase):
             self.assertTrue(got.exists(), 'SIGTERM was not forwarded to bridget')
             self.assertIn('TERM', got.read_text())
 
+    def test_sigterm_during_the_backoff_sleep_is_honored_promptly(self):
+        """Stopping the wrapper must not have to wait out the backoff.
+
+        The other signal tests here signal the wrapper while bridget is up, so
+        it is parked in `wait "$child"` — and `wait` is interruptible. The
+        backoff is the other half of its life, and bash runs a trap only once
+        the current *foreground* command returns: a plain `sleep "$backoff"`
+        left SIGTERM unhandled for the rest of the backoff (2m44s, observed).
+        launchd escalates an unanswered SIGTERM to SIGKILL, so that window ends
+        with a dead supervisor and an orphaned bridget.
+        """
+        backoff = 30
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ran = tmp / 'ran'
+            child = fake_bridget(tmp, f"""
+                echo run >> {ran}
+                exit 1
+            """)
+            proc = subprocess.Popen(
+                ['bash', str(SUPERVISE)],
+                env={**os.environ, 'BRIDGET_BIN': str(child),
+                     'BRIDGET_MIN_BACKOFF': str(backoff),
+                     'BRIDGET_HEALTHY_RUNTIME': '9999'},
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                deadline = time.time() + 15
+                while not ran.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(ran.exists(), 'child never started')
+                time.sleep(1)  # let the wrapper reach its backoff sleep
+
+                sent = time.time()
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    out, _ = proc.communicate(timeout=backoff // 2)
+                except subprocess.TimeoutExpired:
+                    self.fail('SIGTERM ignored during backoff — the wrapper is '
+                              'sleeping in the foreground, so bash defers the trap')
+                elapsed = time.time() - sent
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+
+            self.assertLess(elapsed, backoff / 2,
+                            'wrapper waited out its backoff before honoring SIGTERM')
+            self.assertEqual(proc.returncode, 143, 'wrapper must exit 128+SIGTERM')
+            self.assertIn('got SIGTERM', out)
+
     def test_the_wrapper_does_not_restart_after_being_terminated(self):
         """A terminating wrapper must not resurrect the child on its way out."""
         with tempfile.TemporaryDirectory() as td:

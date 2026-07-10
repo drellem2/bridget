@@ -96,6 +96,19 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **`bridget-supervise` ignored SIGTERM for the whole of its restart backoff.**
+  bash runs a trap only once the current *foreground* command returns, so the
+  backoff's `sleep "$backoff"` deferred the `on_signal` handler for up to
+  `BRIDGET_MAX_BACKOFF` (300s default); 2m44s was measured. That contradicted
+  the script's own promise that `launchctl bootout` and `kickstart -k` work, and
+  it was not merely slow: launchd escalates an unanswered SIGTERM to SIGKILL, so
+  stopping or restarting the job mid-backoff killed the supervisor and left
+  bridget running with nothing watching it — the exact failure the wrapper
+  exists to prevent. The sleep now runs in the background under `wait`, which
+  *is* interruptible, and the handler reaps it instead of orphaning it. The
+  existing signal tests all happened to signal the wrapper while bridget was up,
+  where it parks in `wait "$child"`; the backoff was the untested half.
+
 - **bridget re-sent the same task transitions to the user's DM every five
   seconds, forever.** `mg list --json --all` emits some ids *twice* — once live,
   once as an archived tombstone (`mg-4b2a`, `mg-7387` and `mg-913e` each appeared

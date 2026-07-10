@@ -67,6 +67,7 @@ MAX_SPAWNS="${BRIDGET_MAX_SPAWNS:-0}"
 log() { printf '[supervise %s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 child=""
+sleep_pid=""
 terminating=0
 
 on_signal() {
@@ -76,6 +77,11 @@ on_signal() {
     if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
         kill -"$sig" "$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
+    fi
+    # We may be mid-backoff. Reap the sleep rather than orphaning it for the
+    # remainder of MAX_BACKOFF.
+    if [[ -n "$sleep_pid" ]] && kill -0 "$sleep_pid" 2>/dev/null; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
     fi
     # 128 + signal number, the convention bridget's exit 143 (128+15) follows.
     case "$sig" in
@@ -125,13 +131,28 @@ while true; do
         exit "$rc"
     fi
 
-    # `|| true`, and it is load-bearing. On 2026-07-10 every pogo poller on this
-    # host died at once because unanchored `pkill -f "sleep 600"` from unrelated
-    # sessions matched their idle `sleep`; the sleep returned 143, `set -e` fired,
-    # and each poller killed itself (mg-8c9c, mg-67b5). We do not enable `set -e`
-    # above, so this is belt and braces — but a supervisor that can be stopped by
-    # someone else's pkill is not a supervisor.
-    sleep "$backoff" || true
+    # The backoff sleep runs in the *background*, and we `wait` on it. Both
+    # halves of that are load-bearing.
+    #
+    # `wait`, because bash runs a trap only once the current foreground command
+    # returns. A plain `sleep "$backoff"` therefore made this wrapper ignore
+    # SIGTERM for the rest of the backoff — measured at 2m44s on 2026-07-10
+    # (mg-b4f1), against a header comment promising that `launchctl bootout` and
+    # `kickstart -k` work. launchd escalates an unanswered SIGTERM to SIGKILL,
+    # which kills us mid-backoff and orphans bridget: a live bot with no
+    # supervisor, which is the failure this whole script exists to prevent.
+    # `wait` *is* interruptible, so the trap fires immediately.
+    #
+    # `|| true`, because on 2026-07-10 every pogo poller on this host died at
+    # once when unanchored `pkill -f "sleep 600"` from unrelated sessions matched
+    # their idle `sleep`; the sleep returned 143, `set -e` fired, and each poller
+    # killed itself (mg-8c9c, mg-67b5). We do not enable `set -e` above, so this
+    # is belt and braces — but a supervisor that someone else's pkill can stop is
+    # not a supervisor.
+    sleep "$backoff" &
+    sleep_pid=$!
+    wait "$sleep_pid" || true
+    sleep_pid=""
 
     if (( ran < HEALTHY_RUNTIME )); then
         backoff=$(( backoff * 2 ))
