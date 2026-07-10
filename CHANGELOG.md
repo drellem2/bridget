@@ -52,6 +52,8 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 - **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
   or any real secret value is committed, if a config key is undocumented, or if
   `TOKEN` is referenced anywhere but `client.run`.
+- **`tests/test_task_transitions.py`** — covers the task-transition diff,
+  including the duplicate-id regression below.
 
 ### Security
 
@@ -74,6 +76,19 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **bridget re-sent the same task transitions to the user's DM every five
+  seconds, forever.** `mg list --json --all` emits some ids *twice* — once live,
+  once as an archived tombstone (`mg-4b2a`, `mg-7387` and `mg-913e` each appeared
+  as both `shelved` and `archived`). `watch_task_transitions` diffed and assigned
+  `states[tid] = status` line by line, so it announced the first record and then
+  stored the second; the next poll saw the stored status contradicted by the
+  first record again and re-announced. About 95 of the last 100 DMs in the
+  maintainer's inbox were three "📦 shelved" messages on repeat.
+
+  The listing is now reconciled to one status per id *before* the diff, in the
+  new `reconcile_task_states`. An id whose records disagree is recorded but never
+  announced, which also makes the outcome independent of the order `mg` happens
+  to emit duplicates in. Genuine transitions still announce exactly once.
 - **Every documented way to run bridget crashed on `import discord`.** The
   shebang is `/usr/bin/env python3`, so the `~/.pogo/bin/bridget` symlink from
   the quick start, the launchd plist and the systemd unit all ran under the

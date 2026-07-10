@@ -28,6 +28,10 @@ python3 tests/test_core.py
 python3 tests/test_env_defaults.py
 python3 tests/test_channels.py
 python3 tests/test_threading.py
+# The task-transition diff. Guards the DM flood: `mg list --json --all` emits
+# some ids twice (live + archived tombstone), and a line-by-line diff
+# re-announced them on every single poll.
+python3 tests/test_task_transitions.py
 python3 tests/test_secrets.py
 # Drives the real script under a venv that provably lacks discord.py, so the
 # re-exec into ~/.pogo/venv-bridget is exercised, not just described.

@@ -1314,6 +1314,62 @@ async def watch_idea_claims(user: discord.User):
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def reconcile_task_states(out: str, previous: dict,
+                          announce_statuses) -> tuple[dict, list[dict]]:
+    """Diff one `mg list --json --all` dump against the previous state.
+
+    Returns `(current, announce)`: the full id→status map this listing implies,
+    and the task records whose status just became one we announce.
+
+    `mg list --json --all` can emit the *same id twice* with different statuses
+    — a live record and an archived tombstone (observed: mg-4b2a, mg-7387 and
+    mg-913e each appearing as both `shelved` and `archived`). The obvious loop,
+    which diffs and assigns `states[tid] = status` line by line, announces on the
+    first record and then stores the second. Every subsequent poll sees the
+    stored status contradicted by the first record again and re-announces: an
+    identical DM every POLL_INTERVAL seconds, forever (mg-0655 — it had put ~95
+    of the last 100 DMs in the user's inbox before this was found).
+
+    So: reconcile the listing to one status per id *first*, then diff once. Two
+    rules make that safe.
+
+      1. Last record wins, matching what the old loop would have left in the
+         state file. The state converges either way; only the announcement is
+         order-sensitive, which rule 2 removes.
+      2. An id whose records disagree is ambiguous, so it is recorded but never
+         announced. A genuine transition — mg rewrites one record — still fires,
+         because that id appears once. This is what makes the result independent
+         of the order mg happens to emit duplicates in.
+    """
+    last: dict[str, dict] = {}
+    statuses: dict[str, set] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            task = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if task.get('type') != 'task':
+            continue
+        tid = task.get('id')
+        status = task.get('status')
+        if not tid or not status:
+            continue
+        last[tid] = task
+        statuses.setdefault(tid, set()).add(status)
+
+    current = {tid: task['status'] for tid, task in last.items()}
+    announce = [
+        task for tid, task in last.items()
+        if len(statuses[tid]) == 1
+        and previous.get(tid) != task['status']
+        and task['status'] in announce_statuses
+    ]
+    return current, announce
+
+
 async def watch_task_transitions(user: discord.User):
     states, file_existed = load_task_states()
     primed = file_existed  # if cache file existed, treat first tick as a normal diff
@@ -1325,33 +1381,18 @@ async def watch_task_transitions(user: discord.User):
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            seen_ids = set()
+            current, announce = reconcile_task_states(out, states, _TRANSITION_FORMATS)
             transitions: list[tuple[str, str]] = []  # (msg, assignee)
-            for line in out.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    task = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if task.get('type') != 'task':
-                    continue
-                tid = task.get('id')
-                status = task.get('status')
-                if not tid or not status:
-                    continue
-                seen_ids.add(tid)
-                prev = states.get(tid)
-                if primed and prev != status and status in _TRANSITION_FORMATS:
-                    msg = format_transition(task, status)
+            if primed:
+                for task in announce:
+                    msg = format_transition(task, task['status'])
                     if msg:
-                        assignee = (task.get('assignee') or '').strip()
-                        transitions.append((msg, assignee))
-                states[tid] = status
+                        transitions.append((msg, (task.get('assignee') or '').strip()))
 
-            for stale in set(states.keys()) - seen_ids:
-                del states[stale]
+            # Replace wholesale: ids absent from this listing are gone, which is
+            # what the old `del states[stale]` pass did by hand.
+            states.clear()
+            states.update(current)
 
             if not primed:
                 primed = True
