@@ -82,7 +82,11 @@ from bridget_core.mail import (  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
-from bridget_core.statefile import write_state  # noqa: E402
+from bridget_core.statefile import (  # noqa: E402
+    STATE_FILE_MODE,
+    secure_parent,
+    write_state,
+)
 
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
@@ -95,6 +99,17 @@ TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
+
+# Watcher liveness heartbeat. The task-transition poller touches this file at the
+# top of every cycle — including cycles where `mg list` timed out — so its mtime
+# is a true liveness signal for the *watcher thread*, independent of whether mg
+# itself is healthy. pogod's tier-1 reaper (mg-d18b) keys on exactly this: a
+# declared `label|path|period` whose heartbeat file is dead once its mtime is
+# older than the period. See README "Is it actually alive?" and pogo
+# docs/design/reaper-design.md. This closes the KeepAlive blind spot that made a
+# silently-dead watcher invisible for 44 minutes (mg-3499).
+HEALTH_DIR = HOME / '.pogo' / 'health'
+WATCHER_HEARTBEAT_FILE = HEALTH_DIR / 'bridget.heartbeat'
 INSTALL_DOCS_URL = 'https://github.com/CloverRoss/bridget#readme'
 BRIDGET_REPO = Path(os.environ.get(
     'BRIDGET_REPO_DIR',
@@ -480,6 +495,11 @@ INBOX_REPO = CONFIG['inbox_repo']
 WORKFLOW_AGENT = CONFIG['workflow_agent']
 INBOX_TAG = CONFIG['inbox_tag']
 POLL_INTERVAL = CONFIG['poll_interval']
+#: On a transient `mg list` timeout the task-transition watcher backs off and
+#: retries rather than dying. The backoff grows from one poll interval and is
+#: capped here, so a genuine contention burst isn't hammered while the watcher
+#: stays alive and its heartbeat keeps ticking (mg-3499).
+WATCH_TIMEOUT_BACKOFF_CAP = 60
 QUIET_RESPECTS_OUTBOUND = CONFIG['quiet_respects_outbound']
 APPROVAL_RE = CONFIG['approval_re']
 RESTART_CMD = CONFIG['restart_cmd']
@@ -666,6 +686,37 @@ def load_task_states() -> tuple[dict, bool]:
 def save_task_states(states: dict) -> None:
     """Atomically write the task-state cache."""
     write_state(TASK_STATES_FILE, json.dumps(states, indent=2, sort_keys=True) + '\n')
+
+
+def touch_heartbeat(path: Path = None) -> None:
+    """Bump the watcher liveness heartbeat's mtime to now.
+
+    Best-effort and self-contained: any failure is logged and swallowed, because
+    a heartbeat that could crash the loop it exists to prove alive would defeat
+    its own purpose. Called at the top of every watcher cycle — including cycles
+    where `mg list` timed out — so a stalled or dead watcher shows up to the
+    reaper as a stale mtime, while a merely-degraded one keeps ticking.
+    """
+    path = path or WATCHER_HEARTBEAT_FILE
+    try:
+        secure_parent(path)
+        if not path.exists():
+            # Create owner-only; os.utime below carries the mtime forward each
+            # cycle without rewriting content.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT, STATE_FILE_MODE))
+        os.utime(path, None)
+    except Exception as e:
+        print(f'heartbeat touch failed: {e}', file=sys.stderr)
+
+
+def next_watch_backoff(current: float, poll_interval: float, cap: float) -> float:
+    """The next `mg list`-timeout backoff, in seconds.
+
+    Grows from one poll interval and doubles per consecutive timeout, capped so a
+    real contention burst is retried patiently rather than hammered. Pure so the
+    escalation is unit-testable without waiting on real sleeps.
+    """
+    return min(poll_interval if current == 0 else current * 2, cap)
 
 
 def load_idea_claims() -> tuple[set, bool]:
@@ -1383,13 +1434,31 @@ def reconcile_task_states(out: str, previous: dict,
 async def watch_task_transitions(user: discord.User):
     states, file_existed = load_task_states()
     primed = file_existed  # if cache file existed, treat first tick as a normal diff
+    backoff = 0  # extra seconds added on *consecutive* `mg list` timeouts
     while not client.is_closed():
+        # Liveness heartbeat, ticked at the top of every cycle — before we even
+        # call mg — so it proves the *watcher thread* is alive regardless of
+        # whether mg is healthy. A transient `mg list` timeout must not freeze
+        # this: that was the 44-minute silent-death class (mg-3499), where the
+        # thread went quiet but the process stayed up, so KeepAlive/supervise
+        # never noticed. The reaper (mg-d18b) reads this mtime to tell a degraded
+        # watcher from a dead one.
+        touch_heartbeat()
         try:
             rc, out, err = run_mg(['list', '--json', '--all'])
             if rc != 0:
+                # `mg list` benchmarks at ~0.01s even at rest, so a timeout here
+                # is a transient flake, not slowness. Degrade, do NOT die: log,
+                # back off, retry next cycle. The thread must never exit on a
+                # timeout — that left the channel pipe dark until a manual
+                # kickstart. Backoff grows from one poll interval and is capped
+                # (mg-3499).
                 print(f'watch_task_transitions mg list failed: {err.strip()[:200]}', file=sys.stderr)
-                await asyncio.sleep(POLL_INTERVAL)
+                backoff = next_watch_backoff(
+                    backoff, POLL_INTERVAL, WATCH_TIMEOUT_BACKOFF_CAP)
+                await asyncio.sleep(POLL_INTERVAL + backoff)
                 continue
+            backoff = 0  # a clean listing clears the timeout backoff
 
             current, announce = reconcile_task_states(out, states, _TRANSITION_FORMATS)
             transitions: list[tuple[str, str]] = []  # (msg, assignee)

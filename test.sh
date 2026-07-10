@@ -32,6 +32,11 @@ python3 tests/test_threading.py
 # some ids twice (live + archived tombstone), and a line-by-line diff
 # re-announced them on every single poll.
 python3 tests/test_task_transitions.py
+# The watch_task_transitions silent-death fix (mg-3499): a single transient
+# `mg list` timeout must not kill the watcher thread, and a liveness heartbeat
+# whose mtime ticks every cycle must go stale only when the watcher is truly
+# dead. Injects the timeout and kills a real watcher BY PID; no live Discord.
+python3 tests/test_watcher_liveness.py
 # bridget-supervise + the launchd plist template. Calls no launchctl, so it
 # runs on Linux too.
 python3 tests/test_launchd.py

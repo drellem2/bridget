@@ -610,16 +610,29 @@ rate-limit anything, and 360 identical mails an hour is its own kind of silence.
 ### Is it actually alive?
 
 Do not infer liveness from the last line in `~/.pogo/bridget.log` — a quiet
-mailbox and a dead poller look identical there. `~/.pogo/bridget.task-states.json`
-is rewritten on every poll whether or not anything was delivered, so its mtime is
-a true heartbeat:
+mailbox and a dead poller look identical there. The task-transition watcher
+touches a dedicated heartbeat file at the top of **every** cycle, so its mtime is
+a true liveness signal for the watcher thread:
 
 ```bash
-stat -f '%Sm' ~/.pogo/bridget.task-states.json    # should be within a poll interval
+stat -f '%Sm' ~/.pogo/health/bridget.heartbeat    # should be within a poll interval
 ```
 
-(`~/.pogo/bridget.seen` is *not* a heartbeat — it is only rewritten when mail
-actually arrives.)
+This ticks even on a cycle where `mg list` timed out — the watcher retries
+rather than dying (a single transient timeout, which fires even at rest, once
+silently killed the watcher and left the channel pipe dark for 44 minutes while
+the process stayed up). A frozen heartbeat therefore means the watcher is
+genuinely dead, which is exactly what pogod's tier-1 reaper keys on: declare the
+job to `[reaper]` as `com.pogo.bridget|~/.pogo/health/bridget.heartbeat|<period>`
+(pick a period comfortably above the poll interval) and it will `launchctl
+kickstart` a stale watcher instead of trusting KeepAlive, which only reacts to
+process *exit*.
+
+(`~/.pogo/bridget.task-states.json` also advances on a normal poll, but it is
+*not* a reliable heartbeat: on an `mg list` timeout the watcher skips the write
+and retries, so the task-states mtime freezes during exactly the burst you would
+want to detect. `~/.pogo/bridget.seen` is not a heartbeat either — it is only
+rewritten when mail actually arrives.)
 
 ### Linux (systemd)
 

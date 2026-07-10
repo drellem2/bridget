@@ -96,6 +96,27 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **The task-transition watcher died silently on a transient `mg list`
+  timeout.** A single `mg command timed out` — which fires even at rest, where
+  `mg list` benchmarks at ~0.01s, so it is a transient flake and not contention —
+  could stop `watch_task_transitions` while the bridget *process* stayed alive
+  and logged in. launchd/KeepAlive and `bridget-supervise` only react to process
+  *exit*, so nothing restarted it: the pogo channel went silent for 44 minutes
+  until a manual `launchctl kickstart`. The watcher now catches the timeout,
+  backs off (growing from one poll interval, capped), and retries — the thread
+  never exits on a timeout.
+
+  It also touches a dedicated liveness heartbeat, `~/.pogo/health/bridget.heartbeat`,
+  at the top of **every** cycle (including timeout cycles), so a dead watcher is
+  detectable as a stale mtime — the exact signal pogod's tier-1 reaper (mg-d18b)
+  keys on, closing the KeepAlive blind spot. Declare the job as
+  `com.pogo.bridget|~/.pogo/health/bridget.heartbeat|<period>` under `[reaper]`
+  to have a stale watcher kickstarted automatically. `tests/test_watcher_liveness.py`
+  injects one timeout and proves the watcher keeps posting and keeps ticking,
+  then kills the watcher by PID and proves the heartbeat goes stale. Timeout
+  *tuning* was deliberately not treated as the fix: the trigger is a flake, so
+  the thread must survive regardless of the timeout value (mg-3499).
+
 - **Inbound messages were silently truncated at 200 characters.** Free-form chat
   in a mapped channel put the *entire message* in `--subject` whenever it had no
   newline, leaving the body as the literal string `(no body)`. `build_send_args`
