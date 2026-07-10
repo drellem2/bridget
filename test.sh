@@ -32,6 +32,9 @@ python3 tests/test_threading.py
 # some ids twice (live + archived tombstone), and a line-by-line diff
 # re-announced them on every single poll.
 python3 tests/test_task_transitions.py
+# bridget-supervise + the launchd plist template. Calls no launchctl, so it
+# runs on Linux too.
+python3 tests/test_launchd.py
 python3 tests/test_secrets.py
 # Drives the real script under a venv that provably lacks discord.py, so the
 # re-exec into ~/.pogo/venv-bridget is exercised, not just described.

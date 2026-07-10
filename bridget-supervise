@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
+# bridget-supervise — keep bridget running without relying on launchd KeepAlive.
+#
+# Why this exists (measured on Darwin 24.6.0, mg-0655):
+#
+#   `launchctl print` reports a field called `pended nondemand spawn`. A
+#   "nondemand" spawn is any spawn launchd decides to do on its own: RunAtLoad,
+#   a KeepAlive restart, or a StartInterval fire. launchd defers those and marks
+#   them `inefficient` (or `speculative` at load time). The deferral is not a
+#   short delay: a KeepAlive job that took SIGTERM was observed still
+#   `state=not running, runs=1` 115 seconds later, and com.pogo.watchdog and
+#   com.pogo.gh-issues sat in exactly that state for ~4.8 hours before a human
+#   kickstarted them by hand. A *demand* spawn — `launchctl kickstart` — is
+#   never pended. (Why they died is a separate, since-fixed bug: unanchored
+#   `pkill -f "sleep 600"` from unrelated sessions matched their idle sleep. Why
+#   they STAYED dead is this, and it is still open: mg-e701.)
+#
+#   So `KeepAlive=true` cannot be trusted to restart bridget when bridget exits.
+#   Neither can StartInterval (also a nondemand spawn, also pended), and
+#   ProcessType=Interactive does not exempt a job either. All three were tested,
+#   as was the KeepAlive dict form (mg-50e0, independently).
+#
+#   The fix that does not depend on launchd's mood: never let the supervised
+#   process be the thing launchd has to respawn. This wrapper is what launchd
+#   starts, and it stays alive across bridget's crashes, restarting bridget
+#   itself. launchd then only has to spawn us once.
+#
+# What this does NOT fix: if something kills *this wrapper*, restarting it is
+# launchd's job, and that restart is subject to the same pending. That residual
+# is the open platform fault mg-e701; its fix is a live process issuing
+# `launchctl kickstart`, not anything expressible in a plist. See README
+# "Running as a service".
+#
+# Signals: SIGTERM/SIGINT are forwarded to bridget and then honored. We do not
+# trap-and-ignore them — `launchctl bootout` and `kickstart -k` must work, and a
+# daemon that refuses to die is worse than one that needs a kick.
+
+set -uo pipefail   # deliberately not -e: bridget's nonzero exit is data, not fatal.
+
+BRIDGET_BIN="${BRIDGET_BIN:-$HOME/.pogo/bin/bridget}"
+
+# Restart backoff. A bridget that dies instantly (bad token, missing env file)
+# must not become a fork bomb; a bridget that dies after a week of uptime must
+# not inherit that history and wait 5 minutes to come back.
+MIN_BACKOFF="${BRIDGET_MIN_BACKOFF:-5}"
+MAX_BACKOFF="${BRIDGET_MAX_BACKOFF:-300}"
+# A run at least this long is evidence the config is fine and the exit was
+# transient (a dropped gateway socket), so the next restart is immediate-ish.
+HEALTHY_RUNTIME="${BRIDGET_HEALTHY_RUNTIME:-60}"
+# Test hook: stop after N spawns instead of looping forever. 0 = never stop.
+MAX_SPAWNS="${BRIDGET_MAX_SPAWNS:-0}"
+
+log() { printf '[supervise %s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+child=""
+terminating=0
+
+on_signal() {
+    local sig="$1"
+    terminating=1
+    log "got SIG$sig; forwarding to bridget${child:+ (pid $child)} and exiting"
+    if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
+        kill -"$sig" "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    # 128 + signal number, the convention bridget's exit 143 (128+15) follows.
+    case "$sig" in
+        TERM) exit 143 ;;
+        INT)  exit 130 ;;
+        *)    exit 1   ;;
+    esac
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT'  INT
+
+[[ -x "$BRIDGET_BIN" || -f "$BRIDGET_BIN" ]] || {
+    log "FATAL: no bridget at $BRIDGET_BIN — run install.sh"
+    exit 1
+}
+
+backoff="$MIN_BACKOFF"
+spawns=0
+
+log "supervising $BRIDGET_BIN (pid $$)"
+
+while true; do
+    started="$SECONDS"
+    spawns=$((spawns + 1))
+    log "starting bridget (spawn #$spawns)"
+
+    "$BRIDGET_BIN" &
+    child=$!
+    wait "$child"
+    rc=$?
+    child=""
+
+    (( terminating )) && break
+
+    ran=$((SECONDS - started))
+
+    if (( ran >= HEALTHY_RUNTIME )); then
+        # It held a gateway connection for a while; treat this as a blip.
+        backoff="$MIN_BACKOFF"
+        log "bridget exited rc=$rc after ${ran}s (healthy run); restarting in ${backoff}s"
+    else
+        log "bridget exited rc=$rc after ${ran}s (too fast); restarting in ${backoff}s"
+    fi
+
+    if (( MAX_SPAWNS > 0 && spawns >= MAX_SPAWNS )); then
+        log "reached BRIDGET_MAX_SPAWNS=$MAX_SPAWNS; exiting"
+        exit "$rc"
+    fi
+
+    # `|| true`, and it is load-bearing. On 2026-07-10 every pogo poller on this
+    # host died at once because unanchored `pkill -f "sleep 600"` from unrelated
+    # sessions matched their idle `sleep`; the sleep returned 143, `set -e` fired,
+    # and each poller killed itself (mg-8c9c, mg-67b5). We do not enable `set -e`
+    # above, so this is belt and braces — but a supervisor that can be stopped by
+    # someone else's pkill is not a supervisor.
+    sleep "$backoff" || true
+
+    if (( ran < HEALTHY_RUNTIME )); then
+        backoff=$(( backoff * 2 ))
+        (( backoff > MAX_BACKOFF )) && backoff="$MAX_BACKOFF"
+    fi
+done

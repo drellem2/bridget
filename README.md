@@ -496,22 +496,95 @@ sync.
 
 ## Running as a service
 
-For v0.1, bridget is just a long-running Python process — supervise it however
-you'd supervise any other foreground service. None of these need to know where
-the venv is: bridget's shebang finds the system interpreter, notices `discord`
-is missing there, and re-execs itself into `BRIDGET_VENV_DIR`
-(default `~/.pogo/venv-bridget`). A few options:
+bridget is a long-running Python process. None of the options below need to know
+where the venv is: bridget's shebang finds the system interpreter, notices
+`discord` is missing there, and re-execs itself into `BRIDGET_VENV_DIR`
+(default `~/.pogo/venv-bridget`).
 
-- **macOS (launchd):** wrap `~/.pogo/bin/bridget` in a `~/Library/LaunchAgents/`
-  plist with `RunAtLoad`, `KeepAlive`, and `StandardOutPath` /
-  `StandardErrorPath` set to log files under `~/.pogo/`.
-- **Linux (systemd):** a user unit (`~/.config/systemd/user/bridget.service`)
-  with `ExecStart=%h/.pogo/bin/bridget`, `Restart=always`, then
-  `systemctl --user enable --now bridget`.
-- **Quick-and-dirty:** `nohup ~/.pogo/bin/bridget >>~/.pogo/bridget.log 2>&1 &`.
+### macOS (launchd)
 
-Bundled launchd / systemd templates and an `install.sh --service=...` flag are
-on the roadmap; for now, write the unit yourself. PRs welcome.
+```bash
+bash install.sh --launchd
+```
+
+That renders [`com.pogo.bridget.plist.example`](com.pogo.bridget.plist.example)
+into `~/Library/LaunchAgents/`, bootstraps it, and **kickstarts** it. Check on it
+with:
+
+```bash
+launchctl print gui/$(id -u)/com.pogo.bridget | grep -E 'state|runs|pended'
+```
+
+Two things about this setup are not what you'd expect, and both were measured
+rather than assumed.
+
+**The job runs `bridget-supervise`, not `bridget`.** [`bridget-supervise`](bridget-supervise)
+is a small wrapper whose only job is to restart bridget when bridget exits. That
+sounds like exactly what `KeepAlive` is for — but see below.
+
+**`KeepAlive` is a best-effort outer net, not a guarantee, and the kickstart is
+mandatory.** launchd distinguishes *demand* spawns (`launchctl kickstart`) from
+*nondemand* spawns — `RunAtLoad`, a `KeepAlive` restart, and a `StartInterval`
+fire are all nondemand. Under sustained system load launchd defers nondemand
+spawns and says so in a field almost nobody reads:
+
+```
+$ launchctl print gui/501/com.pogo.bridget | grep -E 'state|runs|pended'
+	state = not running
+	runs = 1
+	pended nondemand spawn = inefficient
+```
+
+That deferral is not a short delay. A job killed with `SIGTERM` was observed
+still `not running` 115 seconds later, and two sibling agents
+(`com.pogo.watchdog`, `com.pogo.gh-issues`) sat in exactly that state for roughly
+4.8 hours, `KeepAlive=true` notwithstanding, until a human kickstarted them by
+hand. A `bootstrap` alone routinely leaves a brand-new job at `runs = 0`,
+`pended … = speculative`, which never spawns at all.
+
+`kickstart` is never pended, which is why `install.sh --launchd` ends with one.
+And because a bridget crash would otherwise hand the restart to the same pending
+machinery, the wrapper takes that job instead: launchd only has to spawn the
+wrapper once.
+
+The plist deliberately omits `StartInterval` (its fire is a nondemand spawn too,
+so it is pended alongside everything else) and `ProcessType` (`Interactive`
+changes the reported spawn type and nothing else). Neither defeats the pending.
+
+**Residual risk, stated plainly:** if anything kills the *wrapper*, restarting it
+is launchd's job, and that restart is subject to the same deferral. Nothing
+expressible in a plist fixes that; it needs a live process to issue
+`launchctl kickstart`. If bridget is ever mysteriously absent, this is why, and
+the cure is:
+
+```bash
+launchctl kickstart gui/$(id -u)/com.pogo.bridget
+```
+
+### Is it actually alive?
+
+Do not infer liveness from the last line in `~/.pogo/bridget.log` — a quiet
+mailbox and a dead poller look identical there. `~/.pogo/bridget.task-states.json`
+is rewritten on every poll whether or not anything was delivered, so its mtime is
+a true heartbeat:
+
+```bash
+stat -f '%Sm' ~/.pogo/bridget.task-states.json    # should be within a poll interval
+```
+
+(`~/.pogo/bridget.seen` is *not* a heartbeat — it is only rewritten when mail
+actually arrives.)
+
+### Linux (systemd)
+
+A user unit (`~/.config/systemd/user/bridget.service`) with
+`ExecStart=%h/.pogo/bin/bridget` and `Restart=always`, then
+`systemctl --user enable --now bridget`. systemd's `Restart=always` is reliable,
+so the supervisor wrapper is unnecessary there.
+
+### Quick-and-dirty
+
+`nohup ~/.pogo/bin/bridget >>~/.pogo/bridget.log 2>&1 &`
 
 ## Troubleshooting
 
@@ -523,6 +596,12 @@ straight to your terminal.
 
 Common failure modes:
 
+- **bridget isn't running, and nothing in the logs says why** — under launchd,
+  check `launchctl print gui/$(id -u)/com.pogo.bridget` for a
+  `pended nondemand spawn` line. If it is there, launchd has deferred the spawn
+  rather than failed it; `runs` will be stuck and `state = not running`.
+  `launchctl kickstart gui/$(id -u)/com.pogo.bridget` starts it immediately. See
+  [Running as a service](#running-as-a-service) for why this happens.
 - **`could not find the mg binary on PATH`** — pogo isn't installed, or its
   `bin/` isn't on the PATH that bridget sees (this is common under launchd,
   which runs with a minimal PATH). Set `MG_BIN` (and optionally `POGO_BIN`)

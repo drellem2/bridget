@@ -52,6 +52,26 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 - **`tests/test_secrets.py`** — fails the build if a Discord-token-shaped string
   or any real secret value is committed, if a config key is undocumented, or if
   `TOKEN` is referenced anywhere but `client.run`.
+- **A launchd agent, and a supervisor that does the work `KeepAlive` claims to.**
+  `install.sh --launchd` renders `com.pogo.bridget.plist.example`, bootstraps it,
+  and kickstarts it. The job runs the new `bridget-supervise` wrapper, which
+  restarts bridget when bridget exits.
+
+  The kickstart and the wrapper both exist for the same measured reason: launchd
+  defers *nondemand* spawns — `RunAtLoad`, `KeepAlive` restarts, `StartInterval`
+  fires — reporting `pended nondemand spawn = inefficient` (or `speculative`). A
+  `SIGTERM`ed job was observed still `not running` 115 seconds later; two sibling
+  agents sat that way for ~4.8 hours until kickstarted by hand; and `bootstrap`
+  alone leaves a fresh job at `runs = 0` indefinitely. Only `launchctl kickstart`,
+  a demand spawn, is never pended. So the wrapper keeps launchd out of the restart
+  path entirely. `StartInterval` and `ProcessType` are deliberately absent from
+  the plist: both were tested, neither defeats the pending. See "Running as a
+  service" in the README, which also documents the one residual case a plist
+  cannot fix.
+- **`tests/test_launchd.py`** — covers the wrapper's restart loop, backoff, and
+  SIGTERM forwarding, plus the plist template: that it parses under a *strict*
+  XML parser (`plutil -lint` accepts a `--` inside a comment; `plistlib` does
+  not), carries no secrets, and still omits `StartInterval` / `ProcessType`.
 - **`tests/test_task_transitions.py`** — covers the task-transition diff,
   including the duplicate-id regression below.
 

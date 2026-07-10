@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.pogo.bridget — launchd agent for bridget (macOS).
+
+  Running install.sh with the `launchd` flag renders this file (substituting
+  __HOME__), installs it to ~/Library/LaunchAgents/, bootstraps it, and then
+  KICKSTARTS it. To do it by hand, replace __HOME__ throughout — launchd does not
+  expand $HOME or any other environment variable inside these strings — then:
+
+  (This comment deliberately contains no double-hyphen: XML forbids it inside a
+  comment, `plutil -lint` accepts it anyway, and the stricter parsers that read
+  this file for you — python's plistlib among them — do not.)
+
+      cp com.pogo.bridget.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pogo.bridget.plist
+      launchctl kickstart gui/$(id -u)/com.pogo.bridget    # <- NOT optional, see below
+
+  THE KICKSTART IS NOT OPTIONAL. `bootstrap` alone routinely leaves the job in
+  `state=not running, runs=0` even though RunAtLoad is true: launchd defers
+  "nondemand" spawns (RunAtLoad, KeepAlive restarts, StartInterval fires) under
+  system load and reports them as `pended nondemand spawn = speculative`. Only a
+  *demand* spawn — `kickstart` — is never pended. Verify with:
+
+      launchctl print gui/$(id -u)/com.pogo.bridget | grep -E 'state|runs|pended'
+
+  Two keys are deliberately ABSENT, both because they were measured not to help:
+
+    * StartInterval — a StartInterval fire is itself a nondemand spawn, so it is
+      pended by the same machinery. It is not a usable safety net, and pairing it
+      with KeepAlive just adds a second thing that does not fire.
+    * ProcessType — `Interactive` changes the reported spawn type but does not
+      exempt the job from spawn pending and does not change its jetsam priority.
+
+  KeepAlive below is a best-effort outer net, not a guarantee. bridget's actual
+  crash-restart guarantee comes from bridget-supervise, the wrapper this plist
+  runs: it stays alive across bridget's exits, so launchd never has to perform
+  the nondemand respawn that it is liable to defer. See bridget-supervise's
+  header comment and the README's "Running as a service" section.
+
+  No secrets belong in this file. Files in ~/Library/LaunchAgents are typically
+  mode 644; bridget reads DISCORD_BOT_TOKEN from ~/.pogo/bridget.env (mode 600)
+  itself, and nothing here needs it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pogo.bridget</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.pogo/bin/bridget-supervise</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Best-effort. See the note above: launchd may pend this indefinitely. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- launchd's own floor on respawn rate. Matches the wrapper's MIN_BACKOFF. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.pogo/bridget.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.pogo/bridget.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd hands a job a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+             bridget shells out to `mg` and `pogo`, and re-execs into python3,
+             so all three must be reachable. Adjust for your own install:
+             `mg` and `pogo` are Go binaries (default ~/go/bin), python3 is
+             typically homebrew's. Alternatively set MG_BIN / POGO_BIN /
+             BRIDGET_VENV_DIR in ~/.pogo/bridget.env and skip the PATH edit. -->
+        <key>PATH</key>
+        <string>__HOME__/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.pogo/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>

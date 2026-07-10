@@ -255,8 +255,8 @@ class TestLicenseHeaders(unittest.TestCase):
     shipping with no notice at all — which is what happened to every file in
     bridget_core/ and tests/."""
 
-    SOURCE_GLOBS = ('bridget', 'build.sh', 'test.sh', 'install.sh',
-                    'bridget_core/*.py', 'tests/test_*.py',
+    SOURCE_GLOBS = ('bridget', 'bridget-supervise', 'build.sh', 'test.sh',
+                    'install.sh', 'bridget_core/*.py', 'tests/test_*.py',
                     'tests/smoke-fresh-install.py', 'tests/smoke-fresh-install.sh')
 
     def sources(self):

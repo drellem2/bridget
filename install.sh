@@ -32,17 +32,22 @@ set -euo pipefail
 
 SETUP=0
 NO_VENV=0
+LAUNCHD=0
 for arg in "$@"; do
     case "$arg" in
         --setup) SETUP=1 ;;
         --no-venv) NO_VENV=1 ;;
+        --launchd) LAUNCHD=1 ;;
         -h|--help)
-            printf 'usage: install.sh [--setup] [--no-venv]\n\n'
+            printf 'usage: install.sh [--setup] [--no-venv] [--launchd]\n\n'
             printf '  --setup     prompt for Discord credentials (token entry is masked)\n'
             printf '  --no-venv   skip venv creation and dependency install. Everything\n'
             printf '              else still runs. This is the only step that needs the\n'
             printf '              network, so it is what the test suite skips; also useful\n'
             printf '              if you manage the venv yourself.\n'
+            printf '  --launchd   (macOS) install, bootstrap and kickstart the\n'
+            printf '              com.pogo.bridget LaunchAgent so bridget runs at login\n'
+            printf '              and restarts when it crashes.\n'
             exit 0 ;;
         *) printf 'install.sh: unknown argument %s\n' "$arg" >&2; exit 2 ;;
     esac
@@ -52,16 +57,26 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$HOME/.pogo/venv-bridget"
 BIN_DIR="$HOME/.pogo/bin"
 BIN_LINK="$BIN_DIR/bridget"
+SUPERVISE_LINK="$BIN_DIR/bridget-supervise"
 ENV_FILE="$HOME/.pogo/bridget.env"
 ENV_EXAMPLE="$REPO_DIR/bridget.env.example"
 SCRIPT="$REPO_DIR/bridget"
+SUPERVISE_SCRIPT="$REPO_DIR/bridget-supervise"
+PLIST_LABEL="com.pogo.bridget"
+PLIST_EXAMPLE="$REPO_DIR/$PLIST_LABEL.plist.example"
+PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 
 log()  { printf '[install] %s\n'  "$*"; }
 warn() { printf '[install] WARN: %s\n' "$*" >&2; }
 die()  { printf '[install] ERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ -f "$SCRIPT"      ]] || die "missing bridget script at $SCRIPT"
-[[ -f "$ENV_EXAMPLE" ]] || die "missing template at $ENV_EXAMPLE"
+[[ -f "$SCRIPT"           ]] || die "missing bridget script at $SCRIPT"
+[[ -f "$SUPERVISE_SCRIPT" ]] || die "missing supervisor at $SUPERVISE_SCRIPT"
+[[ -f "$ENV_EXAMPLE"      ]] || die "missing template at $ENV_EXAMPLE"
+if (( LAUNCHD )); then
+    [[ "$(uname -s)" == "Darwin" ]] || die "--launchd is macOS-only (this is $(uname -s))"
+    [[ -f "$PLIST_EXAMPLE" ]] || die "missing plist template at $PLIST_EXAMPLE"
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     die "python3 not found on PATH"
@@ -83,24 +98,37 @@ else
     "$VENV_DIR/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
 fi
 
-# 2. symlink ~/.pogo/bin/bridget → repo script
-mkdir -p "$BIN_DIR"
-if [[ -L "$BIN_LINK" ]]; then
-    current_target="$(readlink "$BIN_LINK")"
-    if [[ "$current_target" == "$SCRIPT" ]]; then
-        log "symlink $BIN_LINK already points to $SCRIPT"
+# 2. symlink ~/.pogo/bin/{bridget,bridget-supervise} → repo scripts
+#
+# A pre-existing *regular file* at either path is left alone: it may be a copy
+# an operator deliberately placed there (bridget-supervise is stand-alone enough
+# to be copied), and clobbering it would silently discard their edit.
+link_bin() {
+    # No `basename`: install.sh must run under the minimal PATH launchd and the
+    # installer test give it, and coreutils is not guaranteed to be on it.
+    local target="$1" link="$2" name="${2##*/}"
+    if [[ -L "$link" ]]; then
+        local current_target
+        current_target="$(readlink "$link")"
+        if [[ "$current_target" == "$target" ]]; then
+            log "symlink $link already points to $target"
+        else
+            log "replacing symlink $link ($current_target → $target)"
+            rm "$link"
+            ln -s "$target" "$link"
+        fi
+    elif [[ -e "$link" ]]; then
+        warn "$link exists and is not a symlink — leaving it alone."
+        warn "remove it manually and re-run install.sh if you want $name there."
     else
-        log "replacing symlink $BIN_LINK ($current_target → $SCRIPT)"
-        rm "$BIN_LINK"
-        ln -s "$SCRIPT" "$BIN_LINK"
+        log "creating symlink $link → $target"
+        ln -s "$target" "$link"
     fi
-elif [[ -e "$BIN_LINK" ]]; then
-    warn "$BIN_LINK exists and is not a symlink — leaving it alone."
-    warn "remove it manually and re-run install.sh if you want bridget there."
-else
-    log "creating symlink $BIN_LINK → $SCRIPT"
-    ln -s "$SCRIPT" "$BIN_LINK"
-fi
+}
+
+mkdir -p "$BIN_DIR"
+link_bin "$SCRIPT" "$BIN_LINK"
+link_bin "$SUPERVISE_SCRIPT" "$SUPERVISE_LINK"
 
 # 3. seed env file (never overwrite a populated one)
 if [[ ! -e "$ENV_FILE" ]]; then
@@ -216,6 +244,46 @@ else
     warn "$ENV_FILE."
 fi
 
+# 5. launchd agent (opt-in, macOS only)
+#
+# The kickstart at the end is not belt-and-braces, it is the only thing that
+# reliably starts the job. `bootstrap` merely loads the plist; the RunAtLoad
+# spawn that should follow is a "nondemand" spawn, and launchd defers those
+# under system load — `launchctl print` then shows `runs = 0` next to
+# `pended nondemand spawn = speculative`, indefinitely. `kickstart` is a demand
+# spawn and is never pended. Same reason bridget-supervise exists; see its
+# header and the README's "Running as a service".
+if (( LAUNCHD )); then
+    launchd_state() {
+        launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null \
+            | awk '/^\tstate =/{s=$3} /^\truns =/{r=$3} END{printf "%s runs=%s", (s==""?"unknown":s), (r==""?"?":r)}'
+    }
+
+    log "rendering $PLIST_EXAMPLE → $PLIST_DEST"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    # launchd does not expand $HOME inside plist strings, so bake it in.
+    sed "s|__HOME__|$HOME|g" "$PLIST_EXAMPLE" > "$PLIST_DEST"
+    plutil -lint "$PLIST_DEST" >/dev/null || die "rendered plist is malformed: $PLIST_DEST"
+
+    # Reloading a live job is how you pick up a changed plist; bootout fails
+    # when nothing is loaded, which is fine and not an error.
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" \
+        || die "launchctl bootstrap failed for $PLIST_DEST"
+    launchctl kickstart "gui/$(id -u)/$PLIST_LABEL" \
+        || die "launchctl kickstart failed for $PLIST_LABEL"
+
+    sleep 1
+    state="$(launchd_state)"
+    if [[ "$state" == running* ]]; then
+        log "$PLIST_LABEL is $state"
+    else
+        warn "$PLIST_LABEL did not reach state=running (got: $state)."
+        warn "inspect with: launchctl print gui/$(id -u)/$PLIST_LABEL"
+        warn "logs: $HOME/.pogo/bridget.log and $HOME/.pogo/bridget.err.log"
+    fi
+fi
+
 cat <<EOF
 
 [install] Done.
@@ -236,7 +304,12 @@ Next steps:
   4. Run bridget:
          $BIN_LINK
      The script reads its config from $ENV_FILE on startup.
-  5. To run bridget under a process supervisor (launchd / systemd / nohup),
-     see the "Running as a service" section in README.md.
+  5. To keep it running (macOS), install the LaunchAgent:
+         bash install.sh --launchd
+     That renders $PLIST_LABEL, bootstraps it, and kickstarts it. bridget then
+     runs under $SUPERVISE_LINK, which restarts it if it
+     crashes. Check on it with:
+         launchctl print gui/\$(id -u)/$PLIST_LABEL | grep -E 'state|runs'
+     For systemd / nohup, see "Running as a service" in README.md.
 
 EOF
