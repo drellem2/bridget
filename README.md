@@ -383,21 +383,42 @@ fill `DISCORD_SERVER_ID` and `DISCORD_USER_ID` in `bridget.env`.
 
 ```toml
 [channels.<name>]
-snowflake = "1234567890123456789"
+snowflake = "1234567890123456789"             # optional — omit to auto-create
 agent     = "mayor"
 direction = "both"                            # optional
 kinds     = ["mail", "task-transitions"]      # optional
+channel   = "mayor-ops"                       # optional — created channel name
 ```
 
 | Field | Required | Purpose |
 |---|---|---|
-| `snowflake` | yes | Discord channel ID, as a quoted string of digits. |
+| `snowflake` | no | Discord channel ID, as a quoted string of digits. **Omit it to have bridget create the channel on startup** (see below). |
 | `agent` | yes | Pogo agent name. Inbound non-verb messages are mailed to this agent; outbound events for this agent fan out to the channel. |
 | `direction` | no (default `both`) | `inbound`, `outbound`, or `both`. |
 | `kinds` | no (default all) | Subset of `["mail", "task-transitions", "idea-claims"]`. Controls which outbound classes fan out to this channel. |
+| `channel` | no (default: `<name>`) | Discord channel *name* to create / resolve-by-name when there is no snowflake. Sanitised to Discord's rules (lowercase, `[a-z0-9_-]`). |
 
 The `<name>` in `[channels.<name>]` is a local label used only in error
 messages — it does not have to match the agent name or the channel name.
+
+### Auto-create (no snowflake needed)
+
+You no longer have to pre-create a channel and hand-copy its snowflake. Leave
+`snowflake` out and bridget ensures the channel exists on startup:
+
+1. It looks for a text channel whose name matches (`channel`, or the `<name>`
+   label lowercased). If one exists, it **adopts** it.
+2. Otherwise it **creates** the text channel. The bot needs the *Manage
+   Channels* permission in the guild for this step.
+3. The resulting channel ID is written to `~/.pogo/bridget.channel-ids.json`
+   (owner-only) so restarts resolve the **same** channel and never make a
+   duplicate.
+
+That persisted ID takes precedence over a `snowflake` you later hand-type for
+the same `<name>`. And if a hand-typed snowflake can't be resolved (wrong ID,
+channel deleted), bridget resolves the entry by name — adopt-or-create — rather
+than retrying a dead ID forever. Already-valid snowflakes are untouched: static
+routing behaves exactly as before.
 
 ### Routing rules
 
@@ -417,7 +438,9 @@ messages — it does not have to match the agent name or the channel name.
   `kind` is excluded) fall back to DM, exactly as in v1.0.0.
 - **Bot setup.** The bot must be a member of the guild containing each mapped
   channel and have permission to read message history and send messages
-  there. The required Discord intents (`guilds`, `guild_messages`) are
+  there. Auto-created entries (no `snowflake`) additionally need the *Manage
+  Channels* permission so bridget can create the channel. The required Discord
+  intents (`guilds`, `guild_messages`) are
   non-privileged and bridget enables them automatically. The author check
   still pins to `DISCORD_USER_ID` — only your messages are processed in
   mapped channels; messages from anyone else in the same channel are

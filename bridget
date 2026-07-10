@@ -92,6 +92,12 @@ HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'
 SEEN_FILE = HOME / '.pogo' / 'bridget.seen'
 CHANNELS_FILE = HOME / '.pogo' / 'bridget.channels.toml'
+#: Persisted name->snowflake registry for channels bridget auto-created (or
+#: adopted by name) because their [channels.<name>] entry had no usable
+#: snowflake. Written back so a created channel is stable across restarts and is
+#: never re-created. Authoritative over the toml `snowflake` for the same name —
+#: a channel bridget minted itself wins over a hand-typed id that didn't resolve.
+CHANNEL_IDS_FILE = HOME / '.pogo' / 'bridget.channel-ids.json'
 CONVERSATIONS_FILE = HOME / '.pogo' / 'bridget.conversations.json'
 SETTINGS_FILE = HOME / '.pogo' / 'bridget.settings.json'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
@@ -385,7 +391,57 @@ VALID_DIRECTIONS = frozenset({'inbound', 'outbound', 'both'})
 VALID_KINDS = frozenset({'mail', 'task-transitions', 'idea-claims'})
 
 
-def load_channels(path: Path = CHANNELS_FILE) -> tuple[dict, dict, dict]:
+def load_channel_ids(path: Path = CHANNEL_IDS_FILE) -> dict:
+    """Read the persisted name->snowflake registry (see CHANNEL_IDS_FILE).
+
+    Returns {channel_name: snowflake_int}. Missing file, unreadable file, or a
+    malformed payload → empty dict; a corrupt registry must not take bridget
+    down or wedge channel auto-creation."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f'{path.name} parse error: {e}', file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    ids: dict = {}
+    for name, raw in data.items():
+        try:
+            ids[str(name)] = int(str(raw).strip())
+        except (ValueError, TypeError):
+            continue
+    return ids
+
+
+def save_channel_id(name: str, snowflake: int,
+                    path: Path = CHANNEL_IDS_FILE) -> None:
+    """Persist one name->snowflake mapping into the registry, owner-only and
+    atomically. Read-modify-write so concurrent entries don't clobber siblings;
+    bridget resolves channels serially at startup so there is no in-process
+    race, and the file is bridget's alone."""
+    ids = load_channel_ids(path)
+    if ids.get(name) == int(snowflake):
+        return
+    ids[name] = int(snowflake)
+    write_state(path, json.dumps(ids, indent=2, sort_keys=True) + '\n')
+
+
+def discord_channel_name(entry: dict) -> str:
+    """The Discord text-channel name bridget creates / resolves-by-name for an
+    entry with no usable snowflake. An explicit `channel` key wins; otherwise
+    the [channels.<name>] label is sanitised to Discord's channel-name rules
+    (lowercase, no spaces, `[a-z0-9_-]` only, <=100 chars)."""
+    raw = entry.get('channel') or entry['name']
+    slug = re.sub(r'[^a-z0-9_-]+', '-', str(raw).lower()).strip('-')
+    slug = slug[:100].strip('-')
+    # Discord rejects an empty channel name; fall back to a stable placeholder.
+    return slug or 'bridget-channel'
+
+
+def load_channels(path: Path = CHANNELS_FILE,
+                  ids_path: Path = CHANNEL_IDS_FILE) -> tuple[dict, dict, dict]:
     """Read ~/.pogo/bridget.channels.toml. Returns (by_name, by_snowflake,
     outbound_by_agent) where:
 
@@ -393,14 +449,24 @@ def load_channels(path: Path = CHANNELS_FILE) -> tuple[dict, dict, dict]:
     - by_snowflake   {snowflake_int: entry}            — only direction in {inbound, both}
     - outbound_by_agent {agent_name: [entry, ...]}     — only direction in {outbound, both}
 
-    Each entry is a dict {name, snowflake, agent, direction, kinds}. `kinds` is a
-    frozenset over VALID_KINDS controlling which outbound classes fan out to that
-    channel; defaults to all kinds.
+    Each entry is a dict {name, snowflake, agent, direction, kinds, channel_name}.
+    `kinds` is a frozenset over VALID_KINDS controlling which outbound classes fan
+    out to that channel; defaults to all kinds. `channel_name` is the Discord
+    channel name bridget resolves-by-name / creates when the entry has no usable
+    snowflake.
+
+    `snowflake` is optional (Slice A, mg-2fea): an entry may omit it and be
+    auto-created at startup instead. The effective snowflake for a name is the
+    persisted registry id (bridget's own creation) if present, else the toml
+    `snowflake`, else None (deferred to on_ready creation). An entry whose
+    snowflake is still None loads normally but is absent from `by_snowflake`
+    until resolve_and_wire_channels() mints it a channel.
 
     Missing file → three empty dicts (P1 mode). Malformed entries are logged and
     skipped; we never raise so a single typo can't take bridget down."""
     if not path.exists():
         return {}, {}, {}
+    persisted_ids = load_channel_ids(ids_path)
     if tomllib is None:
         print(
             f'bridget.channels.toml present but tomllib unavailable '
@@ -432,10 +498,20 @@ def load_channels(path: Path = CHANNELS_FILE) -> tuple[dict, dict, dict]:
             )
             continue
         try:
-            snowflake_raw = entry.get('snowflake')
-            if snowflake_raw is None:
-                raise ValueError('missing snowflake')
-            snowflake = int(str(snowflake_raw).strip())
+            # snowflake is now optional: a name with no id (in toml or the
+            # persisted registry) is a channel to auto-create at startup.
+            persisted = persisted_ids.get(name)
+            if persisted is not None:
+                snowflake = int(persisted)
+            else:
+                snowflake_raw = entry.get('snowflake')
+                if snowflake_raw is None:
+                    snowflake = None
+                else:
+                    snowflake = int(str(snowflake_raw).strip())
+            channel_override = entry.get('channel')
+            if channel_override is not None:
+                channel_override = str(channel_override).strip()
             agent = str(entry.get('agent', '')).strip()
             if not agent:
                 raise ValueError('missing or empty agent')
@@ -472,9 +548,11 @@ def load_channels(path: Path = CHANNELS_FILE) -> tuple[dict, dict, dict]:
             'agent': agent,
             'direction': direction,
             'kinds': kinds,
+            'channel': channel_override,
         }
+        ch['channel_name'] = discord_channel_name(ch)
         by_name[name] = ch
-        if direction in ('inbound', 'both'):
+        if snowflake is not None and direction in ('inbound', 'both'):
             existing = by_snowflake.get(snowflake)
             if existing is not None:
                 # Two inbound entries pointing at the same Discord channel would
@@ -1264,7 +1342,6 @@ async def watch_agent_mailbox(channel_entry: dict):
     if 'mail' not in channel_entry['kinds']:
         return
     agent = channel_entry['agent']
-    snowflake = channel_entry['snowflake']
 
     watcher = MaildirWatcher(agent_mail_dir(agent), agent_seen_file(agent))
     if not watcher.primed:
@@ -1273,12 +1350,16 @@ async def watch_agent_mailbox(channel_entry: dict):
 
     while not client.is_closed():
         try:
-            channel = client.get_channel(snowflake)
+            # Read the snowflake live off the entry: resolve_and_wire_channels()
+            # fills it in (create-if-missing) and may replace a stale id, so a
+            # watcher started before resolution finished still picks it up.
+            snowflake = channel_entry.get('snowflake')
+            channel = client.get_channel(snowflake) if snowflake else None
             if channel is None:
-                # The bot may not have joined the guild yet, or the channel
-                # snowflake is wrong. Don't churn — just wait and retry, and
-                # crucially don't poll: a mail consumed now would be marked
-                # seen and never reach the channel.
+                # No id yet (auto-create pending), the bot hasn't joined the
+                # guild, or the snowflake is wrong. Don't churn — just wait and
+                # retry, and crucially don't poll: a mail consumed now would be
+                # marked seen and never reach the channel.
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
             if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
@@ -1313,6 +1394,124 @@ def outbound_targets(agent: str, kind: str) -> list[dict]:
         ch for ch in OUTBOUND_BY_AGENT.get(agent, [])
         if kind in ch['kinds']
     ]
+
+
+def _wire_channel(entry: dict, channel_id: int) -> None:
+    """Bind a live channel id onto an entry and the inbound routing index.
+
+    Called after a channel resolves, is adopted by name, or is freshly created.
+    Updates the entry in place (watchers read `snowflake` off it live) and adds
+    it to CHANNELS_BY_SNOWFLAKE for inbound routing, keeping config-order
+    precedence if some other entry already claimed that snowflake."""
+    channel_id = int(channel_id)
+    entry['snowflake'] = channel_id
+    if entry['direction'] in ('inbound', 'both'):
+        existing = CHANNELS_BY_SNOWFLAKE.get(channel_id)
+        if existing is None or existing is entry:
+            CHANNELS_BY_SNOWFLAKE[channel_id] = entry
+        elif existing['name'] != entry['name']:
+            print(
+                f"bridget.channels: {entry['name']} resolved to snowflake "
+                f"{channel_id}, already routed to {existing['name']}; "
+                f"keeping {existing['name']} for inbound",
+                file=sys.stderr,
+            )
+
+
+async def _resolve_existing(guild, snowflake: int):
+    """Return the live channel for `snowflake` in `guild`, or None if it doesn't
+    exist / isn't reachable. Cache first, then a REST fetch (a valid channel may
+    simply not be in the gateway cache yet); genuine absence or a permission
+    wall both read as None so the caller falls through to create-by-name."""
+    channel = guild.get_channel(snowflake)
+    if channel is not None:
+        return channel
+    try:
+        channel = await client.fetch_channel(snowflake)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+    # Only adopt a channel that actually belongs to our guild.
+    if getattr(channel, 'guild', None) is not None and channel.guild.id == guild.id:
+        return channel
+    return None
+
+
+async def ensure_channel(guild, entry: dict) -> None:
+    """Guarantee `entry` has a live Discord channel, creating one if needed.
+
+    Resolution order, tightest-binding first:
+      1. If the entry has a snowflake and it resolves in this guild — use it.
+      2. Otherwise look for an existing text channel *by name* — adopt it. This
+         is what makes restart idempotent: a channel created last boot (recorded
+         in the id registry, but even if that were lost) is re-found, never
+         duplicated.
+      3. Otherwise create the text channel and persist its id.
+    Any newly-bound or changed id is written to CHANNEL_IDS_FILE so it survives
+    restart. An already-resolved snowflake is a no-op — no regression to static
+    routing."""
+    snowflake = entry.get('snowflake')
+    if snowflake is not None:
+        channel = await _resolve_existing(guild, snowflake)
+        if channel is not None:
+            # A snowflake that resolves as-is is static routing: leave it
+            # toml-driven and do NOT shadow it in the registry, so a later toml
+            # edit still takes effect. (The snowflake may itself have come from
+            # the registry via load_channels — that entry is already recorded.)
+            _wire_channel(entry, channel.id)
+            return
+        print(
+            f"bridget.channels: {entry['name']} snowflake {snowflake} is "
+            f"unresolvable in guild {guild.id}; resolving by name instead",
+            file=sys.stderr,
+        )
+
+    wanted = entry['channel_name']
+    existing = discord.utils.get(guild.text_channels, name=wanted)
+    if existing is not None:
+        print(f"bridget.channels: {entry['name']} adopting existing "
+              f"#{wanted} ({existing.id})", flush=True)
+        _wire_channel(entry, existing.id)
+        save_channel_id(entry['name'], existing.id)
+        return
+
+    try:
+        created = await guild.create_text_channel(
+            wanted,
+            reason=f'bridget auto-create for [channels.{entry["name"]}] '
+                   f'(agent {entry["agent"]})',
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"bridget.channels: failed to create #{wanted} for "
+              f"{entry['name']}: {e}", file=sys.stderr)
+        return
+    print(f"bridget.channels: created #{wanted} ({created.id}) for "
+          f"{entry['name']} (agent {entry['agent']})", flush=True)
+    _wire_channel(entry, created.id)
+    save_channel_id(entry['name'], created.id)
+
+
+async def resolve_and_wire_channels() -> None:
+    """Resolve every configured channel against the guild, creating any that are
+    missing, before the watchers start. Slice A of mg-2fea: this is what turns
+    the toml from a table of hand-wired snowflakes into a declaration of the
+    channels bridget should ensure exist."""
+    if not CHANNELS:
+        return
+    guild = client.get_guild(SERVER_ID)
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(SERVER_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"bridget.channels: guild {SERVER_ID} unreachable ({e}); "
+                  f"cannot auto-create channels — falling back to static "
+                  f"snowflake routing only", file=sys.stderr)
+            return
+    for entry in CHANNELS.values():
+        try:
+            await ensure_channel(guild, entry)
+        except Exception as e:
+            print(f"bridget.channels: error resolving {entry['name']}: {e}",
+                  file=sys.stderr)
 
 
 async def watch_idea_claims(user: discord.User):
@@ -2237,6 +2436,12 @@ async def on_ready():
     # Probes `mg mail send --help` once. Replies still deliver when this is
     # off; they just arrive as new top-level mail instead of threading.
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
+
+    # Auto-create + auto-wire any configured channel that has no live snowflake
+    # yet (Slice A, mg-2fea). Runs before the watchers so a freshly-created
+    # channel's id is already bound onto its entry when its watcher starts, and
+    # its inbound routing is registered before the first on_message.
+    await resolve_and_wire_channels()
 
     client.loop.create_task(watch_mailbox(user))
     client.loop.create_task(watch_task_transitions(user))

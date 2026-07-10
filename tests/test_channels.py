@@ -38,9 +38,15 @@ SCRIPT = REPO / 'bridget'
 
 
 def load_bridget(channels_toml: str | None = None,
-                 env_overrides: dict | None = None):
+                 env_overrides: dict | None = None,
+                 channel_ids: dict | None = None):
     """Import bridget into a fresh module namespace with a clean fake HOME and
-    optional channels.toml + env overrides. Returns the imported module."""
+    optional channels.toml + env overrides. Returns the imported module.
+
+    `channel_ids`, if given, seeds ~/.pogo/bridget.channel-ids.json (the
+    persisted name->snowflake registry) before import, so tests can exercise the
+    "resolve a persisted id on restart" path."""
+    import json as _json
     fake_home = Path(tempfile.mkdtemp(prefix='bridget-channels-test-'))
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
@@ -51,6 +57,8 @@ def load_bridget(channels_toml: str | None = None,
     )
     if channels_toml is not None:
         (env_dir / 'bridget.channels.toml').write_text(channels_toml)
+    if channel_ids is not None:
+        (env_dir / 'bridget.channel-ids.json').write_text(_json.dumps(channel_ids))
 
     keys_we_set = {'HOME', 'BRIDGET_REPO_DIR'}
     if env_overrides:
@@ -193,13 +201,24 @@ direction = "both"
         self.assertNotIn('broken', b.CHANNELS)
         self.assertIn('good', b.CHANNELS)
 
-    def test_missing_snowflake_skipped(self):
+    def test_missing_snowflake_loads_deferred_for_autocreate(self):
+        # Slice A (mg-2fea): a snowflake-less entry is no longer skipped — it
+        # loads with snowflake=None, absent from the inbound index until
+        # resolve_and_wire_channels() mints it a channel at startup.
         b = load_bridget(channels_toml='''
-[channels.broken]
-agent = "x"
+[channels.mayor-ops]
+agent = "mayor"
 direction = "both"
 ''')
-        self.assertEqual(b.CHANNELS, {})
+        self.assertIn('mayor-ops', b.CHANNELS)
+        entry = b.CHANNELS['mayor-ops']
+        self.assertIsNone(entry['snowflake'])
+        self.assertEqual(entry['agent'], 'mayor')
+        self.assertEqual(entry['channel_name'], 'mayor-ops')
+        # No id yet → not in the snowflake index...
+        self.assertEqual(b.CHANNELS_BY_SNOWFLAKE, {})
+        # ...but outbound fan-out (keyed by agent) still applies.
+        self.assertIn('mayor', b.OUTBOUND_BY_AGENT)
 
     def test_missing_agent_skipped(self):
         b = load_bridget(channels_toml='''
@@ -370,6 +389,242 @@ class ShippedExampleTest(unittest.TestCase):
                         'example must include at least one inbound channel')
         self.assertTrue(b.OUTBOUND_BY_AGENT,
                         'example must include at least one outbound channel')
+
+
+class _FakeChannel:
+    def __init__(self, cid, name, guild):
+        self.id = cid
+        self.name = name
+        self.guild = guild
+
+
+class _FakeGuild:
+    """Minimal stand-in for discord.Guild: name-keyed text channels plus a
+    create hook that records what bridget minted."""
+
+    def __init__(self, gid=2, channels=None):
+        self.id = gid
+        self.text_channels = list(channels or [])
+        self.created: list = []
+        self._next = 700000000000000000
+
+    def get_channel(self, snowflake):
+        for c in self.text_channels:
+            if c.id == snowflake:
+                return c
+        return None
+
+    async def create_text_channel(self, name, reason=None):
+        self._next += 1
+        ch = _FakeChannel(self._next, name, self)
+        self.text_channels.append(ch)
+        self.created.append(ch)
+        return ch
+
+
+def _install_discord_stubs(b, guild, fetch_channel=None):
+    """Give bridget's MagicMock `discord`/`client` the real bits the resolution
+    path needs: exception classes it catches, a working utils.get, and a
+    guild-returning client."""
+    import types
+
+    b.discord.NotFound = type('NotFound', (Exception,), {})
+    b.discord.Forbidden = type('Forbidden', (Exception,), {})
+    b.discord.HTTPException = type('HTTPException', (Exception,), {})
+
+    def _get(iterable, **attrs):
+        for item in iterable:
+            if all(getattr(item, k, None) == v for k, v in attrs.items()):
+                return item
+        return None
+
+    b.discord.utils = types.SimpleNamespace(get=_get)
+
+    async def _default_fetch(snowflake):
+        raise b.discord.NotFound()
+
+    b.client.get_guild = lambda gid: guild if gid == b.SERVER_ID else None
+    b.client.fetch_channel = fetch_channel or _default_fetch
+
+
+class ChannelIdRegistryTest(unittest.TestCase):
+    """The persisted name->snowflake registry (CHANNEL_IDS_FILE)."""
+
+    def test_save_then_load_round_trips(self):
+        b = load_bridget(channels_toml='')
+        b.save_channel_id('mayor-ops', 424242424242424242)
+        self.assertEqual(
+            b.load_channel_ids(), {'mayor-ops': 424242424242424242})
+        # File is owner-only (0600), like every other bridget state file.
+        mode = b.CHANNEL_IDS_FILE.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_load_missing_file_is_empty(self):
+        b = load_bridget(channels_toml='')
+        self.assertEqual(b.load_channel_ids(), {})
+
+    def test_corrupt_registry_does_not_raise(self):
+        b = load_bridget(channels_toml='')
+        b.CHANNEL_IDS_FILE.write_text('{not json')
+        self.assertEqual(b.load_channel_ids(), {})
+
+
+class ChannelNameDerivationTest(unittest.TestCase):
+    def test_derives_slug_from_label(self):
+        b = load_bridget(channels_toml='')
+        self.assertEqual(
+            b.discord_channel_name({'name': 'Mayor Ops!'}), 'mayor-ops')
+
+    def test_explicit_channel_key_wins(self):
+        b = load_bridget(channels_toml='')
+        self.assertEqual(
+            b.discord_channel_name({'name': 'x', 'channel': 'Cool Room'}),
+            'cool-room')
+
+    def test_empty_slug_falls_back(self):
+        b = load_bridget(channels_toml='')
+        self.assertEqual(
+            b.discord_channel_name({'name': '!!!'}), 'bridget-channel')
+
+
+class PersistedIdPrecedenceTest(unittest.TestCase):
+    """A registry id (bridget's own creation) wins over a toml snowflake for the
+    same name, so a channel bridget minted is never re-created because someone
+    left a stale hand-typed id in the toml."""
+
+    def test_registry_overrides_toml_snowflake(self):
+        b = load_bridget(
+            channels_toml='''
+[channels.mayor-ops]
+snowflake = "1111"
+agent = "mayor"
+direction = "both"
+''',
+            channel_ids={'mayor-ops': 999888777666555444},
+        )
+        entry = b.CHANNELS['mayor-ops']
+        self.assertEqual(entry['snowflake'], 999888777666555444)
+        self.assertIn(999888777666555444, b.CHANNELS_BY_SNOWFLAKE)
+        self.assertNotIn(1111, b.CHANNELS_BY_SNOWFLAKE)
+
+    def test_toml_used_when_no_registry_entry(self):
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+snowflake = "1111"
+agent = "mayor"
+direction = "both"
+''')
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], 1111)
+
+
+class EnsureChannelTest(unittest.TestCase):
+    """resolve_and_wire_channels / ensure_channel: create-if-missing, adopt by
+    name, resolve-persisted-on-restart, and no-op for a live snowflake."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def test_missing_snowflake_creates_and_persists(self):
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+agent = "mayor"
+direction = "both"
+''')
+        guild = _FakeGuild(gid=b.SERVER_ID)
+        _install_discord_stubs(b, guild)
+        self._run(b.resolve_and_wire_channels())
+
+        # A real channel was created, named from the label.
+        self.assertEqual(len(guild.created), 1)
+        created = guild.created[0]
+        self.assertEqual(created.name, 'mayor-ops')
+        entry = b.CHANNELS['mayor-ops']
+        # Wired: entry carries the id, inbound routing registered.
+        self.assertEqual(entry['snowflake'], created.id)
+        self.assertIs(b.CHANNELS_BY_SNOWFLAKE[created.id], entry)
+        # Persisted: survives restart.
+        self.assertEqual(b.load_channel_ids(), {'mayor-ops': created.id})
+
+    def test_restart_resolves_persisted_id_without_duplicate(self):
+        # Simulate the post-create restart: the id is in the registry, the
+        # channel exists in the guild. No new channel must be minted.
+        created_id = 700000000000000123
+        b = load_bridget(
+            channels_toml='''
+[channels.mayor-ops]
+agent = "mayor"
+direction = "both"
+''',
+            channel_ids={'mayor-ops': created_id},
+        )
+        # Loaded straight from the registry.
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], created_id)
+        existing = _FakeChannel(created_id, 'mayor-ops', None)
+        guild = _FakeGuild(gid=b.SERVER_ID, channels=[existing])
+        existing.guild = guild
+        _install_discord_stubs(b, guild)
+        self._run(b.resolve_and_wire_channels())
+        self.assertEqual(guild.created, [], 'must not re-create a live channel')
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], created_id)
+
+    def test_invalid_snowflake_creates_then_reuses_by_name(self):
+        # An entry with a bogus snowflake and no registry id: first boot must
+        # create a channel; a second boot (channel now exists by name) must
+        # adopt it rather than duplicate — even if the registry were lost.
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+snowflake = "1234"
+agent = "mayor"
+direction = "both"
+''')
+        guild = _FakeGuild(gid=b.SERVER_ID)  # 1234 does not exist here
+        _install_discord_stubs(b, guild)
+        self._run(b.resolve_and_wire_channels())
+        self.assertEqual(len(guild.created), 1)
+        created = guild.created[0]
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], created.id)
+
+        # Second boot: wipe the registry to prove name-adoption is what stops
+        # the duplicate, then reset the entry to its unresolved state.
+        b.CHANNEL_IDS_FILE.unlink()
+        b.CHANNELS['mayor-ops']['snowflake'] = 1234
+        b.CHANNELS_BY_SNOWFLAKE.clear()
+        self._run(b.resolve_and_wire_channels())
+        self.assertEqual(len(guild.created), 1, 'no duplicate on restart')
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], created.id)
+
+    def test_live_snowflake_is_noop_no_create(self):
+        live = _FakeChannel(5555, 'mayor-ops', None)
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+snowflake = "5555"
+agent = "mayor"
+direction = "both"
+''')
+        guild = _FakeGuild(gid=b.SERVER_ID, channels=[live])
+        live.guild = guild
+        _install_discord_stubs(b, guild)
+        self._run(b.resolve_and_wire_channels())
+        self.assertEqual(guild.created, [])
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], 5555)
+
+    def test_adopts_existing_channel_by_name(self):
+        # No snowflake, but a channel with the target name already exists: adopt
+        # it, don't create a second one.
+        preexisting = _FakeChannel(8888, 'mayor-ops', None)
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+agent = "mayor"
+direction = "both"
+''')
+        guild = _FakeGuild(gid=b.SERVER_ID, channels=[preexisting])
+        preexisting.guild = guild
+        _install_discord_stubs(b, guild)
+        self._run(b.resolve_and_wire_channels())
+        self.assertEqual(guild.created, [])
+        self.assertEqual(b.CHANNELS['mayor-ops']['snowflake'], 8888)
+        self.assertEqual(b.load_channel_ids(), {'mayor-ops': 8888})
 
 
 if __name__ == '__main__':

@@ -16,7 +16,9 @@
 # `guild_messages`) are non-privileged and bridget enables them automatically.
 #
 # Schema (per [channels.<name>] entry):
-#   snowflake  required  — Discord channel ID, as a quoted string of digits.
+#   snowflake  optional  — Discord channel ID, as a quoted string of digits.
+#                          OMIT it to have bridget auto-create the channel on
+#                          startup (see "Auto-create" below).
 #   agent      required  — Pogo agent name. Inbound free-form text is mailed
 #                          to this agent; outbound events involving this agent
 #                          fan out to the channel.
@@ -24,9 +26,24 @@
 #   kinds      optional  — Subset of ["mail", "task-transitions",
 #                          "idea-claims"]. Filters which outbound classes
 #                          fan out to this channel. Default: all three.
+#   channel    optional  — Discord channel NAME to create / resolve-by-name
+#                          when there is no snowflake. Default: the <name>
+#                          label, lowercased to Discord's channel-name rules.
 #
-# The <name> in [channels.<name>] is a local label used only in error
-# messages — it doesn't have to match the agent name or the channel name.
+# The <name> in [channels.<name>] is a local label. When you omit `snowflake`
+# it also seeds the created channel's name (unless `channel` overrides it), so
+# pick something channel-shaped.
+#
+# ── Auto-create (no snowflake needed) ────────────────────────────────────────
+# An entry with no `snowflake` is a channel bridget ensures exists: on startup
+# it looks for a text channel with the target name, adopts it if found, and
+# otherwise creates one (the bot needs the "Manage Channels" permission in the
+# guild). The resulting channel ID is written to
+# ~/.pogo/bridget.channel-ids.json so restarts resolve the same channel and
+# never make a duplicate. That registry ID takes precedence over a `snowflake`
+# you later hand-type for the same <name>. If a hand-typed snowflake can't be
+# resolved, bridget resolves the entry by name (adopt-or-create) instead of
+# retrying a dead id forever.
 
 # ── Example 1: a two-way operator channel ────────────────────────────────────
 # Type in #general → goes to mayor's mailbox. Mayor's outbound mail and task
@@ -54,6 +71,15 @@ kinds     = ["mail", "idea-claims"]
 snowflake = "333333333333333333"
 agent     = "ops"
 direction = "inbound"
+
+# ── Example 4: auto-created channel (no snowflake) ───────────────────────────
+# No snowflake: bridget creates (or adopts) a text channel named `mayor-ops`
+# on startup, wires it to the `mayor` agent both ways, and remembers its ID in
+# ~/.pogo/bridget.channel-ids.json so it's stable across restarts. Add
+# `channel = "some-other-name"` to control the created channel's name.
+[channels.mayor-ops]
+agent     = "mayor"
+direction = "both"
 
 # ── Notes on routing ─────────────────────────────────────────────────────────
 # - Workflow verbs (`approve`, `reject`, `revise`, `explain`, `next mg-XXXX`,

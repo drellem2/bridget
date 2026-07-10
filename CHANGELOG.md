@@ -12,6 +12,17 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **Auto-create per-agent channels.** A `[channels.<name>]` entry may now omit
+  `snowflake`: on startup bridget adopts an existing text channel of the target
+  name or creates one (needs *Manage Channels*), wires it to the agent, and
+  persists the resulting ID to `~/.pogo/bridget.channel-ids.json` so restarts
+  resolve the same channel and never duplicate it. The registry ID wins over a
+  later hand-typed snowflake for the same name, and an unresolvable snowflake
+  now falls through to resolve-by-name (adopt-or-create) instead of retrying a
+  dead ID forever. A new `channel` key overrides the created channel's name.
+  Already-valid snowflakes are untouched — static routing is unchanged. Removes
+  the manual snowflake hand-wiring that was the setup friction (mg-2fea, Slice
+  A). Per-topic channels (Slice B) remain out of scope.
 - **Conversation threads.** `BRIDGET_LOG_CHANNEL_ID` roots one Discord thread
   per mail conversation in a guild text channel. Conversations are keyed on the
   message that rooted them and matched by a message-id index over every message
