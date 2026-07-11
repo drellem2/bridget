@@ -27,8 +27,12 @@ resolves to exactly one `Ack`, and the adapter always renders it.
 An `Ack` is *data*, not a message: `kind` plus the facts behind it. It carries
 no emoji, no `**bold**`, and no character budget, because all three of those
 are Discord's opinions and this module is the part of the bridge that would be
-identical under Slack. The adapter turns an `Ack` into a string — see
-`render_ack` in the `bridget` script. Tests assert on `kind` and on the fields.
+identical under Slack. The adapter renders an `Ack` two ways: for a routed
+thread reply it becomes a *reaction* on the human's own message — ✅ / ❌ via
+`ack_reaction`, so the confirmation doesn't clutter the thread (mg-aefb); for
+the ambiguous case (which has to list candidates) it becomes text via
+`render_ack`. Both live in the `bridget` script. Tests assert on `kind` and on
+the fields, never on how a given surface chooses to draw it.
 """
 from __future__ import annotations
 

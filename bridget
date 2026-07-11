@@ -970,6 +970,15 @@ ACK_CANDIDATE_LIMIT = 5
 #: Muted conversations listed by the `settings` command before eliding.
 SETTINGS_MUTED_LIMIT = 10
 
+# A routed reply is acknowledged by *reacting on the human's own message*, not
+# by posting a text confirmation into the thread (mg-aefb). Daniel asked twice
+# to stop the "✅ delivered to `mayor`…" chatter cluttering the conversation;
+# the receipt/sent/failed signal now rides on his message as an emoji instead.
+# Silence is still never an outcome — see `ack_reaction`.
+ACK_EMOJI_RECEIVED = '👀'   #: added on receipt — "bridget saw your message".
+ACK_EMOJI_SENT = '✅'        #: added once the reply is actually mailed on.
+ACK_EMOJI_FAILED = '❌'      #: routing failed — a drop is never silent.
+
 
 def _elide(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + '…'
@@ -1009,6 +1018,41 @@ def render_ack(ack: acks.Ack) -> str:
     where = f' to `{ack.agent}`' if ack.agent else ''
     reason = _elide(ack.reason, ACK_REASON_LIMIT) or 'unknown error'
     return f'❌ undeliverable{where}: {reason}'
+
+
+async def _add_reaction(message, emoji: str) -> None:
+    """React on the human's message. A missing 'Add Reactions' permission (or
+    a deleted message) must not take down the handler, so failures are logged,
+    not raised — same posture as a failed `channel.send`."""
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException as e:
+        print(f'add_reaction {emoji} failed: {e}', file=sys.stderr)
+
+
+async def _remove_reaction(message, emoji: str) -> None:
+    """Take our own reaction back off. Best-effort: if it was never added (the
+    add was rate-limited) or the message is gone, there is nothing to undo."""
+    try:
+        await message.remove_reaction(emoji, client.user)
+    except discord.HTTPException as e:
+        print(f'remove_reaction {emoji} failed: {e}', file=sys.stderr)
+
+
+async def ack_reaction(message, ack: acks.Ack) -> None:
+    """Resolve the receipt reaction (👀) into the outcome, on the human's own
+    message (mg-aefb). This is the reaction counterpart of `render_ack`: the
+    core owns the outcome, the adapter renders it — here as an emoji rather
+    than a line of thread chatter.
+
+    👀 was added the moment the message arrived; here it becomes ✅ once the
+    mail is on its way, or ❌ if routing failed. The caller keeps the failure
+    *reason* as text — a bare ❌ with no "why" is a worse silence than the one
+    Daniel asked us to remove — but a success posts nothing at all, which is
+    the whole point.
+    """
+    await _remove_reaction(message, ACK_EMOJI_RECEIVED)
+    await _add_reaction(message, ACK_EMOJI_SENT if ack.ok else ACK_EMOJI_FAILED)
 
 
 def conversation_label(conv) -> str:
@@ -2273,13 +2317,19 @@ def handle_command(text: str) -> str:
     return UNRECOGNIZED_REPLY
 
 
-def handle_thread_message(text: str, conv) -> str:
-    """A message typed inside a conversation thread.
+def thread_command_reply(text: str, conv) -> str | None:
+    """Classify a message typed inside a conversation thread *without* routing it.
 
     `mute` / `unmute` act on *this* conversation — that is the whole ergonomic
     win of threads, since the human never has to name the thing they're looking
-    at. Anything else is a reply, mailed back to the agent with the reply
-    threaded onto the conversation.
+    at. Those, `help`, and an unambiguous workflow verb are commands, and this
+    returns their text reply. Anything else is a *reply* to mail back to the
+    agent: it returns `None`, and the caller both routes it and acknowledges it
+    with a reaction rather than a text post (mg-aefb).
+
+    Splitting classification from routing is what lets `on_message` add the 👀
+    receipt reaction *before* the (blocking) mg send, so the human sees "seen"
+    the instant they hit enter, then ✅/❌ once the send resolves.
     """
     low = text.strip().lower()
 
@@ -2304,7 +2354,7 @@ def handle_thread_message(text: str, conv) -> str:
         if reply != UNRECOGNIZED_REPLY:
             return reply
 
-    return render_ack(reply_in_conversation(text, conv))
+    return None
 
 
 def send_channel_chat_mail(text: str, agent: str) -> str:
@@ -2484,7 +2534,21 @@ async def on_message(message: discord.Message):
         if conv is None:
             return
         SETTINGS.reload_if_changed()
-        reply = handle_thread_message(message.content, conv)
+        # A thread command (mute / help / an unambiguous workflow verb) still
+        # answers with text. A plain reply, though, is acknowledged by reacting
+        # on the human's own message — not by a "✅ delivered…" post that
+        # clutters the very thread he's reading (mg-aefb). 👀 goes on first, so
+        # he sees "seen" the instant he hits enter; then the mg send resolves it
+        # to ✅, or to ❌ plus the reason (a bare ❌ would be a worse silence).
+        cmd = thread_command_reply(message.content, conv)
+        if cmd is None:
+            await _add_reaction(message, ACK_EMOJI_RECEIVED)
+            ack = reply_in_conversation(message.content, conv)
+            await ack_reaction(message, ack)
+            if not ack.ok:
+                await post_text(message.channel, render_ack(ack))
+            return
+        reply = cmd
     elif THREADS_ENABLED and channel.id == LOG_CHANNEL_ID:
         # Free-form text in the log channel itself, outside any thread. We
         # cannot know which conversation it answers — say so, and show what it
@@ -2501,12 +2565,19 @@ async def on_message(message: discord.Message):
             return
         reply = handle_channel_message(message.content, channel_entry)
 
-    if not reply:
+    await post_text(message.channel, reply)
+
+
+async def post_text(channel, text: str) -> None:
+    """Send a text reply, clamped under Discord's limit. A failed send is
+    logged, never raised — the handler must survive it (mirrors the reaction
+    helpers)."""
+    if not text:
         return
-    if len(reply) > DISCORD_MSG_LIMIT:
-        reply = reply[:DISCORD_MSG_LIMIT] + '…'
+    if len(text) > DISCORD_MSG_LIMIT:
+        text = text[:DISCORD_MSG_LIMIT] + '…'
     try:
-        await message.channel.send(reply)
+        await channel.send(text)
     except discord.HTTPException as e:
         print(f"reply send failed: {e}", file=sys.stderr)
 

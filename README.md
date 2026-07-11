@@ -253,15 +253,25 @@ or an `idea:` / `bug:` prefix. Bare words are not commands there — "status is
 green, ship it" is a reply, not a request for a status dump, and "dismiss all of
 that noise" will not inbox-zero you. In a DM, every command works as always.
 
-You always get an explicit acknowledgement:
+You always get an explicit acknowledgement — and for a reply, it rides on
+**your own message as a reaction**, not as a text post that would clutter the
+thread you're reading:
 
 | | |
 |---|---|
-| ✅ delivered | the mail went out, and to whom. |
-| ⚠️ ambiguous | bridget can't tell which conversation you meant (e.g. you typed in the log channel instead of in a thread). It lists the candidates. |
-| ❌ undeliverable | there's nowhere to send it, or `mg` refused — with the reason, verbatim. |
+| 👀 | bridget saw your message (added the instant you send it). |
+| ✅ | delivered — the mail went out. Replaces the 👀. |
+| ❌ | undeliverable — there's nowhere to send it, or `mg` refused. Replaces the 👀, and the reason is posted as text so the failure is never a bare cross. |
+
+`⚠️ ambiguous` is still text: it means bridget can't tell which conversation you
+meant (e.g. you typed in the log channel instead of in a thread), so it lists
+the candidates for you to pick from — something a single reaction can't do.
 
 Silence is never an outcome: if a reply didn't go, bridget says so.
+
+bridget only needs the **Add Reactions** permission in the log channel to draw
+these (no extra gateway intent — it adds reactions, it doesn't listen for
+yours). Without it, the ✅/❌ simply don't appear; delivery is unaffected.
 
 `--in-reply-to` ships in macguffin gh#66 and is **not** required. bridget probes
 `mg mail send --help` once (`BRIDGET_CORRELATION_IDS=auto`) and uses the flag if

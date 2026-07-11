@@ -138,11 +138,35 @@ class FakeAllowedMentions:
         return cls(everyone=False, users=False, roles=False)
 
 
+class FakeInboundMessage:
+    """A message the human typed, as `on_message` sees it: it carries its
+    channel and content, and records the reactions bridget puts on it — the ack
+    surface for a routed reply (mg-aefb)."""
+
+    def __init__(self, channel, content, author_id=1, is_bot=False):
+        self.channel = channel
+        self.content = content
+        self.author = types.SimpleNamespace(id=author_id, bot=is_bot)
+        self.reactions = []
+
+    async def add_reaction(self, emoji):
+        self.reactions.append(emoji)
+
+    async def remove_reaction(self, emoji, member):
+        # discord raises if the reaction was never there; the adapter's
+        # best-effort remove tolerates that, so mirror a lenient remove here.
+        if emoji in self.reactions:
+            self.reactions.remove(emoji)
+
+
 class FakeClient:
     def __init__(self, *a, **kw):
         self.channels = {}
         self._closed = False
         self.allowed_mentions = kw.get('allowed_mentions')
+        # The logged-in bot user; `remove_reaction` needs it to take its own
+        # reaction back off.
+        self.user = types.SimpleNamespace(id=999, bot=True)
 
     def event(self, fn):
         return fn
@@ -1195,6 +1219,86 @@ class TestReplyInConversation(unittest.TestCase):
         self.assertNotIn('out-1', self.b.CONVERSATIONS.get('id-1').message_ids)
 
 
+class TestAckReaction(unittest.IsolatedAsyncioTestCase):
+    """The reaction counterpart of `render_ack`: 👀 → ✅ / ❌ on the human's own
+    message (mg-aefb)."""
+
+    def setUp(self):
+        self.b = load_threaded()
+        self.msg = FakeInboundMessage(FakeThread(9001), 'looks good')
+
+    async def test_delivered_resolves_the_eyes_into_a_check(self):
+        self.msg.reactions = [self.b.ACK_EMOJI_RECEIVED]
+        await self.b.ack_reaction(self.msg, self.b.acks.delivered('mayor', 's'))
+        self.assertEqual(self.msg.reactions, [self.b.ACK_EMOJI_SENT])
+
+    async def test_undeliverable_resolves_the_eyes_into_a_cross(self):
+        self.msg.reactions = [self.b.ACK_EMOJI_RECEIVED]
+        await self.b.ack_reaction(self.msg, self.b.acks.undeliverable('boom', agent='mayor'))
+        self.assertEqual(self.msg.reactions, [self.b.ACK_EMOJI_FAILED])
+
+    async def test_a_missing_add_reactions_permission_does_not_raise(self):
+        async def boom(_):
+            raise FakeHTTPException('Missing Permissions')
+        self.msg.add_reaction = boom
+        # Must not propagate — a failed ack can't take down the handler.
+        await self.b.ack_reaction(self.msg, self.b.acks.delivered('mayor'))
+
+
+class TestThreadReplyAcksByReaction(unittest.IsolatedAsyncioTestCase):
+    """End-to-end through `on_message`: a reply in a conversation thread is
+    acknowledged by a reaction on the human's message, and posts *no* text into
+    the thread — the chatter Daniel asked us to remove (mg-aefb)."""
+
+    def setUp(self):
+        self.b = load_threaded()
+        self.b.MG_CAPS.mode = 'on'
+        self.thread = FakeThread(9001)
+        self.b.client.channels[9001] = self.thread
+        self.b.CONVERSATIONS.record('id-1', subject='design review', agent='mayor',
+                                    message_id='id-7')
+        self.b.CONVERSATIONS.bind_thread('id-1', 9001)
+
+    def _msg(self, content):
+        return FakeInboundMessage(self.thread, content, author_id=self.b.USER_ID)
+
+    async def test_a_delivered_reply_reacts_and_posts_nothing(self):
+        msg = self._msg('looks good')
+        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')):
+            await self.b.on_message(msg)
+        self.assertEqual(msg.reactions, [self.b.ACK_EMOJI_SENT])
+        self.assertEqual(self.thread.sent, [], 'a delivered reply must not post text')
+
+    async def test_a_failed_reply_reacts_with_a_cross_and_keeps_the_reason(self):
+        msg = self._msg('looks good')
+        with mock.patch.object(self.b, 'run_mg', return_value=(1, '', 'no such mailbox')):
+            await self.b.on_message(msg)
+        self.assertEqual(msg.reactions, [self.b.ACK_EMOJI_FAILED])
+        self.assertEqual(len(self.thread.sent), 1, 'a failure must not be a bare cross')
+        self.assertIn('no such mailbox', self.thread.sent[0])
+
+    async def test_a_thread_command_still_answers_with_text_and_no_reaction(self):
+        msg = self._msg('mute')
+        await self.b.on_message(msg)
+        self.assertEqual(msg.reactions, [], 'a command is not the ack surface')
+        self.assertEqual(len(self.thread.sent), 1)
+
+    async def test_the_eyes_go_on_before_the_send(self):
+        """👀 must be added *before* the (blocking) mg call, so the human sees
+        'seen' the instant they hit enter — not only once the send returns."""
+        msg = self._msg('looks good')
+        seen_during_send = []
+
+        def slow_send(_args):
+            seen_during_send.append(list(msg.reactions))
+            return (0, '', '')
+
+        with mock.patch.object(self.b, 'run_mg', side_effect=slow_send):
+            await self.b.on_message(msg)
+        self.assertEqual(seen_during_send, [[self.b.ACK_EMOJI_RECEIVED]],
+                         'the receipt reaction was not on the message during the send')
+
+
 class TestCorrelationIdSeam(unittest.TestCase):
     """The bridge must never hard-depend on `mg mail send --in-reply-to`.
 
@@ -1297,7 +1401,12 @@ class TestCorrelationIdSeam(unittest.TestCase):
         self.assertIn('off (forced)', self.b.handle_command('settings'))
 
 
-class TestHandleThreadMessage(unittest.TestCase):
+class TestThreadCommandReply(unittest.TestCase):
+    """`thread_command_reply` classifies a thread message *without* routing it: a
+    command (mute / help / an unambiguous workflow verb) returns its text reply,
+    a plain reply returns `None` so the caller routes it and acks by reaction
+    (mg-aefb). The routing itself is exercised through `on_message` below."""
+
     def setUp(self):
         self.b = load_threaded()
         # Pin the capability so a lazy probe doesn't consume a mocked run_mg call.
@@ -1307,41 +1416,45 @@ class TestHandleThreadMessage(unittest.TestCase):
         self.conv = self.b.CONVERSATIONS.get('id-1')
 
     def test_mute_in_thread_needs_no_argument(self):
-        out = self.b.handle_thread_message('mute', self.conv)
+        out = self.b.thread_command_reply('mute', self.conv)
         self.assertIn('muted', out.lower())
         self.assertTrue(self.b.SETTINGS.is_muted('id-1'))
 
     def test_mute_is_idempotent(self):
-        self.b.handle_thread_message('mute', self.conv)
-        self.assertIn('Already muted', self.b.handle_thread_message('mute', self.conv))
+        self.b.thread_command_reply('mute', self.conv)
+        self.assertIn('Already muted', self.b.thread_command_reply('mute', self.conv))
 
     def test_unmute_in_thread(self):
         self.b.SETTINGS.mute('id-1')
-        self.b.handle_thread_message('unmute', self.conv)
+        self.b.thread_command_reply('unmute', self.conv)
         self.assertFalse(self.b.SETTINGS.is_muted('id-1'))
 
     def test_unmute_when_not_muted_says_so(self):
-        self.assertIn('not muted', self.b.handle_thread_message('unmute', self.conv))
+        self.assertIn('not muted', self.b.thread_command_reply('unmute', self.conv))
 
-    def test_free_text_becomes_a_reply(self):
-        with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
-            out = self.b.handle_thread_message('sounds good to me', self.conv)
-        run.assert_called_once()
-        self.assertIn('delivered', out)
+    def test_free_text_is_a_reply_not_a_command(self):
+        """A plain reply is not a command: the classifier returns None and does
+        not route (no mg call), leaving `on_message` to mail and react."""
+        with mock.patch.object(self.b, 'run_mg') as run:
+            out = self.b.thread_command_reply('sounds good to me', self.conv)
+        self.assertIsNone(out)
+        run.assert_not_called()
 
     def test_workflow_verb_still_routes_to_the_workflow_agent(self):
         """`approve mg-1234` must mean the same thing in a thread as in a DM."""
         with mock.patch.object(self.b, 'run_mg', return_value=(0, 'ok', '')) as run:
-            self.b.handle_thread_message('approve mg-1234', self.conv)
+            out = self.b.thread_command_reply('approve mg-1234', self.conv)
+        self.assertIsNotNone(out, 'a workflow verb is a command, not a reply')
         joined = ' '.join(run.call_args_list[0][0][0])
         self.assertNotIn('--in-reply-to', joined)
 
     def test_help_in_thread_names_the_agent(self):
-        self.assertIn('mayor', self.b.handle_thread_message('help', self.conv))
+        self.assertIn('mayor', self.b.thread_command_reply('help', self.conv))
 
     def test_prose_starting_with_a_command_word_is_a_reply_not_a_command(self):
         """The bug: `handle_command` matches `status` with startswith, so a
-        genuine reply was swallowed and the agent never heard it."""
+        genuine reply was swallowed and the agent never heard it. As a reply,
+        the classifier returns None (→ `on_message` routes it to the agent)."""
         for text in ('status is green, ship it',
                      'dm the client tomorrow',
                      'restart the deploy when you can',
@@ -1352,17 +1465,17 @@ class TestHandleThreadMessage(unittest.TestCase):
                      'settings look right to me',
                      'dismiss all of that, it was noise'):
             with self.subTest(text=text):
-                with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
-                    out = self.b.handle_thread_message(text, self.conv)
-                self.assertIn('delivered', out, f'{text!r} was intercepted as a command')
-                args = run.call_args[0][0]
-                self.assertEqual(args[:3], ['mail', 'send', 'mayor'])
+                with mock.patch.object(self.b, 'run_mg') as run:
+                    out = self.b.thread_command_reply(text, self.conv)
+                self.assertIsNone(out, f'{text!r} was intercepted as a command')
+                run.assert_not_called()
 
     def test_dismiss_all_in_a_thread_does_not_touch_the_maildir(self):
         """`dismiss all of that` as prose must never inbox-zero the human."""
         with mock.patch.object(self.b, 'mark_mail_read') as marker, \
              mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')):
-            self.b.handle_thread_message('dismiss all of that noise', self.conv)
+            self.assertIsNone(
+                self.b.thread_command_reply('dismiss all of that noise', self.conv))
         marker.assert_not_called()
 
     def test_unambiguous_verbs_with_an_mg_id_are_still_commands(self):
@@ -1394,16 +1507,17 @@ class TestOnMessageRouting(unittest.IsolatedAsyncioTestCase):
         self.b.CONVERSATIONS.bind_thread('id-1', 9001)
 
     def _msg(self, channel, content, author_id=1, bot=False):
-        return types.SimpleNamespace(
-            author=types.SimpleNamespace(id=author_id, bot=bot),
-            channel=channel, content=content)
+        return FakeInboundMessage(channel, content, author_id=author_id, is_bot=bot)
 
     async def test_reply_in_known_thread_is_mailed(self):
         thread = FakeThread(9001)
+        msg = self._msg(thread, 'looks good')
         with mock.patch.object(self.b, 'run_mg', return_value=(0, '', '')) as run:
-            await self.b.on_message(self._msg(thread, 'looks good'))
+            await self.b.on_message(msg)
         self.assertIn('--in-reply-to=id-7', run.call_args[0][0])
-        self.assertIn('delivered', thread.sent[0])
+        # The ack is a reaction on the human's message, not text in the thread.
+        self.assertEqual(msg.reactions, [self.b.ACK_EMOJI_SENT])
+        self.assertEqual(thread.sent, [])
 
     async def test_message_in_unknown_thread_is_ignored(self):
         thread = FakeThread(4242)

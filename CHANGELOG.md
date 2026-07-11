@@ -314,6 +314,19 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Changed
 
+- **A reply is acknowledged by a reaction on your message, not a post in the
+  thread.** Typing a reply into a conversation thread used to draw a
+  `✅ delivered to \`mayor\` — …` line into the very thread you were reading;
+  Daniel asked twice to stop that chatter. bridget now reacts on your own
+  message instead: 👀 the instant you send it ("seen"), then ✅ once the mail is
+  on its way — or ❌ **plus** the reason as text, because a bare cross would be a
+  worse silence than the one removed. Routing (mail to the agent, threaded with
+  `--in-reply-to`) is unchanged; only the acknowledgement surface moved. The
+  `⚠️ ambiguous` case stays text — it has to list candidates for you to pick,
+  which a reaction can't. Needs the bot's **Add Reactions** permission in the log
+  channel; without it delivery is unaffected, the ✅/❌ just don't appear
+  (mg-aefb).
+
 - **A multi-line reply in a thread keeps the conversation's subject.** Typing
   two lines into a thread used to send the first as `--subject` and the rest as
   `--body`, mirroring the `mail` verb. Both lines are now body, and the subject
