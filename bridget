@@ -950,6 +950,61 @@ def code_block(body: str, budget: int | None = None) -> str:
     return f'```\n{body}\n```'
 
 
+#: Sentence-ending punctuation, plus any closing quote/bracket, followed by
+#: whitespace — the boundary a long paragraph is split on when it carries no
+#: line breaks. Deliberately naive: a split after "e.g. " costs only a slightly
+#: early break, never lost text.
+_SENTENCE_END_RE = re.compile(r'[.!?]["\')\]]*\s')
+
+
+def _find_break(text: str, limit: int) -> int:
+    """Where to cut `text` (which is longer than `limit`) so the head is at most
+    `limit` chars and lands on the softest boundary at or before it: a blank
+    line, else a line break, else a sentence end, else a word break. A single
+    token longer than `limit` is the only thing ever cut mid-word. Always
+    returns at least 1, so the caller makes progress."""
+    head = text[:limit + 1]
+    para = head.rfind('\n\n')
+    if para > 0:
+        return para
+    line = head.rfind('\n')
+    if line > 0:
+        return line
+    sentence = 0
+    for m in _SENTENCE_END_RE.finditer(head):
+        if m.end() <= limit:
+            sentence = m.end()
+    if sentence > 0:
+        return sentence
+    space = max(head.rfind(' '), head.rfind('\t'))
+    if space > 0:
+        return space
+    return limit
+
+
+def split_text(text: str, limit: int, first_limit: int | None = None) -> list[str]:
+    """Split `text` into ordered parts — the first at most `first_limit` chars
+    (default `limit`), the rest at most `limit` — breaking on the softest
+    boundary `_find_break` can reach. Nothing is dropped: the parts rejoined are
+    `text` minus only the whitespace consumed at each break point. Text that
+    already fits comes back as a single unchanged part. This is how a long
+    outbound reply is split across messages instead of truncated (mg-dcfc)."""
+    room = max(first_limit if first_limit is not None else limit, 1)
+    limit = max(limit, 1)
+    parts = []
+    remaining = text
+    while len(remaining) > room:
+        cut = _find_break(remaining, room)
+        head = remaining[:cut].rstrip()
+        if head:
+            parts.append(head)
+        remaining = remaining[cut:].lstrip()
+        room = limit
+    if remaining:
+        parts.append(remaining)
+    return parts or ['']
+
+
 # -- rendering the core's outcome types -------------------------------------
 #
 # `bridget_core` hands us facts: an Ack's `kind` and the fields behind it, a
@@ -1201,6 +1256,28 @@ async def resolve_thread(conv, mail: dict):
     return thread
 
 
+def thread_messages(header: str, body: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]:
+    """A mail body rendered for its thread as one or more fenced messages, each
+    under `limit`, to be sent in order.
+
+    A body that fits is a single message — `header` + one always-closed fence,
+    exactly as before. A longer one is split on a soft boundary (blank line,
+    line, sentence, word) and each part gets its own fence, so the *whole* body
+    reaches the thread (mg-dcfc) instead of the tail being lost to truncation
+    (mg-7e0c). The header rides the first part only: Discord groups a sender's
+    consecutive messages, and the thread name already carries the subject, so
+    the continuation parts read as one message without repeating it.
+
+    The body is defused once, up front — wrapping the already-defused chunks
+    cannot grow them past their budget, so every part stays under `limit`."""
+    body = defuse_fences(body or '(no body)')
+    first_room = limit - _FENCE_OVERHEAD - len(header)
+    rest_room = limit - _FENCE_OVERHEAD
+    chunks = split_text(body, rest_room, first_limit=first_room)
+    return [(header if i == 0 else '') + code_block(chunk)
+            for i, chunk in enumerate(chunks)]
+
+
 async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
     """Post `mail` into its conversation thread. Returns the thread URL, or ''
     if the thread could not be reached.
@@ -1220,14 +1297,17 @@ async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
         return ''
     if message_id and CONVERSATIONS.was_posted(conv.key, message_id):
         return thread_url(thread.id)
-    body = mail['body'] or '(no body)'
     header = defuse_fences(f"**{mail['from']}** — {mail['subject']}\n")
     if len(header) > MAIL_HEADER_LIMIT:
         header = header[:MAIL_HEADER_LIMIT - 2] + '…\n'
-    text = header + code_block(body, budget=DISCORD_MSG_LIMIT - len(header))
     try:
-        await thread.send(text)
+        for text in thread_messages(header, mail['body']):
+            await thread.send(text)
     except discord.HTTPException as e:
+        # A send that fails midway leaves earlier parts in the thread and does
+        # not mark_posted, so the whole mail is reposted on retry. A duplicate is
+        # the acceptable half of the at-least-once trade (see the docstring); a
+        # dropped tail is not.
         print(f'thread send failed ({thread.id}): {e}', file=sys.stderr)
         return ''
     if message_id:
@@ -2569,17 +2649,19 @@ async def on_message(message: discord.Message):
 
 
 async def post_text(channel, text: str) -> None:
-    """Send a text reply, clamped under Discord's limit. A failed send is
+    """Send a text reply. A reply longer than Discord's limit is split into
+    ordered parts on a soft boundary and sent in sequence rather than truncated
+    — the tail of a long reply is content, not noise (mg-dcfc). A failed send is
     logged, never raised — the handler must survive it (mirrors the reaction
-    helpers)."""
+    helpers); the remaining parts are abandoned rather than spamming the error."""
     if not text:
         return
-    if len(text) > DISCORD_MSG_LIMIT:
-        text = text[:DISCORD_MSG_LIMIT] + '…'
-    try:
-        await channel.send(text)
-    except discord.HTTPException as e:
-        print(f"reply send failed: {e}", file=sys.stderr)
+    for part in split_text(text, DISCORD_MSG_LIMIT):
+        try:
+            await channel.send(part)
+        except discord.HTTPException as e:
+            print(f"reply send failed: {e}", file=sys.stderr)
+            return
 
 
 if __name__ == '__main__':

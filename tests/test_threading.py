@@ -1631,5 +1631,182 @@ class TestSettingsCommands(unittest.TestCase):
         self.assertEqual(b.handle_command('flibbertigibbet'), b.UNRECOGNIZED_REPLY)
 
 
+# --- splitting a long outbound message instead of truncating (mg-dcfc) ------
+
+class TestSplitText(unittest.TestCase):
+    def setUp(self):
+        self.b = load_bridget()
+
+    def test_short_text_is_one_unchanged_part(self):
+        self.assertEqual(self.b.split_text('hello there', 1900), ['hello there'])
+
+    def test_every_part_is_within_the_limit(self):
+        parts = self.b.split_text('x' * 5000, 1900)
+        self.assertTrue(all(len(p) <= 1900 for p in parts))
+
+    def test_content_is_never_dropped(self):
+        """A single unbreakable token is the one thing cut mid-word — and even
+        then every character survives, spread across the parts in order."""
+        parts = self.b.split_text('x' * 5000, 1900)
+        self.assertEqual(''.join(parts), 'x' * 5000)
+
+    def test_it_breaks_on_a_newline_when_it_can(self):
+        text = 'a' * 100 + '\n' + 'b' * 100
+        self.assertEqual(self.b.split_text(text, 150), ['a' * 100, 'b' * 100])
+
+    def test_it_prefers_a_blank_line_to_a_bare_one(self):
+        text = 'a' * 40 + '\n' + 'b' * 40 + '\n\n' + 'c' * 40
+        parts = self.b.split_text(text, 100)
+        # The paragraph break wins: the first two lines stay together.
+        self.assertEqual(parts[0], 'a' * 40 + '\n' + 'b' * 40)
+        self.assertEqual(parts[1], 'c' * 40)
+
+    def test_it_never_splits_mid_word_when_a_space_is_available(self):
+        parts = self.b.split_text('ab ' * 100, 50)
+        self.assertTrue(len(parts) > 1)
+        self.assertTrue(all(tok == 'ab' for p in parts for tok in p.split()))
+
+    def test_it_breaks_on_a_sentence_end_in_a_long_paragraph(self):
+        text = ('This is one. ' * 40).strip()  # no newlines at all
+        parts = self.b.split_text(text, 100)
+        self.assertTrue(len(parts) > 1)
+        # No part ends mid-sentence: each ends on the '.' of "one."
+        self.assertTrue(all(p.endswith('one.') for p in parts))
+
+    def test_the_first_part_can_carry_a_smaller_budget(self):
+        parts = self.b.split_text('word ' * 200, 100, first_limit=20)
+        self.assertLessEqual(len(parts[0]), 20)
+        self.assertTrue(all(len(p) <= 100 for p in parts[1:]))
+
+    def test_order_is_preserved(self):
+        text = '\n'.join(f'line{i}' for i in range(500))
+        parts = self.b.split_text(text, 200)
+        rejoined = '\n'.join(parts)
+        self.assertEqual(
+            [ln for ln in rejoined.split('\n') if ln],
+            [f'line{i}' for i in range(500)])
+
+
+class TestThreadMessages(unittest.TestCase):
+    def setUp(self):
+        self.b = load_bridget()
+
+    def _fences(self, text):
+        import re
+        return re.findall('`{3,}', text)
+
+    def test_a_short_body_is_a_single_headed_message(self):
+        msgs = self.b.thread_messages('**mayor** — hi\n', 'a short reply')
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(msgs[0].startswith('**mayor** — hi\n'))
+        self.assertIn('a short reply', msgs[0])
+        self.assertTrue(msgs[0].rstrip().endswith('```'))
+
+    def test_a_long_body_becomes_several_messages_each_within_the_limit(self):
+        body = ('paragraph text goes here. ' * 400).strip()
+        msgs = self.b.thread_messages('**mayor** — big\n', body)
+        self.assertTrue(len(msgs) > 1)
+        self.assertTrue(all(len(m) <= self.b.DISCORD_MSG_LIMIT for m in msgs))
+
+    def test_the_whole_body_survives_the_split(self):
+        body = 'START ' + ('middle ' * 500) + 'FINALTOKEN'
+        msgs = self.b.thread_messages('**mayor** — big\n', body)
+        self.assertIn('START', msgs[0])
+        self.assertIn('FINALTOKEN', msgs[-1])
+        # Nothing was elided: the truncation ellipsis never appears.
+        self.assertNotIn('…', ''.join(msgs))
+
+    def test_only_the_first_part_carries_the_header(self):
+        body = ('line of text\n' * 400)
+        msgs = self.b.thread_messages('**mayor** — big\n', body)
+        self.assertTrue(msgs[0].startswith('**mayor** — big\n'))
+        self.assertTrue(all(not m.startswith('**mayor**') for m in msgs[1:]))
+
+    def test_every_part_is_a_closed_fence(self):
+        body = ('some content here\n' * 400)
+        msgs = self.b.thread_messages('**mayor** — big\n', body)
+        for m in msgs:
+            self.assertEqual(len(self._fences(m)), 2)
+            self.assertTrue(m.rstrip().endswith('```'))
+
+    def test_a_fence_in_the_body_cannot_escape_any_part(self):
+        body = ('```python\nprint(1)\n```\n' * 200)
+        msgs = self.b.thread_messages('**mayor** — code\n', body)
+        # Every message has exactly our own two fences — the body's are defused.
+        for m in msgs:
+            self.assertEqual(len(self._fences(m)), 2)
+
+    def test_an_empty_body_still_renders_one_block(self):
+        msgs = self.b.thread_messages('**mayor** — hi\n', '')
+        self.assertEqual(len(msgs), 1)
+        self.assertIn('(no body)', msgs[0])
+
+
+class TestPostToThreadSplits(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.b = load_threaded()
+        self.channel = FakeTextChannel(555, client=self.b.client)
+        self.b.client.channels[555] = self.channel
+        self.user = FakeUser()
+
+    async def test_a_long_reply_arrives_in_multiple_thread_messages(self):
+        body = 'HEADSTART ' + ('reply body ' * 600) + 'TAILEND'
+        await self.b.deliver_mail(self.user, 'f1', mail(body=body, msg_id='id-1'))
+        sent = self.channel.threads[0].sent
+        self.assertTrue(len(sent) > 1, 'a 6000-char reply should span >1 message')
+        self.assertIn('HEADSTART', sent[0])
+        self.assertIn('TAILEND', sent[-1], 'the tail must not be dropped')
+        self.assertTrue(all(len(m) <= self.b.DISCORD_MSG_LIMIT for m in sent))
+
+    async def test_a_short_reply_is_still_a_single_message(self):
+        await self.b.deliver_mail(self.user, 'f1', mail(body='ok', msg_id='id-1'))
+        self.assertEqual(len(self.channel.threads[0].sent), 1)
+
+    async def test_a_split_reply_is_still_posted_once(self):
+        """The was_posted guard is per-mail: a redelivery of a multi-part mail
+        must not double every part."""
+        body = ('reply body ' * 600)
+        await self.b.deliver_mail(self.user, 'f1', mail(body=body, msg_id='id-1'))
+        first = len(self.channel.threads[0].sent)
+        await self.b.deliver_mail(self.user, 'f1', mail(body=body, msg_id='id-1'))
+        self.assertEqual(len(self.channel.threads[0].sent), first)
+
+
+class TestPostTextSplits(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.b = load_bridget()
+
+    async def test_a_long_reply_is_split_not_truncated(self):
+        channel = FakeDMChannel()
+        text = 'HEAD ' + ('word ' * 700) + 'TAIL'
+        await self.b.post_text(channel, text)
+        self.assertTrue(len(channel.sent) > 1)
+        self.assertIn('HEAD', channel.sent[0])
+        self.assertIn('TAIL', channel.sent[-1])
+        self.assertNotIn('…', ''.join(channel.sent))
+        self.assertTrue(all(len(m) <= self.b.DISCORD_MSG_LIMIT for m in channel.sent))
+
+    async def test_a_short_reply_is_a_single_send(self):
+        channel = FakeDMChannel()
+        await self.b.post_text(channel, 'just a line')
+        self.assertEqual(channel.sent, ['just a line'])
+
+    async def test_an_empty_reply_sends_nothing(self):
+        channel = FakeDMChannel()
+        await self.b.post_text(channel, '')
+        self.assertEqual(channel.sent, [])
+
+    async def test_a_failed_send_abandons_the_rest_quietly(self):
+        class Flaky(FakeDMChannel):
+            async def send(self, content):
+                self.sent.append(content)
+                raise FakeHTTPException('429')
+
+        channel = Flaky()
+        # Must not raise, and must stop after the first failure.
+        await self.b.post_text(channel, 'word ' * 700)
+        self.assertEqual(len(channel.sent), 1)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

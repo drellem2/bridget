@@ -107,6 +107,21 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **A long reply to the user was truncated; now it is split.** Outbound text
+  past Discord's per-message limit (~1900 chars) used to be chopped with a
+  trailing `…`, and the tail was lost. An agent's mail body posted into its
+  conversation thread, and any command/ack reply, are now split across as many
+  messages as they need and sent in order — nothing is dropped (mg-dcfc, the
+  outbound complement of the mg-7e0c "never truncate the payload" rule). Parts
+  break on the softest boundary available at or before the limit — a blank
+  line, else a line, else a sentence end, else a word — so a split never lands
+  mid-word unless a single token is itself longer than a whole message. Each
+  thread part carries its own always-closed code fence; the sender/subject
+  header rides the first part only, since Discord groups a sender's consecutive
+  messages and the thread name already holds the subject. The DM card is
+  unchanged: it stays a compact preview by design, with the full text one tap
+  away in the thread (or via `read <mg-id>`), so no content is lost there.
+
 - **The task-transition watcher died silently on a transient `mg list`
   timeout.** A single `mg command timed out` — which fires even at rest, where
   `mg list` benchmarks at ~0.01s, so it is a transient flake and not contention —

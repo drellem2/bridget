@@ -205,6 +205,14 @@ a thread.) So the log channel is where conversations live, and the DM keeps its
 job as the place bridget taps you on the shoulder. A DM card links straight to
 its thread.
 
+The thread is the full-text reading surface: a reply too long for one Discord
+message (~1900 chars) is **split across several messages** in order, never
+truncated, so the tail of a long answer is not lost. Splits fall on the softest
+boundary at or before the limit — a blank line, else a line, else a sentence,
+else a word — so a break lands mid-word only for a single token longer than a
+whole message. The DM card stays a compact preview by design; the whole text is
+in the thread (or a `read <mg-id>` away).
+
 The bot needs **View Channel**, **Send Messages**, **Create Public Threads**, and
 **Send Messages in Threads** on that channel. Point `BRIDGET_LOG_CHANNEL_ID` at a
 text channel; a category, voice channel, or DM will be reported at startup rather
