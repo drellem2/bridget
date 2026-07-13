@@ -37,6 +37,10 @@ python3 tests/test_task_transitions.py
 # verbatim, while every label cut from it (the ack echo, the mg title) carries
 # a visible '…'. Stubs discord; runs under system python3.
 python3 tests/test_dm_echo.py
+# The read-only 'on your plate' view (mg-3358): `mine` renders
+# `mg list --assignee=human` into Discord, separating outstanding from resolved,
+# and — the conservative-first-cut guarantee — mutates nothing. Stubs discord.
+python3 tests/test_assigned_view.py
 # The watch_task_transitions silent-death fix (mg-3499): a single transient
 # `mg list` timeout must not kill the watcher thread, and a liveness heartbeat
 # whose mtime ticks every cycle must go stale only when the watcher is truly

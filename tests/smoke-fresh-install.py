@@ -75,6 +75,7 @@ def main() -> int:
         'dismiss mg-deadbeef',
         'mail smoke subject\nsmoke body',
         'status',
+        'mine',
         'agents',
     ]
 

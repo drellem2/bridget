@@ -166,6 +166,12 @@ and `discord.py`'s own logging is disabled (`log_handler=None`).
 - `dismiss mg-XXXX` — mark all unread mail about an mg-id as read.
 - `dismiss all` — inbox-zero everything.
 - `status` — global pull view (unread mail + in-flight work).
+- `mine` (or `outstanding`) — a read-only "what's on my plate" view: the work
+  items assigned to you, split into **outstanding** (anything not yet done) and
+  a trailing count of the **recently resolved**, plus any approval requests
+  awaiting your decision. Source of truth is `mg list --assignee=human`; the
+  command mutates nothing. See [Outstanding-vs-resolved UX](docs/outstanding-ux.md)
+  for the design and the thread-level marking / auto-archive follow-ons.
 - `agents` — list crew agents and health.
 - `balance` — check whether any agent is hitting credit balance errors.
 - `nudge <agent> [reason]` — wake a stalled agent.

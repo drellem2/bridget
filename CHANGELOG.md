@@ -12,6 +12,18 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **`mine` — a read-only "what's on my plate" view.** DM `mine` (aliases
+  `outstanding` / `plate`) to see the work items assigned to you, split into
+  **outstanding** (anything not yet `done`, ordered pending → claimed →
+  available) and a trailing count of the **recently resolved**, plus any
+  approval requests awaiting your decision. Source of truth is `mg list
+  --assignee=human`; the command mutates nothing — it marks no mail read,
+  archives no thread. This is the first, always-safe slice of mg-3358 (surface
+  resolved-vs-outstanding + assigned-to-me). The two mutating follow-ons —
+  reflecting `done` onto a thread, and auto-archiving resolved/old threads — are
+  designed in `docs/outstanding-ux.md` and gated on sign-off, not shipped,
+  because the bridge is Daniel's live fleet-tracking surface and a wrong
+  auto-archive would hide outstanding work.
 - **Auto-create per-agent channels.** A `[channels.<name>]` entry may now omit
   `snowflake`: on startup bridget adopts an existing text channel of the target
   name or creates one (needs *Manage Channels*), wires it to the agent, and

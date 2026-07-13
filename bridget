@@ -187,6 +187,7 @@ COMMAND_LIST = (
     "• `dismiss mg-XXXX` — mark all unread mail about an mg-id as read\n"
     "• `dismiss all` — inbox-zero everything\n"
     "• `status` — global pull view (unread mail + in-flight work)\n"
+    "• `mine` (or `outstanding`) — work assigned to you: outstanding vs resolved, + approvals\n"
     "• `agents` — list crew agents and health\n"
     "• `balance` — check whether any agent is hitting credit balance errors\n"
     "• `nudge <agent> [reason]` — wake a stalled agent\n"
@@ -1993,6 +1994,78 @@ def get_status_summary() -> str:
     return '\n'.join(parts)
 
 
+#: Work-item statuses that count as *outstanding* — still on the human's plate.
+#: `done` is the resolved state; `archived`/`shelved` are off the active surface
+#: and `mg list` hides them by default anyway. Ordered so the view leads with the
+#: items most likely to be waiting on the human: `pending` (blocked/awaiting),
+#: then `claimed` (in progress), then `available` (not yet picked up).
+OUTSTANDING_STATUSES = ('pending', 'claimed', 'available')
+
+
+def get_assigned_view() -> str:
+    """Read-only 'what's on my plate' pull view (mg-3358).
+
+    Daniel's papercut: the bridge could tell him what mail was unread, but not
+    what *work* was assigned to him or awaiting his input, nor cleanly separate
+    what he's already resolved from what's still outstanding. mg already knows
+    all of this — `assignee=human` is the source of truth — so this view just
+    renders it into the Discord surface.
+
+    Outstanding = any non-done item assigned to the human, plus the approval
+    requests sitting unread in his inbox (the two ways work lands on him).
+    Resolved = the recently-done items, shown only as a trailing count so the
+    outstanding/resolved distinction is visible without burying the plate.
+
+    Deliberately **read-only**: it mutates no thread, marks nothing read, and
+    archives nothing. Anything that would touch Daniel's live surface (marking a
+    thread resolved, auto-archiving) is proposed in docs/outstanding-ux.md and
+    gated on his sign-off, not shipped here.
+    """
+    rc, out, err = run_mg(['list', '--assignee=human', '--json'])
+    if rc != 0:
+        return f'✗ mg list failed: {(err or out).strip()[:200]}'
+
+    items = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+
+    outstanding = [d for d in items if d.get('status') in OUTSTANDING_STATUSES]
+    resolved = [d for d in items if d.get('status') == 'done']
+    approvals = scan_pending_approvals()
+
+    parts = [f'🧑 **On your plate — {len(outstanding)} outstanding**']
+    if outstanding:
+        rank = {s: i for i, s in enumerate(OUTSTANDING_STATUSES)}
+        for d in sorted(outstanding, key=lambda d: rank.get(d.get('status'), 9)):
+            iid = d.get('id', '?')
+            status = d.get('status', '?')
+            title = _elide(d.get('title') or '?', TASK_TITLE_LABEL_LIMIT)
+            repo = (d.get('repo') or '').rstrip('/').rsplit('/', 1)[-1]
+            scope = f' · {repo}' if repo else ''
+            parts.append(f'• [{iid}] {status}{scope}: {title}')
+    else:
+        parts.append('  (nothing assigned to you)')
+
+    if approvals:
+        parts.append(f'\n📋 **Awaiting your approval ({len(approvals)}):**')
+        for s in approvals:
+            parts.append(f'• {s}')
+
+    if resolved:
+        parts.append(
+            f'\n✅ **Recently resolved:** {len(resolved)} '
+            f'(assigned to you, now done)'
+        )
+
+    return '\n'.join(parts)
+
+
 def handle_command(text: str) -> str:
     text = text.strip()
     low = text.lower()
@@ -2383,6 +2456,12 @@ def handle_command(text: str) -> str:
     if low in ('mute', 'unmute'):
         return (f'Reply `{low}` inside a conversation thread to act on that '
                 f'conversation, or `{low} all` to act on every DM.')
+
+    if low in ('mine', 'outstanding', 'plate') or low == 'assigned to me':
+        view = get_assigned_view()
+        if len(view) > STATUS_OUTPUT_BUDGET:
+            view = view[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+        return view
 
     if low == 'status' or low.startswith('status'):
         summary = get_status_summary()
