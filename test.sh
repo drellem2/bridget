@@ -46,6 +46,12 @@ python3 tests/test_assigned_view.py
 # whose mtime ticks every cycle must go stale only when the watcher is truly
 # dead. Injects the timeout and kills a real watcher BY PID; no live Discord.
 python3 tests/test_watcher_liveness.py
+# The delivery-wedge resilience fix (mg-e5b8): a STORM of `mg list` timeouts must
+# not stop outbound delivery (mg now runs off the event loop, so a hung mg cannot
+# starve the delivery watcher), and a NEW delivery-liveness heartbeat must go
+# stale the moment mail stops reaching Discord — the ~70h wedge the loop
+# heartbeat was blind to. Storms mg, wedges delivery; no live Discord.
+python3 tests/test_delivery_liveness.py
 # bridget-supervise + the launchd plist template. Calls no launchctl, so it
 # runs on Linux too.
 python3 tests/test_launchd.py

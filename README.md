@@ -675,6 +675,37 @@ job to `[reaper]` as `com.pogo.bridget|~/.pogo/health/bridget.heartbeat|<period>
 kickstart` a stale watcher instead of trusting KeepAlive, which only reacts to
 process *exit*.
 
+#### The loop is alive — but is mail actually being delivered?
+
+`bridget.heartbeat` proves the task-transition **loop** is scheduled. It does
+**not** prove mail is reaching Discord, and the difference is not academic: a
+*storm* of `mg list` timeouts once blocked the shared event loop long enough that
+Discord dropped the gateway socket and outbound delivery died for **~70h** — yet
+`bridget.heartbeat` kept ticking the whole time, because the poller that touches
+it does not need Discord to run (mg-e5b8). Nothing watching that file could have
+caught the wedge. So there is a second, narrower heartbeat:
+
+```bash
+stat -f '%Sm' ~/.pogo/health/bridget.delivery.heartbeat   # DELIVERY liveness
+```
+
+The mail watcher touches this **only at the end of a poll cycle that actually
+delivered — or had nothing to deliver — with no send failure.** The moment mail
+is queued and every send fails (Discord down, rate-limited, socket dropped), or
+the delivery loop stops iterating at all, its mtime **freezes** while
+`bridget.heartbeat` may keep advancing. Declare it to the reaper the same way,
+alongside the loop heartbeat:
+
+```
+com.pogo.bridget|~/.pogo/health/bridget.delivery.heartbeat|<period>
+```
+
+Watch **both**: the loop beat catches a dead *watcher thread*; the delivery beat
+catches a *wedged delivery path* that leaves the thread alive. Liveness has to
+reflect the work, not just the loop. (Under the hood, the storm that caused this
+also no longer freezes the loop: the pollers now run `mg` off the event loop, so
+a hung `mg` degrades the pollers without starving delivery — see CHANGELOG.)
+
 (`~/.pogo/bridget.task-states.json` also advances on a normal poll, but it is
 *not* a reliable heartbeat: on an `mg list` timeout the watcher skips the write
 and retries, so the task-states mtime freezes during exactly the burst you would

@@ -163,6 +163,61 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   *tuning* was deliberately not treated as the fix: the trigger is a flake, so
   the thread must survive regardless of the timeout value (mg-3499).
 
+- **A *storm* of `mg list` timeouts wedged outbound delivery for ~70h while the
+  process and heartbeat stayed alive.** The mg-3499 fix survived a *single*
+  transient timeout; it did not survive a sustained flood. Root cause: `run_mg`
+  is a synchronous `subprocess.run(..., timeout=30)` called directly from the
+  async poll loops, so a hung `mg` blocked the **entire** shared event loop for
+  up to 30s per call. Back-to-back timeouts kept the loop blocked cycle after
+  cycle; discord.py could not service its gateway heartbeat, Discord dropped the
+  socket, and outbound delivery — `watch_mailbox`, a *different* task on the same
+  loop — starved for ~70h, silently eating the human's mail. Yet
+  `~/.pogo/health/bridget.heartbeat` kept ticking the whole time, because the
+  task-transition poller that touches it does not need Discord to run: it is a
+  **loop** heartbeat, not a **delivery** heartbeat, so nothing watching it fired
+  (mg-e5b8, recurrence of mg-3499).
+
+  Three changes, defense in depth:
+
+  1. **The pollers run `mg` off the event loop** (`run_mg_async` →
+     `run_in_executor`). A slow or hung `mg` now degrades the pollers without
+     freezing the loop, so the delivery watcher, the gateway heartbeat, and
+     inbound handling all keep running through a storm. This is the root-cause
+     fix for "an mg storm stops delivery." `watch_idea_claims` also gained the
+     bounded, capped backoff `watch_task_transitions` already had — it had none,
+     and was a second engine hammering a loop-blocking `mg list` every poll.
+
+  2. **A delivery-liveness heartbeat, `~/.pogo/health/bridget.delivery.heartbeat`.**
+     The mail watcher touches it only at the end of a poll cycle that actually
+     delivered — or had nothing to deliver — with **no send failure**. The moment
+     mail is queued and sends fail (or the delivery loop stops iterating), its
+     mtime freezes while the loop heartbeat may keep advancing — so a reaper can
+     finally catch this wedge. Declare it under `[reaper]` alongside the loop
+     heartbeat as
+     `com.pogo.bridget|~/.pogo/health/bridget.delivery.heartbeat|<period>`.
+     Liveness must reflect the work, not just the loop.
+
+  3. **A loud storm breadcrumb.** After a threshold of *consecutive* `mg list`
+     timeouts the poller logs one distinct storm line (rate-limited to the rising
+     edge), so a burst is greppable instead of hiding among per-cycle timeout
+     lines. The watcher still does not self-exit — it is the delivery heartbeat
+     going stale, not a self-kill, that drives the reaper's respawn.
+
+  `tests/test_delivery_liveness.py` storms `mg` (blocked in its worker thread the
+  whole window) and proves a mail dropped mid-storm still reaches the user, that
+  `run_mg_async` keeps the loop running while `mg` is blocked, and that the
+  delivery heartbeat ticks on healthy cycles but **freezes** the moment every
+  send fails — the positive control that it *can* go stale on a real wedge.
+
+  *Why `mg list` times out inside bridget at all* was investigated in parallel
+  and left as a follow-up (report, not forced): the store has no lock and shows
+  no contention even at 8× concurrency, but the task-transition poller passes
+  `--all`, which walks ~3000 archive-tombstone files every 5s (vs ~14 without
+  it); under I/O/fd pressure that cold directory walk is what stalls past 30s.
+  Dropping `--all` from that poller and/or compacting archive tombstones is a
+  macguffin/bridget follow-up, tracked separately so this change stays scoped to
+  surviving the storm rather than preventing it.
+
 - **Inbound messages were silently truncated at 200 characters.** Free-form chat
   in a mapped channel put the *entire message* in `--subject` whenever it had no
   newline, leaving the body as the literal string `(no body)`. `build_send_args`
