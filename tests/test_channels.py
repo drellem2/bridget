@@ -290,6 +290,48 @@ kinds = ["task-transitions"]
         self.assertEqual(b.outbound_targets('mayor', 'mail'), [])
 
 
+class ChannelsStatusLineTest(unittest.TestCase):
+    """The `settings` / startup one-liner that makes DM-only mode visible, so a
+    missing bridget.channels.toml is self-diagnosable rather than a silent
+    "everything lands in the log channel"."""
+
+    def test_no_file_reports_off_and_names_the_file(self):
+        b = load_bridget(channels_toml=None)
+        line = b.channels_status_line()
+        self.assertIn('off', line)
+        self.assertIn('DM-only', line)
+        # Names the exact file the operator must create to turn routing on.
+        self.assertIn(str(b.CHANNELS_FILE), line)
+
+    def test_empty_channels_table_reports_off(self):
+        b = load_bridget(channels_toml='')
+        self.assertIn('off', b.channels_status_line())
+
+    def test_configured_channels_report_on_with_agents(self):
+        b = load_bridget(channels_toml='''
+[channels.mayor-ops]
+snowflake = "9999"
+agent = "mayor"
+direction = "both"
+
+[channels.ops]
+snowflake = "8888"
+agent = "ops"
+direction = "inbound"
+''')
+        line = b.channels_status_line()
+        self.assertIn('on', line)
+        self.assertIn('2 channel(s)', line)
+        self.assertIn('mayor', line)
+        self.assertIn('ops', line)
+
+    def test_render_settings_includes_routing_status(self):
+        b = load_bridget(channels_toml=None)
+        out = b.render_settings(b.SETTINGS.summary())
+        self.assertIn('Per-channel routing:', out)
+        self.assertIn('off', out)
+
+
 class HandleChannelMessageTest(unittest.TestCase):
     """Inbound routing: workflow verbs continue to route through
     WORKFLOW_AGENT; free-form chat becomes a mail to the channel's agent."""

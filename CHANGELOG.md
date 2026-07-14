@@ -12,6 +12,14 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **Per-channel routing is now visible in `settings` and at startup.** The
+  `settings` command and the startup log both report whether per-agent routing
+  is on (`N channel(s); agent(s): …`) or off. When it is off because no
+  `~/.pogo/bridget.channels.toml` exists, the line says so and names the file to
+  create. Previously the DM-only fallback was silent, so a missing config file
+  looked identical to a routing bug — "everything still lands in the log
+  channel" was undiagnosable without reading the source (mg-8bff). Behavior is
+  unchanged; this only surfaces the existing state.
 - **`mine` — a read-only "what's on my plate" view.** DM `mine` (aliases
   `outstanding` / `plate`) to see the work items assigned to you, split into
   **outstanding** (anything not yet `done`, ordered pending → claimed →

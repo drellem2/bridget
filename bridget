@@ -1117,11 +1117,30 @@ def conversation_label(conv) -> str:
     return f'**{conv.agent}** — {conv.subject}'
 
 
+def channels_status_line(channels: dict | None = None,
+                         path: Path = CHANNELS_FILE) -> str:
+    """One-line summary of per-channel routing state, for the `settings` command
+    and the startup log.
+
+    When no bridget.channels.toml is loaded, per-agent routing is off and every
+    outbound event falls back to the log channel / DM (v1.0.0 behavior). That
+    fallback was previously silent, so a "why is everything still in the log
+    channel?" misconfiguration looked identical to a routing bug. Name the file
+    to create so the DM-only state is self-diagnosable."""
+    if channels is None:
+        channels = CHANNELS
+    if not channels:
+        return f"off — DM-only; create {path} to route per agent"
+    agents = sorted({e['agent'] for e in channels.values()})
+    return f"on — {len(channels)} channel(s); agent(s): {', '.join(agents)}"
+
+
 def render_settings(summary: dict) -> str:
     """Turn `SettingsStore.summary()` into the `settings` command's output."""
     lines = [
         '⚙️ **bridget settings**',
         f"• DM policy: `{summary['dm_policy']}`",
+        f"• Per-channel routing: {channels_status_line()}",
         f"• Mute all DMs: `{str(summary['mute_all']).lower()}`",
     ]
     muted = summary['muted']
@@ -2645,6 +2664,7 @@ async def on_ready():
     # Probes `mg mail send --help` once. Replies still deliver when this is
     # off; they just arrive as new top-level mail instead of threading.
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
+    print(f"per-channel routing: {channels_status_line()}", flush=True)
 
     # Auto-create + auto-wire any configured channel that has no live snowflake
     # yet (Slice A, mg-2fea). Runs before the watchers so a freshly-created
