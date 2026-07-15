@@ -177,6 +177,77 @@ class ReconcileTaskStatesTest(unittest.TestCase):
         self.assertEqual([t['id'] for t in announce], ['mg-dddd'])
 
 
+class SplitPollAnnounceStatusesTest(unittest.TestCase):
+    """mg-4fc0 split the one --all poll into a cheap non---all hot poll plus a
+    throttled --all full diff. Each owns a partition of the announce statuses,
+    keyed on whether `mg list` shows the status without --all. This guards the
+    partition and the routing consequence: the hot poll must never announce a
+    status it cannot see, and the full diff must not double-announce one the hot
+    poll already owns."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bridget = load_bridget()
+
+    def test_partition_is_a_clean_cover_of_every_formatted_status(self):
+        b = self.bridget
+        formats = frozenset(b._TRANSITION_FORMATS)
+        # Together they cover every announceable status...
+        self.assertEqual(b.HOT_TRANSITION_STATUSES | b.FULL_TRANSITION_STATUSES,
+                         formats)
+        # ...and they never overlap, so no transition is announced twice.
+        self.assertEqual(b.HOT_TRANSITION_STATUSES & b.FULL_TRANSITION_STATUSES,
+                         frozenset())
+
+    def test_hot_owns_the_statuses_mg_shows_without_all(self):
+        # claimed and done are visible in a plain `mg list`; shelved is not.
+        self.assertIn('claimed', self.bridget.HOT_TRANSITION_STATUSES)
+        self.assertIn('done', self.bridget.HOT_TRANSITION_STATUSES)
+        self.assertNotIn('shelved', self.bridget.HOT_TRANSITION_STATUSES)
+
+    def test_full_owns_only_the_hidden_statuses(self):
+        # shelved is only visible with --all; done must stay hot-only.
+        self.assertIn('shelved', self.bridget.FULL_TRANSITION_STATUSES)
+        self.assertNotIn('done', self.bridget.FULL_TRANSITION_STATUSES)
+        self.assertNotIn('claimed', self.bridget.FULL_TRANSITION_STATUSES)
+
+    def test_hot_poll_announces_claimed_and_done(self):
+        b = self.bridget
+        # available -> claimed, diffed with the hot partition, announces.
+        _, a = b.reconcile_task_states(
+            dump(task('mg-h1', 'claimed')), {'mg-h1': 'available'},
+            b.HOT_TRANSITION_STATUSES)
+        self.assertEqual([t['id'] for t in a], ['mg-h1'])
+        # claimed -> done also announces on the hot poll (mg lists done by default).
+        _, a = b.reconcile_task_states(
+            dump(task('mg-h2', 'done')), {'mg-h2': 'claimed'},
+            b.HOT_TRANSITION_STATUSES)
+        self.assertEqual([t['id'] for t in a], ['mg-h2'])
+
+    def test_full_poll_announces_shelved_but_not_done(self):
+        b = self.bridget
+        # A shelve is invisible to the hot poll (the id just vanishes); the full
+        # --all diff is the only place it can be announced.
+        _, a = b.reconcile_task_states(
+            dump(task('mg-f1', 'shelved')), {'mg-f1': 'available'},
+            b.FULL_TRANSITION_STATUSES)
+        self.assertEqual([t['id'] for t in a], ['mg-f1'])
+        # done is NOT in the full partition, so the full diff stays silent on it
+        # even though --all shows done — the hot poll already announced it.
+        _, a = b.reconcile_task_states(
+            dump(task('mg-f2', 'done')), {'mg-f2': 'claimed'},
+            b.FULL_TRANSITION_STATUSES)
+        self.assertEqual(a, [])
+
+    def test_full_poll_every_is_a_positive_throttle(self):
+        b = self.bridget
+        self.assertGreaterEqual(b.FULL_POLL_EVERY, 1)
+        # Default config: 60s full interval over a 5s poll → every 12 cycles.
+        self.assertEqual(
+            b.FULL_POLL_EVERY,
+            max(1, round(b.FULL_POLL_INTERVAL / b.POLL_INTERVAL)))
+
+
 class FormatTransitionTitleTest(unittest.TestCase):
     """The card carries a *label*; the full title lives in the mg item. A trim
     is fine, but a bare slice clips mid-word and reads as a whole sentence — the

@@ -370,6 +370,18 @@ current status without DMing, so you don't get a flood of notifications for
 work that's already in flight. Only ideas/bugs/etc. with `type=task` trigger
 notifications; other types are filtered out.
 
+The watcher polls in two tiers so it doesn't walk the whole macguffin archive
+every few seconds. A cheap **hot poll** (`mg list --json`, no `--all`) runs
+every `BRIDGET_POLL_INTERVAL` and catches `claimed`/`done`, which `mg list`
+shows by default. The expensive `--all` **full diff** — which alone can see
+`shelved`/archived items, and so walks every archive tombstone — runs only
+every `BRIDGET_FULL_POLL_INTERVAL` seconds (default 60) and catches `📦 shelved`
+transitions. The full diff keeps its own cache at
+`~/.pogo/bridget.task-states-full.json`. The trade-off: a `📦 shelved` notice
+can lag by up to `BRIDGET_FULL_POLL_INTERVAL` rather than one poll interval.
+Dropping `--all` from the hot poll is what stopped it feeding the `mg
+list`-timeout storm that once wedged delivery for ~70h (mg-e5b8, mg-4fc0).
+
 ## Per-channel agent routing (optional)
 
 By default, bridget is DM-only: every command and every notification flows

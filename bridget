@@ -102,6 +102,11 @@ CONVERSATIONS_FILE = HOME / '.pogo' / 'bridget.conversations.json'
 SETTINGS_FILE = HOME / '.pogo' / 'bridget.settings.json'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
+#: The task-transition watcher runs two diffs against separate state caches: the
+#: cheap non---all hot poll uses TASK_STATES_FILE above; the throttled `--all`
+#: full diff (which alone can see shelved/archived tombstones) uses this one, so
+#: the two id-views never clobber each other (mg-4fc0).
+TASK_STATES_FULL_FILE = HOME / '.pogo' / 'bridget.task-states-full.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
@@ -327,6 +332,18 @@ def load_config() -> dict:
     if poll_interval <= 0:
         die(f"BRIDGET_POLL_INTERVAL must be positive (got {poll_interval}).")
 
+    # The task-transition watcher polls cheaply (no --all) every poll_interval and
+    # runs the expensive --all full diff only every full_poll_interval seconds
+    # (mg-4fc0). Must be >= poll_interval so the throttle is never a no-op.
+    full_poll_interval_str = lookup('BRIDGET_FULL_POLL_INTERVAL')
+    try:
+        full_poll_interval = int(full_poll_interval_str) if full_poll_interval_str else 60
+    except ValueError:
+        die(f"BRIDGET_FULL_POLL_INTERVAL must be an integer (got {full_poll_interval_str!r}).")
+    if full_poll_interval < poll_interval:
+        die(f"BRIDGET_FULL_POLL_INTERVAL ({full_poll_interval}) must be >= "
+            f"BRIDGET_POLL_INTERVAL ({poll_interval}).")
+
     quiet_respects_outbound_raw = (lookup('BRIDGET_QUIET_RESPECTS_OUTBOUND') or 'false').strip().lower()
     quiet_respects_outbound = quiet_respects_outbound_raw in ('true', '1', 'yes', 'on')
 
@@ -394,6 +411,7 @@ def load_config() -> dict:
         'workflow_agent': workflow_agent,
         'inbox_tag': inbox_tag,
         'poll_interval': poll_interval,
+        'full_poll_interval': full_poll_interval,
         'quiet_respects_outbound': quiet_respects_outbound,
         'approval_re': approval_re,
         'restart_cmd': restart_cmd,
@@ -600,6 +618,18 @@ INBOX_REPO = CONFIG['inbox_repo']
 WORKFLOW_AGENT = CONFIG['workflow_agent']
 INBOX_TAG = CONFIG['inbox_tag']
 POLL_INTERVAL = CONFIG['poll_interval']
+#: The task-transition watcher's hot poll runs a cheap `mg list --json` (no
+#: --all) every POLL_INTERVAL; the expensive `--all` full diff runs only every
+#: FULL_POLL_INTERVAL seconds. Dropping --all from the hot poll cut its I/O from
+#: walking ~3000+ archive tombstones to ~14 live records — the walk that fed the
+#: mg-list-timeout storm that wedged delivery for ~70h (mg-e5b8). The --all diff
+#: still runs, just throttled, so shelved/archived transitions the hot poll can't
+#: see are still announced, at up to FULL_POLL_INTERVAL latency (mg-4fc0).
+FULL_POLL_INTERVAL = CONFIG['full_poll_interval']
+#: How many hot-poll cycles between full --all diffs. round() keeps it near the
+#: configured wall-clock interval; max(1, …) means "at least every cycle" if the
+#: two intervals are equal.
+FULL_POLL_EVERY = max(1, round(FULL_POLL_INTERVAL / POLL_INTERVAL))
 #: On a transient `mg list` timeout the task-transition watcher backs off and
 #: retries rather than dying. The backoff grows from one poll interval and is
 #: capped here, so a genuine contention burst isn't hammered while the watcher
@@ -780,13 +810,15 @@ def is_quiet_now() -> bool:
     return cur >= s or cur < e
 
 
-def load_task_states() -> tuple[dict, bool]:
-    """Read the task-state cache. Returns (states, file_existed). Missing or
-    malformed → empty dict + False so callers can prime silently."""
-    if not TASK_STATES_FILE.exists():
+def load_task_states(path: Path = None) -> tuple[dict, bool]:
+    """Read a task-state cache. Returns (states, file_existed). Missing or
+    malformed → empty dict + False so callers can prime silently. `path`
+    defaults to the hot-poll cache; the --all full diff passes its own file."""
+    path = path or TASK_STATES_FILE
+    if not path.exists():
         return {}, False
     try:
-        d = json.loads(TASK_STATES_FILE.read_text())
+        d = json.loads(path.read_text())
         if not isinstance(d, dict):
             raise ValueError('not a dict')
         return {k: str(v) for k, v in d.items()}, True
@@ -795,9 +827,10 @@ def load_task_states() -> tuple[dict, bool]:
         return {}, True
 
 
-def save_task_states(states: dict) -> None:
-    """Atomically write the task-state cache."""
-    write_state(TASK_STATES_FILE, json.dumps(states, indent=2, sort_keys=True) + '\n')
+def save_task_states(states: dict, path: Path = None) -> None:
+    """Atomically write a task-state cache (hot-poll cache by default)."""
+    write_state(path or TASK_STATES_FILE,
+                json.dumps(states, indent=2, sort_keys=True) + '\n')
 
 
 def touch_heartbeat(path: Path = None) -> None:
@@ -896,6 +929,19 @@ _TRANSITION_FORMATS = {
     'done': '✅ done {id}: {title}',
     'shelved': '📦 shelved {id}: {title}',
 }
+
+#: Statuses `mg list` hides unless you pass --all. A task entering one of these
+#: simply *vanishes* from a non---all listing rather than showing the new status,
+#: so the cheap hot poll can never diff a transition *into* them — only the
+#: throttled --all full diff can (mg-4fc0).
+MG_HIDDEN_WITHOUT_ALL = frozenset({'shelved', 'archived'})
+#: The announce statuses each poller owns, partitioned by mg's --all visibility.
+#: The hot poll announces the statuses it can actually see (claimed, done); the
+#: full diff announces only the hidden ones (shelved). `done` is visible to both
+#: mg listings — assigning it hot-only is what stops the two pollers from both
+#: announcing the same transition and sending a duplicate DM.
+HOT_TRANSITION_STATUSES = frozenset(_TRANSITION_FORMATS) - MG_HIDDEN_WITHOUT_ALL
+FULL_TRANSITION_STATUSES = frozenset(_TRANSITION_FORMATS) & MG_HIDDEN_WITHOUT_ALL
 
 
 def format_transition(task: dict, new_status: str):
@@ -1819,10 +1865,14 @@ async def watch_idea_claims(user: discord.User):
 
 def reconcile_task_states(out: str, previous: dict,
                           announce_statuses) -> tuple[dict, list[dict]]:
-    """Diff one `mg list --json --all` dump against the previous state.
+    """Diff one `mg list --json` dump (with or without --all) against the
+    previous state.
 
     Returns `(current, announce)`: the full id→status map this listing implies,
-    and the task records whose status just became one we announce.
+    and the task records whose status just became one we announce. Both the
+    cheap non---all hot poll and the throttled --all full diff share this — they
+    differ only in the listing they feed and the `announce_statuses` they own
+    (mg-4fc0).
 
     `mg list --json --all` can emit the *same id twice* with different statuses
     — a live record and an archived tombstone (observed: mg-4b2a, mg-7387 and
@@ -1873,11 +1923,88 @@ def reconcile_task_states(out: str, previous: dict,
     return current, announce
 
 
+async def deliver_task_transitions(user: discord.User,
+                                   transitions: list[tuple[str, str]]) -> None:
+    """Fan a batch of (message, assignee) transition announcements out to their
+    per-assignee channels, falling back to the human's DM. Shared by both the
+    hot poll and the --all full diff so the routing lives in one place (mg-4fc0).
+    Honours the quiet-hours outbound gate exactly as the inline sender did."""
+    if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
+        return
+    for msg, assignee in transitions:
+        targets = outbound_targets(assignee, 'task-transitions') if assignee else []
+        if targets:
+            for ch in targets:
+                chan = client.get_channel(ch['snowflake'])
+                if chan is None:
+                    continue
+                try:
+                    await chan.send(msg)
+                except discord.HTTPException as e:
+                    print(f'task-transition channel send failed: {e}',
+                          file=sys.stderr)
+        else:
+            try:
+                await user.send(msg)
+            except discord.HTTPException as e:
+                print(f'task-transition send failed: {e}', file=sys.stderr)
+
+
+async def full_reconcile_tick(user: discord.User, full_states: dict,
+                              full_primed: bool) -> tuple[dict, bool]:
+    """The periodic `mg list --json --all` full diff. Returns the updated
+    `(full_states, full_primed)`.
+
+    This is the *only* caller that still passes --all, and it runs once every
+    FULL_POLL_EVERY hot-poll cycles instead of every cycle — that throttle is the
+    whole point of mg-4fc0: --all walks ~3000+ archive tombstones, the I/O that
+    fed the mg-list-timeout storm (mg-e5b8). It announces only the statuses the
+    cheap hot poll cannot see (FULL_TRANSITION_STATUSES — shelved), so a task
+    that vanishes from the non---all listing when it is shelved is still caught.
+
+    Resilient like the hot poll: an --all timeout here is logged and skipped, so
+    it neither crashes the watcher nor disturbs the hot poll's storm accounting.
+    """
+    rc, out, err = await run_mg_async(['list', '--json', '--all'])
+    if rc != 0:
+        print(f'watch_task_transitions full --all diff failed: '
+              f'{err.strip()[:200]}', file=sys.stderr)
+        return full_states, full_primed
+
+    current, announce = reconcile_task_states(out, full_states,
+                                              FULL_TRANSITION_STATUSES)
+    transitions: list[tuple[str, str]] = []  # (msg, assignee)
+    if full_primed:
+        for task in announce:
+            msg = format_transition(task, task['status'])
+            if msg:
+                transitions.append((msg, (task.get('assignee') or '').strip()))
+
+    full_states.clear()
+    full_states.update(current)
+
+    if not full_primed:
+        # First --all diff after a (re)start with no cache: record every existing
+        # shelved/archived id silently so we don't announce a backlog as if it
+        # just happened.
+        full_primed = True
+    else:
+        await deliver_task_transitions(user, transitions)
+
+    save_task_states(full_states, TASK_STATES_FULL_FILE)
+    return full_states, full_primed
+
+
 async def watch_task_transitions(user: discord.User):
     states, file_existed = load_task_states()
     primed = file_existed  # if cache file existed, treat first tick as a normal diff
+    # The --all full diff keeps its own state, on its own cache and priming, so
+    # its wider id-view never clobbers the hot poll's (mg-4fc0).
+    full_states, full_existed = load_task_states(TASK_STATES_FULL_FILE)
+    full_primed = full_existed
     backoff = 0  # extra seconds added on *consecutive* `mg list` timeouts
     storm = 0  # consecutive `mg list` timeouts; resets on any clean listing
+    cycles = 0  # hot-poll cycles completed; gates the throttled full --all diff
     while not client.is_closed():
         # Liveness heartbeat, ticked at the top of every cycle — before we even
         # call mg — so it proves the *watcher thread* is alive regardless of
@@ -1890,10 +2017,16 @@ async def watch_task_transitions(user: discord.User):
         # watch_mailbox exists to catch the wedge this one is blind to (mg-e5b8).
         touch_heartbeat()
         try:
+            # HOT POLL: the cheap non---all read, every cycle. Dropping --all is
+            # mg-4fc0's core change — it walks ~14 live records instead of
+            # ~3000+ archive tombstones, so it no longer feeds the storm. It can
+            # see claimed/done (mg shows done by default) but NOT shelved/archived
+            # — those the throttled full diff below catches (mg-4fc0).
+            #
             # Off the event loop: a hung `mg` must not freeze the shared loop and
             # starve delivery. A STORM of these once blocked the gateway
             # heartbeat and dropped Discord for ~70h (mg-e5b8).
-            rc, out, err = await run_mg_async(['list', '--json', '--all'])
+            rc, out, err = await run_mg_async(['list', '--json'])
             if rc != 0:
                 # `mg list` benchmarks at ~0.01s even at rest, so a timeout here
                 # is a transient flake, not slowness. Degrade, do NOT die: log,
@@ -1918,7 +2051,8 @@ async def watch_task_transitions(user: discord.User):
             backoff = 0  # a clean listing clears the timeout backoff
             storm = 0    # ...and ends the storm
 
-            current, announce = reconcile_task_states(out, states, _TRANSITION_FORMATS)
+            current, announce = reconcile_task_states(out, states,
+                                                      HOT_TRANSITION_STATUSES)
             transitions: list[tuple[str, str]] = []  # (msg, assignee)
             if primed:
                 for task in announce:
@@ -1934,28 +2068,20 @@ async def watch_task_transitions(user: discord.User):
             if not primed:
                 primed = True
             else:
-                quiet_outbound = QUIET_RESPECTS_OUTBOUND and is_quiet_now()
-                for msg, assignee in transitions:
-                    if quiet_outbound:
-                        continue
-                    targets = outbound_targets(assignee, 'task-transitions') if assignee else []
-                    if targets:
-                        for ch in targets:
-                            chan = client.get_channel(ch['snowflake'])
-                            if chan is None:
-                                continue
-                            try:
-                                await chan.send(msg)
-                            except discord.HTTPException as e:
-                                print(f'task-transition channel send failed: {e}',
-                                      file=sys.stderr)
-                    else:
-                        try:
-                            await user.send(msg)
-                        except discord.HTTPException as e:
-                            print(f'task-transition send failed: {e}', file=sys.stderr)
+                await deliver_task_transitions(user, transitions)
 
             save_task_states(states)
+
+            # FULL POLL: the expensive --all diff, throttled to one run per
+            # FULL_POLL_EVERY cycles. Its state persists across restarts on its
+            # own cache, so after a restart it announces from its first run;
+            # only a first-ever deploy primes silently. Shelved/archived latency
+            # rises from POLL_INTERVAL to up to FULL_POLL_INTERVAL — the
+            # deliberate trade for killing the per-poll tombstone walk (mg-4fc0).
+            cycles += 1
+            if cycles % FULL_POLL_EVERY == 0:
+                full_states, full_primed = await full_reconcile_tick(
+                    user, full_states, full_primed)
         except Exception as e:
             print(f'watch_task_transitions loop error: {e}', file=sys.stderr)
         await asyncio.sleep(POLL_INTERVAL)

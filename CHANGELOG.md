@@ -404,6 +404,25 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Changed
 
+- **The task-transition watcher stopped walking the archive on every poll.**
+  The 5-second transition poll ran `mg list --json --all`, and `--all` walks
+  *every* archived tombstone and shelved item — measured at ~3094 files (~2932
+  archive tombstones + ~148 shelved) versus ~14 for a plain `mg list`, ~200×
+  the I/O and growing without bound as the archive fills. That per-poll walk was
+  what fed the `mg list`-timeout storm that once wedged delivery for ~70h
+  (mg-e5b8); bridget now *survives* that storm, and this cuts how often it hits
+  it. The poll is now split: a cheap non-`--all` **hot poll** every
+  `BRIDGET_POLL_INTERVAL` catches `claimed`/`done` (which `mg list` shows by
+  default), and the expensive `--all` **full diff** runs only every
+  `BRIDGET_FULL_POLL_INTERVAL` seconds (default 60) to catch `shelved`/archived
+  transitions the hot poll can't see. The two diffs keep separate state caches
+  so their different id-views never clobber each other, and `done` is announced
+  hot-only so the two pollers never double-DM the same transition. The one
+  visible trade: a `📦 shelved` notice can now lag by up to
+  `BRIDGET_FULL_POLL_INTERVAL` instead of one poll interval. Verified
+  end-to-end that dropping `--all` from the hot poll does **not** regress
+  `done`/`shelved` announcements (mg-4fc0).
+
 - **A reply is acknowledged by a reaction on your message, not a post in the
   thread.** Typing a reply into a conversation thread used to draw a
   `✅ delivered to \`mayor\` — …` line into the very thread you were reading;
