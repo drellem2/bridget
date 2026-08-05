@@ -52,6 +52,13 @@ python3 tests/test_watcher_liveness.py
 # stale the moment mail stops reaching Discord — the ~70h wedge the loop
 # heartbeat was blind to. Storms mg, wedges delivery; no live Discord.
 python3 tests/test_delivery_liveness.py
+# The duplicate-watcher fix (mg-dc94): `on_ready` fires on every gateway
+# RECONNECT, and used to spawn a fresh watcher set each time with no teardown —
+# seven sets accumulated and each delivered the same mail, so one mail became
+# seven Discord threads. Proves the live set stays constant across reconnects,
+# that retired watchers actually stop, and that the teardown is LOGGED. Carries
+# a pre-fix control that reproduces N+1 delivery. Stubs discord.
+python3 tests/test_watcher_idempotence.py
 # bridget-supervise + the launchd plist template. Calls no launchctl, so it
 # runs on Linux too.
 python3 tests/test_launchd.py

@@ -127,6 +127,47 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **One mail no longer becomes N Discord threads after N gateway reconnects.**
+  `on_ready` is fired by discord.py on every gateway RECONNECT, not just at
+  process start, and it spawned a fresh set of maildir watchers each time with
+  nothing retiring the previous set. Each set carries its own in-memory seen-set,
+  so each independently treated a new mail as unseen and delivered it: after N
+  reconnects, one mail produced N+1 root cards and N+1 threads. In the reported
+  incident seven sets had accumulated inside a single process — the observed
+  duplicate count in the log channel climbed x2 → x3 → x4 → x5 → x7 across the
+  day and topped out at exactly the number of watcher sets (mg-dc94, reported by
+  Daniel as "a bunch of dup discord threads for each mail").
+
+  The existing `was_posted` idempotency guard did not catch this. `resolve_thread`
+  runs *before* the guard and is itself a check-then-act across an `await`, so
+  every concurrent watcher saw `thread_id is None`, every one created a thread,
+  and `bind_thread` cleared `posted_ids` as it re-rooted — resetting the guard
+  by the very race it would have caught.
+
+  Watcher startup is now idempotent: each `on_ready` cancels **and awaits** the
+  previous set before spawning a replacement, so the live count stays constant
+  across reconnects. Awaiting is the load-bearing half — `cancel()` only
+  schedules a `CancelledError`, and a watcher that is still unwinding is still
+  polling. A watcher interrupted mid-send loses nothing, because a mail is
+  committed to the seen-set only *after* delivery, so the replacement redelivers
+  it.
+
+  **Two new log lines make this auditable**, which the previous behavior was
+  not: `tore down watcher set: N task(s) cancelled, M already dead (reason)` on
+  every retirement, and `watcher set live: N task(s)` after every spawn. The leak
+  ran unnoticed for weeks precisely because the log showed `spawned …` over and
+  over with no counterpart — a grep for teardown activity returned zero lines
+  across the entire history. If `watcher set live:` ever climbs across
+  reconnects, this bug is back.
+
+  The same reconnect path also re-sent the `🔔 bridget online` DM on every
+  reconnect; that greeting is now once per process, not once per connection.
+
+  Not fixed here, and independent: bridget reconnects often because the host's
+  DNS keeps failing (18k+ `nodename nor servname provided` errors reaching
+  `discord.com`, alongside multiple recorded connectivity outages). That is
+  environmental, and reconnecting is the correct response to it — the
+  duplication was a bug at any reconnect rate.
 - **A long reply to the user was truncated; now it is split.** Outbound text
   past Discord's per-message limit (~1900 chars) used to be chopped with a
   trailing `…`, and the tail was lost. An agent's mail body posted into its

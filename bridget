@@ -1503,6 +1503,61 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     return True
 
 
+#: Every long-lived watcher task the current session spawned, so the *next*
+#: `on_ready` can retire them instead of stacking a second set on top (mg-dc94).
+#: `on_ready` fires again on every gateway RECONNECT, not only at process start.
+WATCHER_TASKS: list = []
+
+#: The startup DM is per-process, not per-connection. Without this the greeting
+#: rides along with every watcher respawn, so a night of gateway flapping DMs
+#: "bridget online" once per reconnect.
+GREETED = False
+
+
+async def stop_watchers(reason: str) -> int:
+    """Cancel and await the previous session's watcher tasks. Returns the count.
+
+    Awaiting is the load-bearing half, not the cancel: `cancel()` only *schedules*
+    a CancelledError, so a watcher that is mid-`await` is still live and still
+    polling until it next reaches a suspension point. Spawning the replacement
+    before that lands leaves the two sets overlapping for a poll interval — each
+    with its own in-memory seen-set — which is the very double-delivery this
+    teardown exists to prevent.
+
+    A watcher cancelled mid-send loses nothing: the mail is only committed to the
+    seen-set *after* delivery, so an interrupted one is uncommitted and the
+    replacement redelivers it. That is the at-least-once trade `MaildirWatcher.poll`
+    documents, and it falls on the safe side.
+
+    The log line is not decoration. Watcher accumulation ran unnoticed for weeks
+    (mg-dc94) precisely because nothing ever recorded a teardown: the log showed
+    "spawned ..." over and over with no counterpart, and there was no way to tell
+    a healthy respawn from a leak. A fix here without a teardown line would be
+    unverifiable in exactly the same way.
+    """
+    global WATCHER_TASKS
+    tasks, WATCHER_TASKS = WATCHER_TASKS, []
+    if not tasks:
+        return 0
+    live = [t for t in tasks if not t.done()]
+    for task in live:
+        task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
+    print(f"tore down watcher set: {len(live)} task(s) cancelled, "
+          f"{len(tasks) - len(live)} already dead ({reason})", flush=True)
+    return len(live)
+
+
+def track_watcher(coro):
+    """Spawn a watcher task and register it for teardown. Every long-lived task
+    `on_ready` starts must go through here — one that doesn't is invisible to
+    `stop_watchers` and becomes a leak that survives the next reconnect."""
+    task = client.loop.create_task(coro)
+    WATCHER_TASKS.append(task)
+    return task
+
+
 async def send_startup_dm(user: discord.User, first_run: bool) -> None:
     if QUIET_RESPECTS_OUTBOUND and is_quiet_now():
         return
@@ -1531,12 +1586,20 @@ async def watch_mailbox(user: discord.User):
     reads `new/` and never moves anything out of it — `mg mail read` owns that,
     and the `dismiss`/`read` commands are the only things here that mark mail
     read, because the human asked them to."""
+    global GREETED
     watcher = MaildirWatcher(MAIL_DIR, SEEN_FILE)
     first_run = not watcher.primed
     if first_run:
         # Adopt the backlog rather than replaying it into chat.
         watcher.prime()
-    await send_startup_dm(user, first_run)
+    if not GREETED:
+        # Once per process, not once per connection. This watcher is respawned
+        # on every gateway reconnect, and "bridget online" is a statement about
+        # the process starting — repeating it on a reconnect is just noise in
+        # the human's DM (mg-dc94). Set before the await so two watchers racing
+        # here cannot both greet.
+        GREETED = True
+        await send_startup_dm(user, first_run)
 
     while not client.is_closed():
         # A cycle is "delivery-healthy" unless a send actually fails in it. An
@@ -2903,9 +2966,28 @@ async def on_ready():
     # its inbound routing is registered before the first on_message.
     await resolve_and_wire_channels()
 
-    client.loop.create_task(watch_mailbox(user))
-    client.loop.create_task(watch_task_transitions(user))
-    client.loop.create_task(watch_idea_claims(user))
+    # `on_ready` is not a process-start hook — discord.py fires it again on every
+    # gateway RECONNECT (a re-IDENTIFY after a dropped socket; RESUME is the quiet
+    # path that does not). So everything below runs many times per process, and
+    # spawning watchers here is only correct if it is idempotent.
+    #
+    # It was not (mg-dc94). Each reconnect started a *second* full set of watchers
+    # over the same maildirs with nothing retiring the first. Each set carries its
+    # own in-memory seen-set, so each independently saw every new mail as fresh and
+    # delivered it: after N reconnects one mail produced N+1 root cards and N+1
+    # threads. The `was_posted` idempotency guard does not catch this, because
+    # `resolve_thread` runs *before* it and is itself a check-then-act across an
+    # await — every watcher sees `thread_id is None`, every watcher creates a
+    # thread, and `bind_thread` clears `posted_ids` as it re-roots, so the guard is
+    # reset by the very race it would have caught.
+    #
+    # Retiring the old set first makes the live watcher count constant across
+    # reconnects, which is the property to check when this is suspected again.
+    await stop_watchers('gateway reconnect')
+
+    track_watcher(watch_mailbox(user))
+    track_watcher(watch_task_transitions(user))
+    track_watcher(watch_idea_claims(user))
 
     # Per-channel mailbox fan-out: one watcher per outbound channel mapping
     # whose `kinds` includes 'mail'. Each watcher uses ~/.pogo/bridget.seen.<agent>
@@ -2918,11 +3000,15 @@ async def on_ready():
             continue
         if 'mail' not in entry['kinds']:
             continue
-        client.loop.create_task(watch_agent_mailbox(entry))
+        track_watcher(watch_agent_mailbox(entry))
         started_agents.add(entry['agent'])
     if started_agents:
         print(f"spawned per-channel mailbox watchers for: "
               f"{', '.join(sorted(started_agents))}", flush=True)
+    # The live count, every time. Paired with the teardown line above, this is
+    # what makes accumulation visible: across reconnects it must stay constant.
+    # A log where it climbs is the mg-dc94 leak, back.
+    print(f"watcher set live: {len(WATCHER_TASKS)} task(s)", flush=True)
 
 
 @client.event

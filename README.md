@@ -783,6 +783,16 @@ Common failure modes:
 - **Replies arrive as new top-level mail, not in the conversation** — your `mg`
   predates gh#66 and has no `--in-reply-to`. `settings` will show
   `Correlation IDs: off (detected)`. Upgrade macguffin; nothing else to do.
+- **Every mail shows up as several identical threads** — count the
+  `watcher set live: N task(s)` lines in the log. `N` must be the *same* after
+  every reconnect; if it climbs, a watcher set is leaking and each accumulated
+  set delivers the mail once (mg-dc94). Each retirement should log
+  `tore down watcher set: …` — a run of `spawned …` lines with no teardown
+  between them is the signature. Restarting bridget clears the accumulated
+  watchers and returns delivery to 1× immediately. Note that repeated
+  `logged in as …` blocks are normal on a flaky network: discord.py re-runs its
+  ready path on every gateway reconnect, and reconnecting is the correct
+  response to the connection dropping.
 
 ## Architecture
 
