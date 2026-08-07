@@ -98,6 +98,19 @@ class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
         self._saved_home = os.environ.get('HOME')
         os.environ['HOME'] = str(self.home)
         self._mg('init')
+        # mg refuses a recipient it has never seen (macguffin's dead-drop fix):
+        # before that refusal, a typo'd name minted a mailbox nobody read and
+        # still reported "Delivered". This fixture mails `human` and `mayor` into
+        # an empty store, so both need registering first or every send in the
+        # file fails with no_such_mailbox — which is what it did.
+        #
+        # Tolerated rather than asserted: `mg mail register` postdates the
+        # refusal, so an mg old enough to lack the subcommand is also old enough
+        # not to need it. This file already self-skips on an mg without
+        # correlation IDs; it must not hard-fail on one without `register`.
+        for box in ('human', 'mayor'):
+            subprocess.run([MG, 'mail', 'register', box],
+                           capture_output=True, text=True, timeout=30)
 
         self.delivered: set[str] = set()
         self.mayor_seen: set[str] = set()
