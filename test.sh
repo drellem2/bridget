@@ -26,6 +26,12 @@ python3 -m py_compile bridget_core/*.py
 bash -n install.sh
 python3 tests/test_core.py
 python3 tests/test_env_defaults.py
+# The representative relay's INBOUND seam (mg-65d2). Outbound agent mail routes
+# through a representative crew agent; Daniel's replies do not — they are his own
+# words. So the representative gets a marked COPY, filed to its own box rather
+# than to `human` (which a fail-open deadman watches, and would notify his own
+# words back at him). Off by default; a failed copy never fails the relay.
+python3 tests/test_representative_copy.py
 python3 tests/test_channels.py
 python3 tests/test_threading.py
 # The task-transition diff. Guards the DM flood: `mg list --json --all` emits

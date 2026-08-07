@@ -321,6 +321,22 @@ def load_config() -> dict:
         else str(HOME / '.pogo' / 'inbox')
 
     mail_recipient = lookup('POGO_MAIL_RECIPIENT') or 'mayor'
+    # The representative relay's INBOUND seam (mg-65d2). Empty (the default)
+    # means the seam is off and bridget behaves exactly as it always has.
+    #
+    # When a deployment runs a representative — a crew agent that owns `human`
+    # as its inbox and writes a separate terminal box a person actually reads —
+    # OUTBOUND mail routes through it and inbound does not. Daniel's replies are
+    # his own words; putting a rewriter in the middle of them would be worse
+    # than the problem the representative solves. But with outbound relayed and
+    # inbound invisible, the representative has no record of what it has already
+    # told him or what he has already settled: it re-summarises answered
+    # questions, and agents receive replies referring to text the representative
+    # wrote rather than text they sent. Thread integrity breaks in exactly one
+    # direction.
+    #
+    # So the relay gets a COPY, not the relay position. See relay_copy_to().
+    representative = lookup('POGO_REPRESENTATIVE') or ''
     workflow_agent = lookup('POGO_WORKFLOW_AGENT') or 'architect'
     inbox_tag = lookup('POGO_INBOX_TAG') or 'pogo-inbox'
 
@@ -408,6 +424,7 @@ def load_config() -> dict:
         'designs_dir': designs_dir,
         'inbox_repo': inbox_repo,
         'mail_recipient': mail_recipient,
+        'representative': representative,
         'workflow_agent': workflow_agent,
         'inbox_tag': inbox_tag,
         'poll_interval': poll_interval,
@@ -616,6 +633,7 @@ MAIL_DIR = CONFIG['mail_dir']
 DESIGNS_DIR = CONFIG['designs_dir']
 INBOX_REPO = CONFIG['inbox_repo']
 WORKFLOW_AGENT = CONFIG['workflow_agent']
+REPRESENTATIVE = CONFIG['representative']
 INBOX_TAG = CONFIG['inbox_tag']
 POLL_INTERVAL = CONFIG['poll_interval']
 #: The task-transition watcher's hot poll runs a cheap `mg list --json` (no
@@ -2632,6 +2650,7 @@ def handle_command(text: str) -> str:
         recipient = CONFIG['mail_recipient']
         rc, out, err = run_mg(build_send_args(recipient, subject, body, sender='human'))
         if rc == 0:
+            relay_copy_to_representative(recipient, subject, body)
             # The body already carries every byte the human typed (mg-7e0c). This
             # echo is a *label*, so elide it visibly rather than bare-slicing: a
             # `subject[:60]` clips the tail with no marker, and a person watching
@@ -2829,6 +2848,54 @@ def thread_command_reply(text: str, conv) -> str | None:
     return None
 
 
+def relay_copy_to_representative(agent: str, subject: str, body: str) -> None:
+    """File a copy of an inbound reply into the representative's own inbox.
+
+    Best-effort and deliberately silent. This is a RECORD, not a delivery: the
+    reply has already reached the agent it was for by the time this runs, and
+    the human has already been told it was delivered. A failure here must never
+    turn a successful relay into a reported failure, and must never raise into
+    the Discord handler — losing one line of the representative's context is a
+    smaller harm than dropping the human's reply on the floor.
+
+    No-op when POGO_REPRESENTATIVE is unset, which is every install that does
+    not run a representative.
+
+    It goes to the representative's OWN box, not to `human`. `human` is the
+    representative's work queue and is watched by the deadman (a poller that
+    delivers anything sitting there unprocessed after 15 minutes, raw). Copying
+    the human's own replies there would make his words a candidate for being
+    notified back at him whenever the representative was slow, and would put a
+    record into the one box whose backlog is supposed to mean "nobody looked at
+    this". Its own inbox has neither problem.
+    """
+    if not REPRESENTATIVE:
+        return
+    note = (
+        f'FYI — this is a COPY of a reply Daniel sent to `{agent}` via Discord.\n'
+        f'It has already been delivered. Do not act on it, forward it, or reply '
+        f'to it: it is here so you know what he has already been told and '
+        f'already settled.\n\n'
+        f'--- his words, verbatim, to {agent} ---\n'
+        f'{body}'
+    )
+    try:
+        rc, out, err = run_mg(build_send_args(
+            REPRESENTATIVE, f'[inbound copy] {subject}', note, sender='human'))
+    except Exception as e:  # noqa: BLE001 — see docstring; never escalate
+        print(f'representative inbound copy failed (ignored): {e}', file=sys.stderr)
+        return
+    if rc != 0:
+        # Reported, not swallowed. mg refuses a recipient it has never seen, so
+        # a POGO_REPRESENTATIVE naming a box nobody registered fails on every
+        # single reply — permanently, and with the representative none the wiser
+        # about a growing hole in its context. Silent-forever is the failure
+        # shape mg-f04b found fifteen times; one stderr line per occurrence is
+        # what makes it findable. Fix with `mg mail register <name>`.
+        print(f'representative inbound copy to {REPRESENTATIVE!r} failed '
+              f'(ignored): {(err or out).strip()[:200]}', file=sys.stderr)
+
+
 def send_channel_chat_mail(text: str, agent: str) -> str:
     """Plain-text message in a mapped guild channel becomes a mail to that
     channel's agent.
@@ -2846,6 +2913,7 @@ def send_channel_chat_mail(text: str, agent: str) -> str:
     subject, body = subject_label(text), text
     rc, out, err = run_mg(build_send_args(agent, subject, body, sender='human'))
     if rc == 0:
+        relay_copy_to_representative(agent, subject, body)
         # Body carries the message whole; the echo is a label — elide visibly,
         # never bare-slice (mirrors the `mail` verb; mg-2635 / mg-7e0c).
         return f'✓ mailed `{agent}`: "{_elide(subject, ACK_SUBJECT_LIMIT)}"'
@@ -2915,6 +2983,7 @@ def reply_in_conversation(text: str, conv) -> acks.Ack:
     if rc != 0:
         return acks.undeliverable((err or out).strip(), agent=conv.agent)
 
+    relay_copy_to_representative(conv.agent, subject, body)
     sent_id = parse_sent_message_id(out)
     if sent_id:
         CONVERSATIONS.record(conv.key, message_id=sent_id)

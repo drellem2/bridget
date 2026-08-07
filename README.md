@@ -94,10 +94,11 @@ All config lives in `~/.pogo/bridget.env`. See
 | `DISCORD_SERVER_ID`  | yes | Guild the bot is installed in. |
 | `MG_BIN`             | no  | Absolute path to `mg`. Default: resolved via `PATH`. |
 | `POGO_BIN`           | no  | Absolute path to `pogo`. Default: resolved via `PATH`. |
-| `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. |
+| `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. Point at the representative's **output** box if you run one — see below. |
 | `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs (read by `next`). Default: `~/.pogo/designs`. |
 | `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Default: `~/.pogo/inbox`. |
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
+| `POGO_REPRESENTATIVE` | no | Mailbox of a representative crew agent, if you run one. Empty (default) = no representative, no behaviour change. See "Running behind a representative". |
 | `BRIDGET_REPO_DIR`   | no  | Override for the bridget git checkout. Default: self-detected from the script's location (works for the install.sh-managed symlink). |
 | `BRIDGET_VENV_DIR`   | no  | Virtualenv holding `discord.py`; bridget re-execs into its interpreter when `discord` isn't importable. Default: `~/.pogo/venv-bridget` (what `install.sh` builds). |
 
@@ -735,6 +736,48 @@ so the supervisor wrapper is unnecessary there.
 
 `nohup ~/.pogo/bin/bridget >>~/.pogo/bridget.log 2>&1 &`
 
+## Running behind a representative (optional)
+
+A pogo deployment may put a **representative** crew agent between the fleet and
+you: it owns `human` as its inbox, strips internal identifiers, makes agents
+supply the takeaway, collapses a burst of nine mails about one incident into
+one, and writes a separate terminal box.
+
+Two keys matter to bridget when that is running.
+
+**`POGO_MAIL_DIR` — point it at the representative's OUTPUT box.** Not at
+`human`. Two reasons, and the second is easy to miss:
+
+1. `human` is now the representative's work queue, not the box a person reads.
+2. bridget **moves** what it reads from `new/` to `cur/`. Left pointing at
+   `human`, it would silently satisfy the fail-open deadman that watches that
+   box for mail nobody processed — the backstop would see a clean queue and
+   never fire, and a dead representative would mean silence.
+
+Everything bridget derives from this path follows it, including `cur/` and the
+approval-request scan.
+
+**`POGO_REPRESENTATIVE` — the representative's own mailbox.** Setting it files a
+marked **copy** of every reply you send into that box.
+
+Outbound agent mail routes through the representative; your replies do not.
+They are your own words, and putting a rewriter in the middle of them would be
+worse than the problem the representative solves. But with outbound relayed and
+inbound invisible, the representative has no record of what it has already told
+you or what you have already settled — it re-summarises answered questions, and
+agents receive replies referring to text it wrote rather than text they sent.
+Thread integrity breaks in one direction only. The copy closes that without
+putting the representative in the path of your words.
+
+The copy goes to the representative's own box, never to `human`: `human` is
+deadman-watched, so copying your words there would make them a candidate for
+being notified back at you whenever the representative ran slow.
+
+The copy is best-effort. Your reply is already delivered by the time it runs, so
+a failure is logged to stderr and ignored — it never turns a delivered message
+into a reported failure. Register the box first (`mg mail register <name>`); `mg`
+refuses a recipient it has never seen.
+
 ## Troubleshooting
 
 When bridget is running under a supervisor, stderr is the first place to look.
@@ -773,6 +816,11 @@ Common failure modes:
 - **No mail notifications** — verify `~/.macguffin/mail/human/new/` exists
   (or whatever you set `POGO_MAIL_DIR` to). bridget skips mail-watching
   silently when the directory is missing.
+- **The representative never learns what you replied** — `POGO_REPRESENTATIVE`
+  names a mailbox `mg` has never seen. `mg mail send` refuses an unregistered
+  recipient, so every inbound copy fails; bridget logs one line to stderr per
+  occurrence and delivers your reply regardless. Fix with
+  `mg mail register <name>`.
 - **`restart` says git pull failed** — the bridget checkout has uncommitted
   changes or a divergent branch. Resolve manually in the repo; bridget keeps
   running on the old code in the meantime.
