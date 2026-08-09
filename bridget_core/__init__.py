@@ -29,6 +29,10 @@ Slack, Matrix, or a terminal:
     mgshim        — the mg CLI seam: detect whether this build of mg supports
                     correlation IDs, and degrade cleanly when it does not.
     statefile     — atomic, owner-only writes for everything above.
+    logstamp      — the `[<ISO-8601 UTC>] ` line prefix the whole fleet's logs
+                    are grepped by, installed over the process's stdout/stderr
+                    (mg-35b1). Imported as `bridget_core.logstamp` rather than
+                    re-exported here: it is process plumbing, not bridge data.
 
 The Discord presentation adapter lives in the top-level `bridget` script: DM
 cards, guild threads, and the slash/keyword command surface. Keeping the split

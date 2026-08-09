@@ -106,6 +106,39 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 - **`tests/test_task_transitions.py`** — covers the task-transition diff,
   including the duplicate-id regression below.
 
+### Changed
+
+- **The log is dated.** Every line bridget writes now carries the pogo fleet's
+  `[2026-08-09T09:58:06Z] ` ISO-8601 UTC prefix, and `bridget-supervise`'s lines
+  moved from `[supervise <stamp>]` to `[<stamp>] supervise:` so one anchored
+  pattern (`^\[<date>`) dates the whole of `~/.pogo/bridget.log` — and matches
+  how pogod.log, deadman.log, notify.log and pogo-deploy.log are already read.
+
+  bridget carried **no** dates at all, which is not a missing nicety: it is an
+  instrument that cannot return a negative. `grep -cE '2026-08-0[789]'
+  ~/.pogo/bridget.log` answered `0` on a live file whose mtime was that same
+  afternoon, with per-channel watchers actively spawning. The zero meant *this
+  format has no dates* and read as *nothing happened in those three days*, with
+  nothing in the output to tell the two apart — so an investigation into whether
+  a dormant code path had cost any missed Discord replies could establish the
+  exposure and had to report the cost as unknown (mg-35b1).
+
+  The stamp is applied by wrapping the process's `sys.stdout`/`sys.stderr`
+  (`bridget_core/logstamp.py`), not by converting the ~60 `print()` call sites:
+  converting call sites dates the lines someone remembered and silently leaves
+  every future `print()` and every uncaught traceback undated, which is the same
+  defect with a smaller radius. Multi-line messages are stamped on every line —
+  an undateable continuation line is that defect again in miniature — and the
+  stamp is taken when a line is *written*, not when the block-buffered stream
+  flushes, so it is the event's time. Blank lines stay blank.
+
+  Two operational notes. It takes effect **on the next start of the bridget
+  process**, not on deploy. And existing log content is **not** retro-stamped —
+  the dates were never recorded and inventing them would be worse than their
+  absence; the first `[`-prefixed line is an unambiguous boundary between the
+  two eras. README's *Reading the log* covers rotating instead, and why a `mv`
+  on a live log silently does nothing (launchd holds the descriptor).
+
 ### Security
 
 - **Nothing bridget posts can ping anyone.** `discord.Client` was constructed

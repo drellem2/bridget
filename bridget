@@ -79,6 +79,7 @@ from bridget_core.mail import (  # noqa: E402
     reply_target,
     thread_title,
 )
+from bridget_core.logstamp import install_line_timestamps  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
@@ -87,6 +88,19 @@ from bridget_core.statefile import (  # noqa: E402
     secure_parent,
     write_state,
 )
+
+# Date every line this process emits, before anything can emit one — the config
+# loader below can `die()` during import, and a startup failure nobody can date
+# is the case this exists for (mg-35b1). See bridget_core/logstamp.py for why
+# the stream is wrapped instead of the ~60 print() call sites being converted.
+#
+# Gated on __main__ so it applies to the daemon and not to the test suite, which
+# imports this file as a module: wrapping the *test* process's stdio would stamp
+# unittest's own output and the captures tests assert against. The daemon always
+# runs as __main__ — including after reexec_into_venv_if_needed(), which starts a
+# fresh process — so the gate costs the daemon nothing.
+if __name__ == '__main__':
+    install_line_timestamps()
 
 HOME = Path.home()
 ENV_FILE = HOME / '.pogo' / 'bridget.env'

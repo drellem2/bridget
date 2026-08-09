@@ -127,7 +127,11 @@ ALERT_STAMP="${BRIDGET_ALERT_STAMP:-$HOME/.pogo/bridget-supervise.alert}"
 # A hung notifier must never keep us from exiting.
 ALERT_TIMEOUT="${BRIDGET_ALERT_TIMEOUT:-10}"
 
-log() { printf '[supervise %s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+# `[<stamp>] supervise: ...`, not `[supervise <stamp>] ...`. Both carry the date,
+# but our lines and bridget's share one file, and only this order lets ONE
+# anchored pattern date the whole of it: `grep '^\[2026-08-09'` finds both
+# (mg-35b1). The word stays — a supervisor line is worth recognising at a glance.
+log() { printf '[%s] supervise: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 child=""
 sleep_pid=""

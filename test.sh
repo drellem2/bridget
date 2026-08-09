@@ -65,6 +65,12 @@ python3 tests/test_delivery_liveness.py
 # that retired watchers actually stop, and that the teardown is LOGGED. Carries
 # a pre-fix control that reproduces N+1 delivery. Stubs discord.
 python3 tests/test_watcher_idempotence.py
+# The undateable log (mg-35b1): every line bridget and its supervisor emit must
+# carry the fleet's `[<ISO-8601 UTC>] ` prefix, because a log whose absence of a
+# date match is indistinguishable from an absence of events is an instrument
+# that cannot return a negative. Drives the real script to a startup failure —
+# no venv, no token — and carries a pre-fix control that reproduces the zero.
+python3 tests/test_log_timestamps.py
 # bridget-supervise + the launchd plist template. Calls no launchctl, so it
 # runs on Linux too.
 python3 tests/test_launchd.py

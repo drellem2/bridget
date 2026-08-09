@@ -725,6 +725,50 @@ and retries, so the task-states mtime freezes during exactly the burst you would
 want to detect. `~/.pogo/bridget.seen` is not a heartbeat either — it is only
 rewritten when mail actually arrives.)
 
+### Reading the log
+
+Every line bridget and `bridget-supervise` write to `~/.pogo/bridget.log` (and
+`bridget.err.log`) is prefixed with an ISO-8601 UTC stamp — the same
+`[2026-08-09T09:58:06Z] ` the rest of the pogo fleet's logs use, so one anchored
+pattern works across all of them:
+
+```bash
+grep -cE '^\[2026-08-09' ~/.pogo/bridget.log     # lines from that UTC day
+```
+
+Multi-line messages are stamped on **every** line, continuations included, so a
+date grep returns whole messages rather than their first lines. Supervisor lines
+read `[<stamp>] supervise: …`.
+
+**This did not used to be true, and the old behaviour is worth knowing about if
+you are reading an archived log.** Before v2 (mg-35b1) bridget's own lines
+carried no date at all, so `grep -cE '2026-08-0[789]' ~/.pogo/bridget.log`
+answered `0` on a live, actively-written file. The zero meant *this format has no
+dates*; it read as *nothing happened in those three days*, and nothing in the
+output distinguished the two. An investigation into whether a dormant code path
+had cost any missed Discord replies could establish the exposure and not the
+cost, purely because of that.
+
+Two consequences of how the change lands:
+
+- **It takes effect on the next start of the bridget process**, not on deploy.
+  The stamp is installed over the running process's stdout/stderr at startup, so
+  a bridget that is already up keeps writing undated lines until it is restarted.
+- **Existing log content cannot be retro-stamped** — the dates were never
+  recorded, and inventing them would be worse than their absence. Leave the file
+  alone; the first `[`-prefixed line *is* the boundary between the two eras, and
+  it is unambiguous. If you would rather the timestamped era start in a clean
+  file, rotate it **as part of the restart**, never while bridget is running:
+  launchd holds an open descriptor on the file it opened, so a `mv` on a live
+  log leaves the process appending to the renamed inode while the fresh file
+  stays empty — a rotation that looks done and silently is not.
+
+  ```bash
+  launchctl bootout gui/$(id -u)/com.pogo.bridget
+  mv ~/.pogo/bridget.log ~/.pogo/bridget.log.undated
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pogo.bridget.plist
+  ```
+
 ### Linux (systemd)
 
 A user unit (`~/.config/systemd/user/bridget.service`) with
