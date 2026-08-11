@@ -81,6 +81,15 @@ python3 tests/test_log_timestamps.py
 # bridget-supervise + the launchd plist template. Calls no launchctl, so it
 # runs on Linux too.
 python3 tests/test_launchd.py
+# The activation story (mg-6ca7): bridget-supervise execs the file in the working
+# checkout, on whatever branch that checkout is on — so a merged fix sat unrun
+# while the merge succeeded, the MERGED mail arrived and the process stayed
+# healthy. The failure was silent AND survived a restart, which is what makes it
+# dangerous: "restart it" confirmed the wrong state. Proves the new code actually
+# runs after a fast-forward, carries a pre-fix control that reproduces the stale
+# run, and pins every refusal — dirty tree, unmerged commits, polecat worktree —
+# as loud rather than silent. Builds real git checkouts; no network, no launchctl.
+python3 tests/test_activation.py
 python3 tests/test_secrets.py
 # Drives the real script under a venv that provably lacks discord.py, so the
 # re-exec into ~/.pogo/venv-bridget is exercised, not just described.

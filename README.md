@@ -734,6 +734,93 @@ rate-limit anything, and 360 identical mails an hour is its own kind of silence.
 | `BRIDGET_ALERT_COOLDOWN` | `900` | seconds between alerts |
 | `BRIDGET_ALERT_STAMP` | `~/.pogo/bridget-supervise.alert` | where that cooldown is remembered |
 
+### Which revision is it actually running?
+
+A durable target says nothing about the code inside it. `bridget-supervise` execs
+the bridget file **in your working checkout**, on whatever branch that checkout
+happens to be on.
+
+On 2026-08-11 that branch was `representative-relay-mg-65d2`, two commits behind
+`origin/main`, because that is where a previous session left it. The refinery
+merged the duplication limit (mg-5521) to main, the MERGED mail arrived, the
+process was healthy — and the fix was not running, and never would have been.
+Restarting bridget did not help: the restart faithfully re-ran the same
+feature-branch code. A human moved the branch by hand (mg-6ca7).
+
+That is worth more than a note because of two properties. It is **silent** —
+nothing named a revision anywhere, so no reader could tell a stale run from a
+current one. And it **survives a restart** — "restart it" is the standard remedy
+for "the fix isn't live", and here it confirms the wrong state instead of
+correcting it.
+
+So every spawn now names the revision it started:
+
+```
+[2026-08-11T20:26:41Z] supervise: starting bridget (spawn #1) at 3a821ca on main (current with origin/main)
+[2026-08-11T20:26:41Z] supervise: starting bridget (spawn #2) at afe7898 on representative-relay-mg-65d2 — 2 commit(s) behind origin/main
+```
+
+and a checkout behind the deploy ref says so on stdout, on stderr, and by mailing
+`human` — the fix that is not running is the human's, so this is user-facing mail
+rather than coordination.
+
+**"Behind its tracking branch" is deliberately not the check.** The branch this
+was found on had no upstream at all, and every branch that did have one was level
+with it: a tracking-branch check would have printed nothing on the day this
+happened. What is wrong is being behind the branch bridget is *deployed* from, so
+that is the comparison — `BRIDGET_DEPLOY_REF`, `origin/main` by default. Nothing
+here fetches: a supervisor's restart path is no place for a network call that can
+hang, and the merge that produced the stale checkout also updated the local ref.
+
+Where the repair is provably lossless, it makes it — `git checkout main &&
+git merge --ff-only origin/main` — and **only** when all of these hold:
+
+- **HEAD is a strict ancestor of the deploy ref.** The branch then carries no
+  commit main does not already have, so leaving it discards nothing and the
+  branch ref still points exactly where it did. Ahead or diverged: report, never
+  touch.
+- **No modified or staged tracked file.** Someone may legitimately be mid-test in
+  there. A supervisor that discards a human's work is strictly worse than one
+  that runs old code.
+- **The checkout is not a polecat worktree.** A polecat that opted in with
+  `BRIDGET_ALLOW_EPHEMERAL_BIN=1` is testing its own build; fast-forwarding it
+  would destroy exactly the mid-test case the previous rule protects.
+
+When any of those fails, nothing is touched and the refusal is **loud**, naming
+both commands that would fix it by hand. The defect here was silence; a silent
+refusal is the same defect with better manners.
+
+One thing the supervisor cannot repair in place is **itself**. bridget is
+re-exec'd on every spawn, so it picks up a new checkout for free; the supervisor
+is already running, and bash reads its own source lazily. So when a fast-forward
+changes `bridget-supervise`, it says so and names the kickstart that activates it:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.pogo.bridget
+```
+
+It does not re-exec itself. That would close the gap and open a worse one — the
+new copy is unverified, and if it fails to start, the respawn is the pended
+nondemand spawn this whole wrapper exists to avoid.
+
+This check runs before **every** spawn, not once at startup, for the same reason
+the target is re-resolved before every spawn: a merge lands while bridget is up,
+and the restart after it is the moment that either activates the new code or
+silently re-runs the old.
+
+| Variable | Default | |
+|---|---|---|
+| `BRIDGET_ACTIVATION` | `ff` | `ff` fast-forwards when the three rules above hold; `warn` reports everything and touches nothing; `off` is the pre-mg-6ca7 behaviour — runs whatever the checkout holds and says nothing about it |
+| `BRIDGET_DEPLOY_REF` | `origin/main` | the revision bridget is deployed from. Falls back to the local branch of the same name when there is no such remote-tracking ref |
+| `BRIDGET_REVISION_ALERT_TO` | `human` | `mg` recipient for revision reports (separate from `BRIDGET_ALERT_TO`, which is about the target path) |
+| `BRIDGET_REVISION_ALERT_STAMP` | `~/.pogo/bridget-supervise.revision` | its own cooldown stamp, so a path alert and a revision alert cannot throttle each other |
+| `BRIDGET_GIT` | `git` | git to run the checks with |
+
+Related, and not a substitute: the `restart` Discord verb does `git pull --ff-only`
+in `BRIDGET_REPO_DIR` and then exits so the supervisor respawns it. That is the
+*deliberate* activation path and it reports its failures to you in Discord. This
+one covers every restart nobody typed — a crash, a reboot, a `kickstart`.
+
 ### Is it actually alive?
 
 Do not infer liveness from the last line in `~/.pogo/bridget.log` — a quiet

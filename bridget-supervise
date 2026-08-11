@@ -86,6 +86,64 @@
 # a mail flood) and logs to stderr as well as stdout. The 18-minute outage was
 # not caused by the pinned path. It was caused by the pinned path failing where
 # nothing was looking.
+#
+# Activation: WHICH REVISION we are running is not a matter of opinion.
+#
+# The target being durable says nothing about the code inside it. On 2026-08-11
+# the refinery merged the duplication limit (mg-5521) to main, the MERGED mail
+# arrived, the process was healthy — and the fix was not running. We exec the
+# file in the working checkout, and that checkout was parked on
+# `representative-relay-mg-65d2`, two commits behind origin/main, because that is
+# where the previous session left it. Restarting bridget did not help: the
+# restart faithfully re-ran the same feature-branch code. A human moved the
+# branch by hand (mg-6ca7).
+#
+# What makes that worth code rather than a note is not that it happened. It is
+# that the failure is SILENT and SURVIVES A RESTART: "restart it" is the standard
+# remedy for "the fix isn't live", and here it confirms the wrong state instead
+# of correcting it. So every spawn now names the revision it is starting, and a
+# checkout behind the deploy ref says so on stdout, on stderr, and to `human`.
+#
+# "Behind its tracking branch" is deliberately NOT the check. The branch we were
+# parked on had no upstream at all, and every branch in the repo that did have
+# one was level with it — a tracking-branch check would have printed nothing on
+# the very day this was found. What is wrong is being behind the branch bridget
+# is DEPLOYED from, so that is what we compare against: $BRIDGET_DEPLOY_REF,
+# `origin/main` by default. Nothing here fetches; a supervisor's restart path is
+# no place for a network call that can hang, and the merge that produced the
+# stale checkout also updated the local ref.
+#
+# Where the repair is provably lossless we also make it — `git checkout main &&
+# git merge --ff-only origin/main` — and only when ALL of these hold:
+#
+#   - HEAD is a strict ancestor of the deploy ref. The branch then carries no
+#     commit that is not already in main, so leaving it discards nothing and the
+#     branch ref still points where it did. Ahead or diverged: warn, never touch.
+#   - No modified or staged tracked file. Someone may legitimately be mid-test in
+#     there, and a supervisor that discards a human's work is strictly worse than
+#     one that runs old code.
+#   - The checkout is not a polecat worktree. A polecat that opted in with
+#     BRIDGET_ALLOW_EPHEMERAL_BIN=1 is testing its own build; yanking it to main
+#     would destroy exactly the mid-test case the previous rule protects.
+#
+# When any of those fails we do not act — and we are LOUD about not acting, with
+# the two commands that would. The defect here was silence; refusing in silence
+# is the same defect with better manners. BRIDGET_ACTIVATION=warn keeps every
+# report and never touches the checkout; =off is the pre-mg-6ca7 behaviour.
+#
+# This changes nothing about the restart policy above. It runs inside the loop
+# before each spawn, at a point where no bridget is running (`wait "$child"` has
+# already returned), it never exits, and every failure path falls through to the
+# spawn. A fast-forward that fails leaves bridget starting on the old code
+# exactly as it did before, with a warning it did not have before.
+#
+# The one thing it cannot repair in place is itself. bridget is re-exec'd on
+# every spawn, so it picks up a new checkout for free; *this script* is already
+# running, and bash reads its own source lazily. So when a fast-forward changes
+# bridget-supervise we say so and name the kickstart that activates it. Re-execing
+# ourselves would close that gap and open a worse one: the new copy is unverified,
+# and if it fails to start, the respawn is launchd's pended nondemand spawn that
+# this entire file exists to avoid.
 
 set -uo pipefail   # deliberately not -e: bridget's nonzero exit is data, not fatal.
 
@@ -127,11 +185,47 @@ ALERT_STAMP="${BRIDGET_ALERT_STAMP:-$HOME/.pogo/bridget-supervise.alert}"
 # A hung notifier must never keep us from exiting.
 ALERT_TIMEOUT="${BRIDGET_ALERT_TIMEOUT:-10}"
 
+# Activation (mg-6ca7). See the header.
+#   ff   — report the revision, and fast-forward the checkout when that is
+#          provably lossless. The default: a merge nobody activated is a merge
+#          that did not happen.
+#   warn — report everything, touch nothing.
+#   off  — the pre-mg-6ca7 behaviour: run whatever the checkout happens to hold
+#          and say nothing about it. Here so an operator can turn this off
+#          without editing the script; not a state to leave a service in.
+ACTIVATION="${BRIDGET_ACTIVATION:-ff}"
+# The revision bridget is deployed from. A remote-tracking ref by default, since
+# that is what the refinery merges into; falls back to the local branch of the
+# same name for a checkout with no such remote.
+DEPLOY_REF="${BRIDGET_DEPLOY_REF:-origin/main}"
+GIT="${BRIDGET_GIT:-git}"
+# Stale code is the human's problem before it is the mayor's — it is his fix that
+# is not running — so this reporting goes to `human`, not to $ALERT_TO. Its own
+# stamp too: sharing the cooldown would let a path alert swallow a revision alert
+# for fifteen minutes, and the two say entirely different things.
+REVISION_ALERT_TO="${BRIDGET_REVISION_ALERT_TO:-human}"
+REVISION_STAMP="${BRIDGET_REVISION_ALERT_STAMP:-$HOME/.pogo/bridget-supervise.revision}"
+
 # `[<stamp>] supervise: ...`, not `[supervise <stamp>] ...`. Both carry the date,
 # but our lines and bridget's share one file, and only this order lets ONE
 # anchored pattern date the whole of it: `grep '^\[2026-08-09'` finds both
 # (mg-35b1). The word stays — a supervisor line is worth recognising at a glance.
-log() { printf '[%s] supervise: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+#
+# Per LINE, not per call, for the same reason bridget stamps per line: an alert
+# body is several lines, and the remedy is always on one of the later ones. A
+# continuation line that no date pattern matches is the mg-35b1 defect at a
+# smaller radius. A blank line stays blank rather than becoming trailing space.
+log() {
+    local stamp line
+    stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            printf '[%s] supervise: %s\n' "$stamp" "$line"
+        else
+            printf '\n'
+        fi
+    done <<< "$*"
+}
 
 child=""
 sleep_pid=""
@@ -187,32 +281,49 @@ ephemeral_veto() {
 runnable() { [[ -x "$1" || -f "$1" ]]; }
 
 # One alert per ALERT_COOLDOWN seconds across every respawn of this script.
+# Per stamp file, so the two things worth mailing about — a target we cannot
+# exec, and a revision we should not be running — cannot throttle each other.
 alert_due() {
-    local now last
+    local stamp="${1:-$ALERT_STAMP}" now last
     now="$(date +%s)"
-    if [[ -r "$ALERT_STAMP" ]]; then
-        last="$(cat "$ALERT_STAMP" 2>/dev/null)"
+    if [[ -r "$stamp" ]]; then
+        last="$(cat "$stamp" 2>/dev/null)"
         [[ "$last" =~ ^[0-9]+$ ]] || last=0
         (( now - last < ALERT_COOLDOWN )) && return 1
     fi
-    mkdir -p "$(dirname "$ALERT_STAMP")" 2>/dev/null || true
-    printf '%s\n' "$now" >"$ALERT_STAMP" 2>/dev/null || true
+    mkdir -p "$(dirname "$stamp")" 2>/dev/null || true
+    printf '%s\n' "$now" >"$stamp" 2>/dev/null || true
     return 0
 }
 
 notify() {
-    local subject="$1" body="$2"
+    local subject="$1" body="$2" to="${3:-$ALERT_TO}"
     if [[ -n "$ALERT_CMD" ]]; then
-        "$ALERT_CMD" "$subject" "$body" || log "alert command $ALERT_CMD failed"
+        # Third argument added for mg-6ca7; a notifier written against the old
+        # two-argument contract ignores it.
+        "$ALERT_CMD" "$subject" "$body" "$to" || log "alert command $ALERT_CMD failed"
         return 0
     fi
     if ! command -v mg >/dev/null 2>&1; then
         log "mg is not on PATH; this alert exists only in the log"
         return 0
     fi
-    mg mail send "$ALERT_TO" --from=bridget-supervise \
+    mg mail send "$to" --from=bridget-supervise \
         --subject="$subject" --body="$body" >/dev/null 2>&1 \
-        || log "mg mail send to $ALERT_TO failed; this alert exists only in the log"
+        || log "mg mail send to $to failed; this alert exists only in the log"
+}
+
+# Backgrounded so a wedged notifier cannot stall bridget's restart. The FATAL
+# paths drain it before exiting; the recovery paths let it finish while bridget
+# comes back up.
+mail_alert() {
+    local subject="$1" body="$2" to="$3" stamp="$4"
+    if ! alert_due "$stamp"; then
+        log "alert to $to throttled (last one <${ALERT_COOLDOWN}s ago)"
+        return 0
+    fi
+    notify "$subject" "$body" "$to" &
+    notify_pid=$!
 }
 
 # Loud on both streams: launchd routes them to bridget.log and bridget.err.log,
@@ -221,15 +332,23 @@ alert() {
     local subject="$1" body="$2"
     log "ALERT: $subject — $body"
     log "ALERT: $subject — $body" >&2
-    if ! alert_due; then
-        log "alert to $ALERT_TO throttled (last one <${ALERT_COOLDOWN}s ago)"
-        return 0
-    fi
-    # Backgrounded so a wedged notifier cannot stall bridget's restart. The
-    # FATAL paths drain it before exiting; the recovery path lets it finish
-    # while bridget comes back up.
-    notify "$subject" "$body" &
-    notify_pid=$!
+    mail_alert "$subject" "$body" "$ALERT_TO" "$ALERT_STAMP"
+}
+
+# A revision we should not be running is a fault, and gets both streams.
+revision_alert() {
+    local subject="$1" body="$2"
+    log "STALE: $subject — $body"
+    log "STALE: $subject — $body" >&2
+    mail_alert "$subject" "$body" "$REVISION_ALERT_TO" "$REVISION_STAMP"
+}
+
+# A revision we just corrected is news, not a fault: stdout and the mail. The
+# error log is where a human looks for what is broken, and this is what is fixed.
+revision_notice() {
+    local subject="$1" body="$2"
+    log "ACTIVATED: $subject — $body"
+    mail_alert "$subject" "$body" "$REVISION_ALERT_TO" "$REVISION_STAMP"
 }
 
 drain_alert() {
@@ -320,6 +439,160 @@ $DEFAULT_BIN is not a usable fallback, so bridget is down and this supervisor
 cannot bring it back. Run install.sh."
 }
 
+# --- Activation (mg-6ca7). See the header. ---------------------------------
+
+short() { printf '%s' "${1:0:7}"; }
+
+# The git checkout the target lives in, if it lives in one at all. An install by
+# copy is a legitimate deployment; it just cannot be revision-checked.
+checkout_of() {
+    local dir
+    dir="$(dirname "$(resolve_path "$1")")"
+    [[ -d "$dir" ]] || return 0
+    "$GIT" -C "$dir" rev-parse --show-toplevel 2>/dev/null || true
+}
+
+# Our own path relative to that checkout, when we are inside it. Empty otherwise
+# — this script is stand-alone enough to be copied elsewhere.
+self_in_checkout() {
+    local self
+    self="$(resolve_path "$0")"
+    case "$self" in "$1"/*) printf '%s\n' "${self#"$1"/}" ;; esac
+}
+
+# Appended to the `starting bridget` line, so the log records what each spawn
+# actually ran. mg-6ca7 was invisible in a log that said only "spawn #14".
+revision_note=""
+
+activate() {
+    revision_note=""
+    [[ "$ACTIVATION" == off ]] && return 0
+    if ! command -v "$GIT" >/dev/null 2>&1; then
+        # launchd's PATH is not a login shell's. Saying nothing here would make
+        # a missing git indistinguishable from a current checkout, which is the
+        # exact shape of the failure this function exists to end.
+        log "WARN: $GIT is not on PATH, so nothing can say which revision this is"
+        return 0
+    fi
+
+    local root head branch ref deploy behind why out rc new self
+    root="$(checkout_of "$BRIDGET_BIN")"
+    [[ -n "$root" ]] || return 0
+
+    head="$("$GIT" -C "$root" rev-parse HEAD 2>/dev/null)"
+    [[ -n "$head" ]] || return 0            # an empty repo: nothing to compare
+    branch="$("$GIT" -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [[ "$branch" == HEAD ]] && branch="a detached HEAD"
+
+    ref="$DEPLOY_REF"
+    deploy="$("$GIT" -C "$root" rev-parse --verify -q "$ref^{commit}" 2>/dev/null)"
+    if [[ -z "$deploy" && "$ref" == */* ]]; then
+        ref="${DEPLOY_REF##*/}"
+        deploy="$("$GIT" -C "$root" rev-parse --verify -q "$ref^{commit}" 2>/dev/null)"
+    fi
+    if [[ -z "$deploy" ]]; then
+        # Not fatal and not silent: we simply cannot answer the question, which
+        # is a different thing from answering it "fine".
+        revision_note=" at $(short "$head") on $branch"
+        log "WARN: $root has no $DEPLOY_REF, so nothing can say whether it is current"
+        return 0
+    fi
+
+    if [[ "$head" == "$deploy" ]]; then
+        revision_note=" at $(short "$head") on $branch (current with $ref)"
+        return 0
+    fi
+    revision_note=" at $(short "$head") on $branch"
+
+    if ! "$GIT" -C "$root" merge-base --is-ancestor "$head" "$deploy" 2>/dev/null; then
+        # The checkout holds commits $ref does not. Moving it is not ours to do,
+        # whatever else is true — this is the branch someone is mid-test on.
+        local relation="ahead of"
+        "$GIT" -C "$root" merge-base --is-ancestor "$deploy" "$head" 2>/dev/null \
+            || relation="diverged from"
+        revision_alert "bridget is running unmerged code, not $ref" \
+"$root is on $branch at $(short "$head"), $relation $ref ($(short "$deploy")).
+Which may be exactly what you want — but the running bridget is not the revision
+on $ref, and until now nothing said so. This supervisor will not move a branch
+carrying commits $ref does not have."
+        return 0
+    fi
+
+    behind="$("$GIT" -C "$root" rev-list --count "$head..$deploy" 2>/dev/null)"
+    [[ "$behind" =~ ^[0-9]+$ ]] || behind="?"
+    revision_note=" at $(short "$head") on $branch — $behind commit(s) behind $ref"
+
+    why=""
+    if [[ "$ACTIVATION" != ff ]]; then
+        why="BRIDGET_ACTIVATION=$ACTIVATION, which reports and touches nothing."
+    elif is_ephemeral "$root"; then
+        why="$root is a polecat worktree, supervised deliberately
+(BRIDGET_ALLOW_EPHEMERAL_BIN). Something is being tested in there; moving it to
+$ref would be vandalism, not activation."
+    elif [[ -n "$("$GIT" -C "$root" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        why="the working tree has uncommitted changes. Someone may be mid-test in
+there, and a supervisor that discards a human's work is worse than one that runs
+old code. Commit or stash them and restart."
+    fi
+
+    if [[ -n "$why" ]]; then
+        # A remote-tracking ref needs both commands; a local branch is already
+        # the thing you checked out, and a redundant second command in a warning
+        # is how a reader learns not to trust the first one.
+        local by_hand="git checkout ${ref##*/}"
+        [[ "$ref" == */* ]] && by_hand="$by_hand && git merge --ff-only $ref"
+        revision_alert "bridget is $behind commit(s) behind $ref and starting anyway" \
+"$root is on $branch at $(short "$head"); $ref is at $(short "$deploy").
+bridget is about to start from the OLD code, and restarting it will not change
+that — it will re-run the same old code and look healthy doing it (mg-6ca7).
+Not fast-forwarding, because $why
+To activate it by hand:
+    cd $root && $by_hand
+    launchctl kickstart -k gui/$(id -u)/com.pogo.bridget"
+        return 0
+    fi
+
+    log "$branch at $(short "$head") is $behind commit(s) behind $ref; the tree is clean and this branch carries nothing $ref lacks, so fast-forwarding"
+    out="$("$GIT" -C "$root" checkout "${ref##*/}" 2>&1)"
+    rc=$?
+    if (( rc == 0 )); then
+        out="$out
+$("$GIT" -C "$root" merge --ff-only "$ref" 2>&1)"
+        rc=$?
+    fi
+    new="$("$GIT" -C "$root" rev-parse HEAD 2>/dev/null)"
+    [[ -n "$new" ]] || new="$head"
+
+    if (( rc != 0 )) || [[ "$new" != "$deploy" ]]; then
+        # Never fatal: bridget on old code beats no bridget at all. But loud —
+        # this is the state the whole ticket is about, now with a reason.
+        revision_note=" at $(short "$new") on $("$GIT" -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        revision_alert "bridget could not be moved to $ref and is starting on old code" \
+"$root is still at $(short "$new"); $ref is at $(short "$deploy"). git said:
+$out"
+        return 0
+    fi
+
+    local body="$root was on $branch at $(short "$head"), $behind commit(s) behind $ref.
+The tree was clean and $branch carried nothing $ref lacks, so the checkout was
+moved to ${ref##*/} at $(short "$new") and bridget is starting from that. Nothing was
+discarded: $branch still points at $(short "$head")."
+    self="$(self_in_checkout "$root")"
+    if [[ -n "$self" ]] \
+        && [[ -n "$("$GIT" -C "$root" diff --name-only "$head" "$new" -- "$self" 2>/dev/null)" ]]; then
+        # bridget is re-exec'd every spawn and so is current for free. We are
+        # not: bash is reading this script from the copy it opened at startup.
+        body="$body
+
+$self CHANGED in that range, and THIS PROCESS IS STILL THE OLD COPY. bridget is
+current; its supervisor is not. To activate it:
+    launchctl kickstart -k gui/$(id -u)/com.pogo.bridget"
+        log "WARN: $self changed too, and this supervisor is still the old copy — launchctl kickstart -k gui/$(id -u)/com.pogo.bridget"
+    fi
+    revision_note=" at $(short "$new") on ${ref##*/} (fast-forwarded from $(short "$head"))"
+    revision_notice "bridget fast-forwarded to $(short "$new") ($ref)" "$body"
+}
+
 resolve_target startup
 
 backoff="$MIN_BACKOFF"
@@ -329,10 +602,14 @@ log "supervising $BRIDGET_BIN (pid $$)"
 
 while true; do
     resolve_target respawn
+    # Before every spawn, not once at startup, and for the same reason defense 2
+    # is: a merge lands while bridget is running, and the restart after it is the
+    # moment that either activates the new code or silently re-runs the old.
+    activate
 
     started="$SECONDS"
     spawns=$((spawns + 1))
-    log "starting bridget (spawn #$spawns)"
+    log "starting bridget (spawn #$spawns)$revision_note"
 
     "$BRIDGET_BIN" &
     child=$!

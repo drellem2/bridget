@@ -212,6 +212,50 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **A merge to main is no longer inert: the supervisor knows which revision it
+  is running (mg-6ca7).** `bridget-supervise` execs the bridget file in the
+  working checkout, on whatever branch that checkout is on. On 2026-08-11 it was
+  on `representative-relay-mg-65d2`, two commits behind `origin/main`, so the
+  duplication limit above was merged, mailed as MERGED, and **not running** —
+  with a healthy process and a green `launchctl` the whole time. A human moved
+  the branch by hand.
+
+  Two properties make that worth code. It was **silent**: no log line anywhere
+  named a revision, so a stale run and a current one read identically. And it
+  **survived a restart**: restarting is the standard remedy for "the fix isn't
+  live", and here it faithfully re-ran the old code and confirmed the wrong
+  state.
+
+  Every spawn now names the revision it started — `starting bridget (spawn #1)
+  at 3a821ca on main (current with origin/main)` — and a checkout behind the
+  deploy ref reports on stdout, on stderr, and by mailing `human`. The check is
+  against `BRIDGET_DEPLOY_REF` (`origin/main`), **not** against the checkout's
+  tracking branch: the branch this was found on had no upstream at all and every
+  branch that had one was level with it, so a tracking-branch check would have
+  printed nothing on the day it happened. Nothing fetches — a restart path is no
+  place for a network call that can hang.
+
+  Where the repair is provably lossless it is now made automatically
+  (`git checkout main && git merge --ff-only origin/main`), and **only** when
+  HEAD is a strict ancestor of the deploy ref (so the branch carries nothing main
+  lacks, the branch ref is left pointing exactly where it was, and nothing is
+  discarded), the tree has no modified or staged tracked file, and the checkout
+  is not a polecat worktree someone opted into supervising. Otherwise nothing is
+  touched — **loudly**, naming both commands that would fix it by hand. The
+  defect here was silence, so a silent refusal would be the same defect with
+  better manners. `BRIDGET_ACTIVATION=warn` keeps every report and touches
+  nothing; `off` restores the previous behaviour.
+
+  The one thing this cannot repair in place is itself: bridget is re-exec'd every
+  spawn, but the supervisor is already running and bash reads its own source
+  lazily. So a fast-forward that changes `bridget-supervise` says exactly that
+  and names the `launchctl kickstart -k` that activates it, rather than
+  re-execing an unverified copy into launchd's pended-nondemand-spawn machinery.
+
+  Supervisor log lines are now stamped **per line** rather than per call, so the
+  multi-line bodies this adds keep mg-35b1's anchored date on the continuation
+  lines — which is where the remedy is written.
+
 - **One mail no longer becomes N Discord threads after N gateway reconnects.**
   `on_ready` is fired by discord.py on every gateway RECONNECT, not just at
   process start, and it spawned a fresh set of maildir watchers each time with
