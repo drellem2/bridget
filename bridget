@@ -63,6 +63,7 @@ except ImportError:  # pragma: no cover — fallback for 3.10
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridget_core import (  # noqa: E402
     ConversationStore,
+    DuplicateLimiter,
     MaildirWatcher,
     MgCapabilities,
     SettingsStore,
@@ -82,6 +83,7 @@ from bridget_core.mail import (  # noqa: E402
 from bridget_core.logstamp import install_line_timestamps  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
+from bridget_core.ratelimit import claims_ancestry, isoformat  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
 from bridget_core.statefile import (  # noqa: E402
     STATE_FILE_MODE,
@@ -114,6 +116,10 @@ CHANNELS_FILE = HOME / '.pogo' / 'bridget.channels.toml'
 CHANNEL_IDS_FILE = HOME / '.pogo' / 'bridget.channel-ids.json'
 CONVERSATIONS_FILE = HOME / '.pogo' / 'bridget.conversations.json'
 SETTINGS_FILE = HOME / '.pogo' / 'bridget.settings.json'
+#: Per-condition state for the duplication limit (mg-5521): when each repeated
+#: alert last got through, and how many firings have been held back since. Lost
+#: state costs one extra notification per live condition, never a silence.
+DEDUP_FILE = HOME / '.pogo' / 'bridget.dedup.json'
 QUIET_FILE = HOME / '.pogo' / 'quiet.json'
 TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 #: The task-transition watcher runs two diffs against separate state caches: the
@@ -229,6 +235,7 @@ COMMAND_LIST = (
     "• `restart` — git pull + restart bridget (after merging a PR)\n"
     "• `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00)\n"
     "• `settings` — show DM policy, mutes, and threading state\n"
+    "• `dupes` — repeated alerts the duplication limit is holding back\n"
     "• `dm <all|curated|none>` — how much mail reaches your DMs\n"
     "• `mute all` / `unmute all` — silence every DM (mail still threads; with\n"
     "  no log channel it is held, not dropped)\n"
@@ -374,6 +381,35 @@ def load_config() -> dict:
         die(f"BRIDGET_FULL_POLL_INTERVAL ({full_poll_interval}) must be >= "
             f"BRIDGET_POLL_INTERVAL ({poll_interval}).")
 
+    # The duplication limit (mg-5521). A repeated alert is delivered the first
+    # time it fires, then re-notified on a doubling backoff starting at
+    # BRIDGET_DEDUP_WINDOW and capped at BRIDGET_DEDUP_MAX_WINDOW; firings in
+    # between are counted, logged, and reported in the next notice rather than
+    # sent. Set the window to 0 to switch the limit off entirely.
+    def positive_int(name: str, default: int, *, allow_zero: bool = False) -> int:
+        raw = lookup(name)
+        try:
+            value = int(raw) if raw else default
+        except ValueError:
+            die(f"{name} must be an integer (got {raw!r}).")
+        floor = 0 if allow_zero else 1
+        if value < floor:
+            die(f"{name} must be >= {floor} (got {value}).")
+        return value
+
+    dedup_window = positive_int('BRIDGET_DEDUP_WINDOW', 900, allow_zero=True)
+    dedup_max_window = positive_int('BRIDGET_DEDUP_MAX_WINDOW', 14400)
+    dedup_ttl = positive_int('BRIDGET_DEDUP_TTL', 86400)
+    if dedup_window and dedup_max_window < dedup_window:
+        die(f"BRIDGET_DEDUP_MAX_WINDOW ({dedup_max_window}) must be >= "
+            f"BRIDGET_DEDUP_WINDOW ({dedup_window}).")
+    if dedup_window and dedup_ttl < dedup_window:
+        # A TTL shorter than the backoff would expire a condition before its
+        # next notice was due, so every firing would look like a first
+        # occurrence and the limit would quietly do nothing.
+        die(f"BRIDGET_DEDUP_TTL ({dedup_ttl}) must be >= "
+            f"BRIDGET_DEDUP_WINDOW ({dedup_window}).")
+
     quiet_respects_outbound_raw = (lookup('BRIDGET_QUIET_RESPECTS_OUTBOUND') or 'false').strip().lower()
     quiet_respects_outbound = quiet_respects_outbound_raw in ('true', '1', 'yes', 'on')
 
@@ -443,6 +479,9 @@ def load_config() -> dict:
         'inbox_tag': inbox_tag,
         'poll_interval': poll_interval,
         'full_poll_interval': full_poll_interval,
+        'dedup_window': dedup_window,
+        'dedup_max_window': dedup_max_window,
+        'dedup_ttl': dedup_ttl,
         'quiet_respects_outbound': quiet_respects_outbound,
         'approval_re': approval_re,
         'restart_cmd': restart_cmd,
@@ -688,6 +727,19 @@ THREADS_ENABLED = LOG_CHANNEL_ID is not None
 #: Both persist to ~/.pogo/ and survive restarts.
 CONVERSATIONS = ConversationStore(CONVERSATIONS_FILE)
 SETTINGS = SettingsStore(SETTINGS_FILE, default_dm_policy=CONFIG['dm_policy'])
+
+#: The duplication limit (mg-5521). Every sender that writes to `human/new/` —
+#: pogod, hey-feed, doctor, the watchdog scripts — crosses this one chokepoint on
+#: the way to Discord, which is why the limit lives here and not in any one
+#: sender's mailer. First occurrence goes straight through; repeats of the same
+#: condition are held and reported.
+DEDUP = DuplicateLimiter(
+    DEDUP_FILE,
+    base_interval=CONFIG['dedup_window'],
+    max_interval=CONFIG['dedup_max_window'],
+    ttl=CONFIG['dedup_ttl'],
+    enabled=CONFIG['dedup_window'] > 0,
+)
 
 
 def _probe_mg_help() -> str:
@@ -1162,6 +1214,12 @@ ACK_CANDIDATE_LIMIT = 5
 #: Muted conversations listed by the `settings` command before eliding.
 SETTINGS_MUTED_LIMIT = 10
 
+#: How wide a repeated alert's subject may be in the `dupes` view.
+DUPES_SUBJECT_LIMIT = 90
+
+#: Conditions the `dupes` command lists, loudest first.
+DUPES_LIMIT = 15
+
 # A routed reply is acknowledged by *reacting on the human's own message*, not
 # by posting a text confirmation into the thread (mg-aefb). Daniel asked twice
 # to stop the "✅ delivered to `mayor`…" chatter cluttering the conversation;
@@ -1289,6 +1347,40 @@ def render_settings(summary: dict) -> str:
         lines.append('• Muted conversations: none')
     if summary['updated_at']:
         lines.append(f"• Updated: {summary['updated_at']}")
+    return '\n'.join(lines)
+
+
+def render_dupes(summary: dict) -> str:
+    """Turn `DuplicateLimiter.summary()` into the `dupes` command's output.
+
+    This is the pull view of what the limit has held back. It exists so a
+    suppressed alert is never merely gone: the log has a line per suppression,
+    the next still-happening notice carries the count, and this shows the
+    standing tally on demand.
+    """
+    if not summary['enabled']:
+        return ('🔁 Duplicate limiting is **off** — every repeat is delivered.\n'
+                'Set `BRIDGET_DEDUP_WINDOW` to a positive number of seconds to enable it.')
+    lines = [
+        '🔁 **duplicate alerts**',
+        f"• Repeat notices back off from `{summary['base_interval']}s` to "
+        f"`{summary['max_interval']}s`; a condition quiet for "
+        f"`{summary['ttl']}s` counts as new again",
+        f"• Conditions tracked: **{summary['conditions']}**",
+        f"• Suppressed since each condition's first notice: **{summary['suppressed_total']}** "
+        f"({summary['holding']} awaiting the next notice)",
+    ]
+    if not summary['top']:
+        lines.append('• Nothing has repeated yet.')
+        return '\n'.join(lines)
+    lines.append('\n**Loudest conditions:**')
+    for row in summary['top']:
+        subject = _elide(row['subject'] or '(no subject)', DUPES_SUBJECT_LIMIT)
+        lines.append(
+            f"• [{row['sender'] or '?'}] {subject}\n"
+            f"    fired {row['occurrences']}×, notified {row['delivered']}×, "
+            f"suppressed {row['suppressed_total']} (last seen {row['last_seen'] or '?'})"
+        )
     return '\n'.join(lines)
 
 
@@ -1434,7 +1526,7 @@ def thread_messages(header: str, body: str, limit: int = DISCORD_MSG_LIMIT) -> l
             for i, chunk in enumerate(chunks)]
 
 
-async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
+async def post_to_thread(conv, mail: dict, message_id: str = '', prefix: str = '') -> str:
     """Post `mail` into its conversation thread. Returns the thread URL, or ''
     if the thread could not be reached.
 
@@ -1456,6 +1548,9 @@ async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
     header = defuse_fences(f"**{mail['from']}** — {mail['subject']}\n")
     if len(header) > MAIL_HEADER_LIMIT:
         header = header[:MAIL_HEADER_LIMIT - 2] + '…\n'
+    # `prefix` is bridget's own words (the still-happening notice), not mail
+    # content, so it goes outside the bounded/defused header.
+    header = prefix + header
     try:
         for text in thread_messages(header, mail['body']):
             await thread.send(text)
@@ -1473,6 +1568,38 @@ async def post_to_thread(conv, mail: dict, message_id: str = '') -> str:
     return thread_url(thread.id)
 
 
+def format_repeat_notice(decision) -> str:
+    """The line that tells the human a repeated alert is still firing.
+
+    It carries the two numbers that make the suppression recoverable: how many
+    firings were held back since the last notice, and when that notice was. The
+    mail itself is untouched below it.
+    """
+    since = isoformat(decision.last_delivered) or isoformat(decision.first_seen)
+    held = decision.suppressed_since
+    plural = '' if held == 1 else 's'
+    return (f"🔁 still happening — notice #{decision.delivered}, "
+            f"{held} repeat{plural} suppressed since {since or 'the first one'}.\n")
+
+
+def log_suppressed(filename: str, mail: dict, decision) -> None:
+    """Record a suppressed repeat in the log.
+
+    Not decoration. A duplication limit whose suppressions leave no trace is
+    indistinguishable from mail being dropped, which is the one outcome the
+    ticket rules out — so every held firing is greppable here, counted into the
+    next still-happening notice, and listed by the `dupes` command. The mail
+    itself is untouched in `human/new/`: bridget is observe-only, so `mg mail
+    list human` still shows every copy.
+    """
+    print(f"dedup: suppressed repeat #{decision.occurrences} of "
+          f"[{mail['from']}] {mail['subject']!r} ({filename}); "
+          f"{decision.suppressed_since + 1} held since "
+          f"{isoformat(decision.last_delivered) or 'the first notice'}, "
+          f"next notice in >= {DEDUP.interval_for(decision.delivered)}s",
+          flush=True)
+
+
 async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     """Route one new mail to the surfaces it belongs on.
 
@@ -1480,11 +1607,17 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     record, and muting a conversation should not make its mail disappear. Only
     the DM is gated.
 
-    The exception is a log channel we could not reach. If we then also honored a
-    `curated`/`none` policy or a mute, the mail would surface nowhere. In that
-    one case the DM is the last surface standing, and it wins over policy, mute,
-    and quiet hours — a mail arriving at a bad hour is a smaller harm than a mail
-    nobody ever sees.
+    A repeated alert is the one thing that can suppress the thread as well as
+    the DM (mg-5521): 31 root cards in the log channel is the same flood as 31
+    DMs. The limit never touches a first occurrence, so a repeat it holds says
+    nothing the human has not already been told, and the held count is reported
+    on the next notice.
+
+    The other exception runs the other way — a log channel we could not reach.
+    If we then also honored a `curated`/`none` policy or a mute, the mail would
+    surface nowhere. In that one case the DM is the last surface standing, and it
+    wins over policy, mute, and quiet hours — a mail arriving at a bad hour is a
+    smaller harm than a mail nobody ever sees.
 
     Returns False if a *send* failed, so the caller leaves the mail uncommitted
     and retries it on the next poll. A mail deliberately suppressed by policy
@@ -1499,8 +1632,29 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     # only mint a fresh key when we recognize none of them. Probing first is
     # what carries a thread past its first round-trip — a reply's `References`
     # names its parent, not the root the conversation is keyed on.
-    key = (CONVERSATIONS.resolve(correlation_candidates(mail, fallback=filename))
-           or conversation_key(mail, fallback=filename))
+    resolved = CONVERSATIONS.resolve(correlation_candidates(mail, fallback=filename))
+    key = resolved or conversation_key(mail, fallback=filename)
+
+    # The duplication limit (mg-5521). Only mail that roots its own conversation
+    # and names no ancestor is eligible: a reply normalises to the same key as
+    # the message it answers (`Re: ` is stripped), so rate-limiting one would
+    # silence a live conversation rather than a repeating watcher. Every alert in
+    # the measured flood roots its own conversation, so this costs no coverage.
+    decision = None
+    if resolved is None and not claims_ancestry(mail):
+        decision = DEDUP.decide(mail['from'], mail['subject'])
+        if not decision.deliver:
+            log_suppressed(filename, mail, decision)
+            DEDUP.commit(decision, sender=mail['from'], subject=mail['subject'])
+            # Handled, not dropped — the mail is committed to the seen-set so it
+            # is not re-offered every poll for the rest of the incident.
+            return True
+        if decision.kind == 'repeat' and decision.conversation in CONVERSATIONS:
+            # Fold the notice into the thread the first occurrence opened, so a
+            # condition owns one thread rather than one per firing.
+            key = decision.conversation
+
+    notice = format_repeat_notice(decision) if decision and decision.kind == 'repeat' else ''
 
     if THREADS_ENABLED:
         message_id = reply_target(mail, fallback=filename)
@@ -1512,7 +1666,7 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
         )
         # Idempotent in `message_id`: a redelivery gets the thread's URL, not a
         # second copy in the thread.
-        url = await post_to_thread(conv, mail, message_id=message_id)
+        url = await post_to_thread(conv, mail, message_id=message_id, prefix=notice)
     else:
         # No threads, no thread map. Recording every mail here would rewrite the
         # conversation file on each delivery for a feature that is switched off.
@@ -1520,19 +1674,38 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
 
     stranded = THREADS_ENABLED and not url
     if not stranded and not should_dm(mail, key):
+        commit_dedup(decision, mail, key)
         return True
 
-    prefix = ''
+    prefix = notice
     if stranded:
-        prefix = '⚠️ log channel unreachable — delivering here instead.\n'
+        prefix += '⚠️ log channel unreachable — delivering here instead.\n'
     try:
         await user.send(format_mail_card(mail, thread_link=url, prefix=prefix))
     except discord.HTTPException as e:
         # Transient by default (429/5xx). Report failure so the mail is retried
-        # rather than silently consumed by the seen-set.
+        # rather than silently consumed by the seen-set — and leave the limiter
+        # untouched, so the retry is still this condition's first notice rather
+        # than a repeat the limit would swallow.
         print(f'DM failed for {filename}, will retry: {e}', file=sys.stderr)
         return False
+    commit_dedup(decision, mail, key)
     return True
+
+
+def commit_dedup(decision, mail: dict, conversation: str) -> None:
+    """Record a delivery against the duplication limit — after it landed.
+
+    Called on the paths that return True having actually put the mail on a
+    surface (or having deliberately suppressed it by DM policy, which is still
+    "the human has been told as much as he asked to be"). Never on the failure
+    path: a limiter that counted a failed send as the first notice would
+    suppress its retry, converting a transient Discord outage into a dropped
+    alert — the very failure this limit is supposed to prevent.
+    """
+    if decision is not None:
+        DEDUP.commit(decision, sender=mail['from'], subject=mail['subject'],
+                     conversation=conversation)
 
 
 #: Every long-lived watcher task the current session spawned, so the *next*
@@ -2291,6 +2464,13 @@ def get_status_summary() -> str:
     unread = sorted(MAIL_DIR.iterdir()) if MAIL_DIR.exists() else []
     parts.append(f"📬 Unread mail to human: **{len(unread)}**")
 
+    dedup = DEDUP.summary()
+    if dedup['suppressed_total']:
+        parts.append(
+            f"🔁 Duplicate alerts suppressed: **{dedup['suppressed_total']}** "
+            f"across {dedup['conditions']} condition(s) — `dupes` for the list"
+        )
+
     if unread:
         for p in unread:
             try:
@@ -2768,7 +2948,20 @@ def handle_command(text: str) -> str:
             out += f'\n• Threads: `on` → <#{LOG_CHANNEL_ID}>'
             out += f'\n• Conversations tracked: **{len(CONVERSATIONS)}**'
         out += f'\n• Correlation IDs (reply threading): `{MG_CAPS.describe()}`'
+        dedup = DEDUP.summary()
+        if dedup['enabled']:
+            out += (f"\n• Duplicate limit: `on` — repeat notices back off "
+                    f"`{dedup['base_interval']}s` → `{dedup['max_interval']}s` "
+                    f"({dedup['suppressed_total']} suppressed; `dupes` for detail)")
+        else:
+            out += '\n• Duplicate limit: `off` (set BRIDGET_DEDUP_WINDOW to enable)'
         return out
+
+    if low in ('dupes', 'duplicates', 'suppressed'):
+        view = render_dupes(DEDUP.summary(limit=DUPES_LIMIT))
+        if len(view) > STATUS_OUTPUT_BUDGET:
+            view = view[:STATUS_OUTPUT_BUDGET] + '\n…(truncated)'
+        return view
 
     if low == 'dm' or low.startswith('dm '):
         arg = text[2:].strip().lower()

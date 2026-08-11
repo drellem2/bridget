@@ -12,6 +12,58 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **A duplication limit for repeated alerts (mg-5521).** Daniel: *"stall-watch
+  etc send me emails which becomes crazy annoying on discord … bc they duplicate
+  a lot, if there was some sort of duplication limit that would be fine."* A
+  measured snapshot of `~/.macguffin/mail/human/new/` held 1404 unread, in which
+  one alert appeared 31 times and the eight loudest subjects accounted for 109
+  messages. bridget now folds each alert to the **condition** it describes —
+  `(sender, subject with digit runs replaced by N)` — and holds repeats.
+
+  The folding is the part that does the work. The three loudest ack-watch rows
+  in that snapshot were one condition whose fire count drifted (`90` / `91` /
+  `92` fires), so a limit keyed on the literal subject would have caught almost
+  none of the volume. mg-ids are deliberately **not** folded: `approval needed
+  mg-4fc0` and `approval needed mg-9a13` are two decisions waiting on the human,
+  and collapsing them would suppress the second — the mail this limit has least
+  right to hold back.
+
+  A **first occurrence is never delayed and never dropped**. Only repeats are
+  held, and the gap between notices doubles (15 min → 30 → 60 → 120, capped at
+  4 h), so a condition that is still firing keeps saying so at a decaying rate
+  rather than going dark; a condition unseen for 24 h counts as new again.
+  Nothing suppressed is untraceable: every held firing writes a `dedup:` line to
+  the log, the next notice leads with `🔁 still happening — notice #N, M repeats
+  suppressed since T`, the new `dupes` command shows the standing tally, and
+  `status` carries the count. The maildir is untouched — bridget is still
+  observe-only, so every copy remains in `new/` and `mg mail list human` still
+  shows all of them.
+
+  Replaying the measured counts through the delivery path turns **114 alerts
+  into 10 DMs and 7 threads** — one thread per condition rather than one per
+  firing, since a repeat notice is folded into the thread its first occurrence
+  opened.
+
+  The limit sits in the delivery path rather than in any sender's mailer because
+  the senders are not one process: `hey-feed`, `doctor`, the watchdog scripts and
+  `gh-intake-watch` write to the maildir directly, and a fix inside pogod would
+  have covered only part of the traffic. `human/new/` is the one chokepoint they
+  all cross.
+
+  Two exclusions are deliberate. A **reply** is never rate-limited — it
+  normalises to the same key as the mail it answers (`Re: ` is stripped), so
+  limiting it would silence a live conversation rather than a repeating watcher;
+  only mail that roots its own conversation and names no ancestor is eligible. A
+  **failed send** is never counted as a notice — the limiter decides and records
+  in two steps and writes nothing until the mail reaches a surface, because a
+  limiter that counted a failed DM as the first occurrence would suppress its
+  retry, converting a transient Discord outage into a dropped alert by way of
+  the mechanism meant to stop alerts being lost.
+
+  New keys, all optional: `BRIDGET_DEDUP_WINDOW` (default `900`; `0` switches the
+  limit off entirely), `BRIDGET_DEDUP_MAX_WINDOW` (`14400`), `BRIDGET_DEDUP_TTL`
+  (`86400`). State lives in `~/.pogo/bridget.dedup.json`; losing it costs one
+  extra notification per live condition, never a silence.
 - **Per-channel routing is now visible in `settings` and at startup.** The
   `settings` command and the startup log both report whether per-agent routing
   is on (`N channel(s); agent(s): …`) or off. When it is off because no

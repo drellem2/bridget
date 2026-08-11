@@ -128,6 +128,16 @@ See [Conversation threads](#conversation-threads-optional).
 | `BRIDGET_DM_POLICY` | `all` | `all` / `curated` / `none` — how much mail reaches your DMs. Anything but `all` requires a log channel. |
 | `BRIDGET_CORRELATION_IDS` | `auto` | `auto` / `on` / `off` — whether replies thread via `mg mail send --in-reply-to`. |
 
+### Duplication-limit knobs
+
+See [The duplication limit](#the-duplication-limit).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `BRIDGET_DEDUP_WINDOW` | `900` | Seconds before a repeated alert may notify again. Each further notice doubles the wait. `0` switches the limit off. |
+| `BRIDGET_DEDUP_MAX_WINDOW` | `14400` | Ceiling on that doubling. Must be >= `BRIDGET_DEDUP_WINDOW`. |
+| `BRIDGET_DEDUP_TTL` | `86400` | Quiet time after which a condition counts as new again. Must be >= `BRIDGET_DEDUP_WINDOW`. |
+
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
 
@@ -179,6 +189,10 @@ and `discord.py`'s own logging is disabled (`log_handler=None`).
 - `restart` — git pull + restart bridget (after merging a PR; see [Remote restart](#remote-restart)).
 - `quiet <true|false> [HH:MM HH:MM]` — toggle agent quiet hours (default 23:00–06:00).
 - `settings` — show the DM policy, muted conversations, and threading state.
+- `dupes` (or `duplicates` / `suppressed`) — the repeated alerts the
+  [duplication limit](#the-duplication-limit) is holding back: how often each
+  condition has fired, how often you were told, and how many repeats were
+  suppressed.
 - `dm <all|curated|none>` — change how much mail reaches your DMs, live.
 - `mute all` / `unmute all` — silence every DM. With a log channel, mail still
   threads into it. Without one the DM was your only surface, so mail is held in
@@ -335,6 +349,59 @@ Delivery is **at-least-once**: if Discord rejects a send (rate limit, 5xx), the
 mail is un-seen and retried on the next poll rather than silently consumed.
 
 The `dismiss` and `read` commands do mark mail read — because you asked them to.
+
+## The duplication limit
+
+Fleet watchers repeat themselves. A measured snapshot of one `human/new/` held
+**1404 unread**, in which a single alert appeared 31 times and the eight loudest
+subjects accounted for 109 messages. bridget is the one chokepoint every sender
+crosses on the way to Discord — pogod, `hey-feed`, `doctor`, the watchdog scripts
+and `gh-intake-watch` all write to that maildir directly — so the limit lives
+here rather than in any one watcher's mailer.
+
+**A condition is `(sender, subject with digit runs folded to N)`.** Folding
+matters more than it looks: the three loudest ack-watch rows in that snapshot
+were one condition whose fire count drifted, and a limit keyed on the literal
+subject would have caught almost none of it.
+
+```
+ack-watch: FLEET BLACKOUT — 90 fires delivered in the last 3h0m0s, NONE completed   ×13
+ack-watch: FLEET BLACKOUT — 92 fires delivered in the last 3h0m0s, NONE completed   ×9
+ack-watch: FLEET BLACKOUT — 91 fires delivered in the last 3h0m0s, NONE completed   ×5
+```
+
+**mg-ids are not folded.** `approval needed mg-4fc0` and `approval needed
+mg-9a13` are two different decisions waiting on you; folding them would suppress
+the second — the mail the limit has least right to hold back.
+
+**A first occurrence is never delayed and never dropped.** Only repeats are
+held, and the wait between notices doubles — 15 minutes, 30, 60, 120, up to
+4 hours — so a condition that is still firing keeps saying so at a decaying rate
+instead of going quiet. A condition unseen for 24 hours counts as new again.
+
+**Nothing suppressed is untraceable.** Every held firing gets a `dedup:` line in
+the log, the next notice leads with `🔁 still happening — notice #N, M repeats
+suppressed since T`, `dupes` shows the standing tally, and `status` carries the
+count. The mail itself is untouched: bridget is observe-only, so all 31 copies
+are still in `human/new/` and `mg mail list human` still shows every one.
+
+Replaying that measured snapshot through the delivery path turns **114 alerts
+into 10 DMs and 7 threads** — one thread per condition rather than one per
+firing, since a repeat notice is folded into the thread its first occurrence
+opened (`tests/test_dedup.py`).
+
+Set `BRIDGET_DEDUP_WINDOW=0` to switch the limit off and deliver every repeat.
+
+Two things the limit deliberately does **not** do:
+
+- It does not rate-limit a **reply**. A reply normalises to the same key as the
+  mail it answers (`Re: ` is stripped), so limiting it would silence a live
+  conversation rather than a repeating watcher. Only mail that roots its own
+  conversation and names no ancestor is eligible.
+- It does not count a **failed** send as a notice. The limiter decides and
+  records in two steps, and the record is written only after the mail reaches a
+  surface — otherwise a transient Discord outage would be laundered into a
+  silently swallowed alert by the very limit meant to prevent losing alerts.
 
 ## Quiet hours
 
@@ -898,6 +965,9 @@ bridget_core/          transport-agnostic. Imports no chat library at all.
   conversations.py     conversation <-> thread map + message-id index,
                        persisted across restarts
   settings.py          live-reloadable mute / DM-policy state
+  ratelimit.py         the duplication limit: fold a repeated alert to the
+                       condition it describes, deliver the first occurrence,
+                       hold and count the rest
   mgshim.py            the mg CLI seam: detect --in-reply-to, degrade if absent
   acks.py              delivered / ambiguous / undeliverable outcomes
 

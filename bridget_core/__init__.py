@@ -25,6 +25,10 @@ Slack, Matrix, or a terminal:
     mailbox       — observe-only maildir scanning with seen-set de-duplication.
     conversations — the conversation <-> thread map, persisted across restarts.
     settings      — live-tunable mute/settings state, persisted.
+    ratelimit     — the duplication limit: fold a repeated alert's subject to
+                    the condition it describes, deliver the first occurrence
+                    immediately, and re-notify on a decaying backoff instead of
+                    once per firing (mg-5521).
     acks          — the delivery / ambiguity / undeliverable outcome model.
     mgshim        — the mg CLI seam: detect whether this build of mg supports
                     correlation IDs, and degrade cleanly when it does not.
@@ -60,22 +64,34 @@ from .mgshim import (
     parse_sent_message_id,
     subject_label,
 )
+from .ratelimit import (
+    Decision,
+    DuplicateLimiter,
+    alert_key,
+    claims_ancestry,
+    normalize_subject,
+)
 from .settings import SettingsStore
 
 __all__ = [
     'Ack',
     'Conversation',
     'ConversationStore',
+    'Decision',
+    'DuplicateLimiter',
     'MG_SUBJECT_LIMIT',
     'MaildirWatcher',
     'MgCapabilities',
     'SettingsStore',
+    'alert_key',
     'ambiguous',
     'build_send_args',
+    'claims_ancestry',
     'compose_subject_body',
     'conversation_key',
     'correlation_candidates',
     'delivered',
+    'normalize_subject',
     'is_unknown_flag_error',
     'parse_mail',
     'parse_sent_message_id',

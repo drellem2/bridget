@@ -616,11 +616,19 @@ class TestDeliverMail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.threads), 2)
 
     async def test_pre_gh66_mail_threads_on_its_filename(self):
-        """No correlation headers at all: safe degrade, one thread per mail."""
-        await self.b.deliver_mail(self.user, 'file-a', mail())
-        await self.b.deliver_mail(self.user, 'file-b', mail())
+        """No correlation headers at all: safe degrade, one thread per mail.
+
+        The two mails carry *different* subjects because since mg-5521 the
+        duplication limit folds repeats of one condition into a single thread —
+        two headerless mails saying the same thing are that case, not this one.
+        What this test guards is the fallback key: with no Message-Id to thread
+        on, the maildir filename is what keeps unrelated mail apart.
+        """
+        await self.b.deliver_mail(self.user, 'file-a', mail(subject='disk is full'))
+        await self.b.deliver_mail(self.user, 'file-b', mail(subject='build is red'))
         self.assertEqual(len(self.channel.threads), 2)
         self.assertIn('file-a', self.b.CONVERSATIONS.keys())
+        self.assertIn('file-b', self.b.CONVERSATIONS.keys())
 
     async def test_conversation_map_survives_restart(self):
         """The point of persisting: don't orphan a live Discord thread."""

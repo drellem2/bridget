@@ -65,6 +65,13 @@ python3 tests/test_delivery_liveness.py
 # that retired watchers actually stop, and that the teardown is LOGGED. Carries
 # a pre-fix control that reproduces N+1 delivery. Stubs discord.
 python3 tests/test_watcher_idempotence.py
+# The duplication limit (mg-5521): 1404 unread, one alert repeated 31 times, and
+# three of the loudest rows one condition whose fire count drifted 90/91/92 —
+# so the key normalises digits, and preserves mg-ids, which are identity rather
+# than drift. Replays the measured subject counts through deliver_mail and
+# asserts the flood shrinks; proves a first occurrence is never held and a
+# FAILED send is never counted as one. Stubs discord.
+python3 tests/test_dedup.py
 # The undateable log (mg-35b1): every line bridget and its supervisor emit must
 # carry the fleet's `[<ISO-8601 UTC>] ` prefix, because a log whose absence of a
 # date match is indistinguishable from an absence of events is an instrument
