@@ -137,6 +137,7 @@ See [The duplication limit](#the-duplication-limit).
 | `BRIDGET_DEDUP_WINDOW` | `900` | Seconds before a repeated alert may notify again. Each further notice doubles the wait. `0` switches the limit off. |
 | `BRIDGET_DEDUP_MAX_WINDOW` | `14400` | Ceiling on that doubling. Must be >= `BRIDGET_DEDUP_WINDOW`. |
 | `BRIDGET_DEDUP_TTL` | `86400` | Quiet time after which a condition counts as new again. Must be >= `BRIDGET_DEDUP_WINDOW`. |
+| `BRIDGET_RELAY_HEARTBEAT` | `3600` | Seconds between `relay: N delivered …` lines in `bridget.log` when idle — the delivery path's positive record. `0` switches it off, restoring a log whose silence means nothing. |
 
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
@@ -823,8 +824,12 @@ one covers every restart nobody typed — a crash, a reboot, a `kickstart`.
 
 ### Is it actually alive?
 
-Do not infer liveness from the last line in `~/.pogo/bridget.log` — a quiet
-mailbox and a dead poller look identical there. The task-transition watcher
+Three instruments, narrowest last: a loop heartbeat, a delivery heartbeat, and
+a `relay:` line in the log that says how much has been carried. Read the log
+line for *what happened*; read the heartbeat files for *what is happening right
+now*, which is the question a reaper asks.
+
+The task-transition watcher
 touches a dedicated heartbeat file at the top of **every** cycle, so its mtime is
 a true liveness signal for the watcher thread:
 
@@ -872,6 +877,62 @@ catches a *wedged delivery path* that leaves the thread alive. Liveness has to
 reflect the work, not just the loop. (Under the hood, the storm that caused this
 also no longer freezes the loop: the pollers now run `mg` off the event loop, so
 a hung `mg` degrades the pollers without starving delivery — see CHANGELOG.)
+
+#### The same answer, in the file you actually grep
+
+Both heartbeats above are mtimes. An mtime answers "is delivery alive *now*" to
+whoever thinks to `stat` it — and answers nothing at all to the far more common
+reader, who greps `~/.pogo/bridget.log` and reasons from what they find. Until
+v1.7 that reader had nothing to find, because **bridget logged delivery only
+when it went wrong**: a dead relay and an idle one produced a byte-identical
+zero. So the delivery path now leaves a positive record (mg-7c1b):
+
+```bash
+grep 'relay:' ~/.pogo/bridget.log | tail -3
+[2026-08-11T20:29:03Z] relay: 0 delivered in the last 0s (0 total since 2026-08-11T20:29:03Z)
+[2026-08-11T20:41:12Z] relay: 3 delivered in the last 729s (3 total since 2026-08-11T20:29:03Z)
+[2026-08-11T21:41:12Z] relay: 0 delivered in the last 3600s (3 total since 2026-08-11T20:29:03Z)
+```
+
+Read it like this:
+
+- **A line with `0 delivered` is the load-bearing one.** It is the beat firing
+  with nothing to report, and it is the only thing that makes a *later* silence
+  mean death rather than a quiet day. A per-mail line could not say this.
+- **A line only appears for a cycle that reached Discord without a send
+  failure.** During a wedge the beat stops, exactly as
+  `bridget.delivery.heartbeat` freezes — and for the same reason. A beat that
+  ticked through an outage would read as a positive across it, which is how the
+  ~70h wedge went unseen.
+- **The exception lines are in the other file.** `bridget.log` is
+  `StandardOutPath`; `will retry`/`send failed` go to stderr, so they land in
+  `~/.pogo/bridget.err.log`. In `bridget.log` the *stop* is the signal.
+- **`grep -c 'relay:'` returning 0 now means something** — either bridget has
+  not started since the upgrade, delivery has never completed a healthy cycle,
+  or the record is switched off. The last of those would be a new ambiguity, so
+  it is stated in the same file at every start: `delivery record: on — …` or
+  `delivery record: OFF (BRIDGET_RELAY_HEARTBEAT=0) — an idle relay and a dead
+  one look identical in this log`. Grep `delivery record:` before reading
+  anything into a zero.
+- **The beat comes from the human-mail watcher**, and counts every outbound
+  surface — the per-agent channel watchers increment the same ledger. So the
+  count is "what bridget carried", while the *presence* of a line is specifically
+  "the human-DM delivery loop completed a healthy cycle". A channel watcher that
+  died on its own would not stop the beat; use `bridget.err.log` for that.
+- **The count does not include a repeat the duplication limit held**, because
+  that mail reached nothing. It gets its own `dedup:` line in the same file, so
+  the two lines together are the whole story and neither overstates.
+
+Volume is bounded in both directions, deliberately: at most one line per hour
+when idle (`BRIDGET_RELAY_HEARTBEAT`, default `3600` — 24 lines a day), and at
+most one per minute when mail is flowing, with the count folded in. A burst of
+33 alarms is one line reading `relay: 33 delivered`, not 33 lines. A record that
+buried the exception lines it sits among would have traded one unreadable file
+for another.
+
+**It takes effect on the next start of the bridget process**, like the log
+stamps below — a bridget that is already up writes no `relay:` lines until it
+restarts, so on a running install the first one dates the upgrade.
 
 (`~/.pogo/bridget.task-states.json` also advances on a normal poll, but it is
 *not* a reliable heartbeat: on an `mg list` timeout the watcher skips the write

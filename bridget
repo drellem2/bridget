@@ -84,6 +84,7 @@ from bridget_core.logstamp import install_line_timestamps  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.ratelimit import claims_ancestry, isoformat  # noqa: E402
+from bridget_core.relaylog import RelayLedger, isostamp  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
 from bridget_core.statefile import (  # noqa: E402
     STATE_FILE_MODE,
@@ -410,6 +411,13 @@ def load_config() -> dict:
         die(f"BRIDGET_DEDUP_TTL ({dedup_ttl}) must be >= "
             f"BRIDGET_DEDUP_WINDOW ({dedup_window}).")
 
+    # The delivery path's positive record (mg-7c1b). Seconds between "relayed N
+    # since T" beats in the log when nothing is happening; a cycle that actually
+    # delivered beats sooner (see bridget_core.relaylog). 0 switches the record
+    # off, which restores the pre-mg-7c1b file — one whose silence cannot be
+    # told apart from a dead relay.
+    relay_heartbeat = positive_int('BRIDGET_RELAY_HEARTBEAT', 3600, allow_zero=True)
+
     quiet_respects_outbound_raw = (lookup('BRIDGET_QUIET_RESPECTS_OUTBOUND') or 'false').strip().lower()
     quiet_respects_outbound = quiet_respects_outbound_raw in ('true', '1', 'yes', 'on')
 
@@ -482,6 +490,7 @@ def load_config() -> dict:
         'dedup_window': dedup_window,
         'dedup_max_window': dedup_max_window,
         'dedup_ttl': dedup_ttl,
+        'relay_heartbeat': relay_heartbeat,
         'quiet_respects_outbound': quiet_respects_outbound,
         'approval_re': approval_re,
         'restart_cmd': restart_cmd,
@@ -740,6 +749,13 @@ DEDUP = DuplicateLimiter(
     ttl=CONFIG['dedup_ttl'],
     enabled=CONFIG['dedup_window'] > 0,
 )
+
+#: The delivery path's positive record (mg-7c1b). Every outbound surface counts
+#: its relays here; the human-DM watcher is the one loop that EMITS, and only on
+#: a cycle it knows was delivery-healthy. See bridget_core.relaylog for why the
+#: gate matters more than the cadence — bridget already owns one heartbeat that
+#: ticked all the way through a 70h delivery wedge.
+RELAY = RelayLedger(interval=CONFIG['relay_heartbeat'])
 
 
 def _probe_mg_help() -> str:
@@ -1600,6 +1616,61 @@ def log_suppressed(filename: str, mail: dict, decision) -> None:
           flush=True)
 
 
+def format_relay_beat(beat) -> str:
+    """The line that proves the delivery path ran (mg-7c1b).
+
+    Deliberately one line, one grep token, always the same shape:
+
+        relay: 3 delivered in the last 61s (7 total since 2026-08-11T20:29:03Z)
+        relay: 0 delivered in the last 3600s (7 total since 2026-08-11T20:29:03Z)
+
+    The second form is the load-bearing one. It is what a per-mail line cannot
+    say: nothing arrived AND the path that would have carried it is alive. Its
+    absence is now a fact about bridget rather than a fact about the day's mail
+    volume, so `grep -c relay: ~/.pogo/bridget.log` returning 0 finally means
+    something — and a `dedup` or `blackout` zero read beside it has a positive
+    control standing next to it.
+
+    `delivered` counts mail that reached a surface a human can read, so a repeat
+    the duplication limit held is NOT in it: that mail reached nothing, and its
+    own `dedup:` line sits in the same file saying so. A positive record that
+    overstated would be the defect wearing the fix's clothes.
+    """
+    return (f"relay: {beat.delivered} delivered in the last "
+            f"{round(beat.window)}s ({beat.total} total since "
+            f"{isostamp(beat.since)})")
+
+
+def relay_status_line() -> str:
+    """Whether the delivery record is on, and how often to expect it.
+
+    A record that can be switched off silently has the defect it was built to
+    remove: a reader who finds no `relay:` lines cannot tell "delivery is dead"
+    from "someone set BRIDGET_RELAY_HEARTBEAT=0". So the setting is stated at
+    startup, in the same file, and the off case says out loud what the file can
+    no longer answer — the same reason the DM-only fallback stopped being silent
+    (mg-8bff).
+    """
+    if not RELAY.enabled:
+        return ("OFF (BRIDGET_RELAY_HEARTBEAT=0) — an idle relay and a dead one "
+                "look identical in this log")
+    return (f"on — `relay:` line every {RELAY.interval}s when idle, "
+            f"within {RELAY.active_gap}s of a delivery")
+
+
+def log_relay_beat() -> None:
+    """Emit the relay beat if one is due. Call only from a healthy cycle.
+
+    "Healthy" is the whole contract: a beat printed on a cycle whose sends were
+    failing would be `bridget.heartbeat` all over again — a line that says the
+    delivery path is alive because the loop around it is turning (mg-e5b8). The
+    caller owns that judgement; this function only asks the ledger for cadence.
+    """
+    beat = RELAY.due()
+    if beat is not None:
+        print(format_relay_beat(beat), flush=True)
+
+
 async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     """Route one new mail to the surfaces it belongs on.
 
@@ -1675,6 +1746,12 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     stranded = THREADS_ENABLED and not url
     if not stranded and not should_dm(mail, key):
         commit_dedup(decision, mail, key)
+        if url:
+            # The thread carried it; the DM was withheld by policy or a mute,
+            # which is still a surface the human can read. Counted for the relay
+            # record (mg-7c1b) — unlike the suppressed repeat above, which
+            # reached nothing and gets its own `dedup:` line instead.
+            RELAY.record()
         return True
 
     prefix = notice
@@ -1690,6 +1767,11 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
         print(f'DM failed for {filename}, will retry: {e}', file=sys.stderr)
         return False
     commit_dedup(decision, mail, key)
+    # It reached Discord. Recorded here rather than at the caller's commit()
+    # because "the maildir let go of it" and "the human can see it" are not the
+    # same fact, and a positive record that conflates them would overstate — the
+    # one failure mode a positive record must not have.
+    RELAY.record()
     return True
 
 
@@ -1847,6 +1929,11 @@ async def watch_mailbox(user: discord.User):
         # too: either way, stale == delivery is not happening.
         if delivery_ok:
             touch_heartbeat(DELIVERY_HEARTBEAT_FILE)
+            # ...and the same fact, in the file people actually grep (mg-7c1b).
+            # An mtime answers "is delivery alive right now" to whoever thinks
+            # to stat it; the log line answers it to everyone reading the log,
+            # and answers it about the past, which an mtime cannot.
+            log_relay_beat()
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -1919,6 +2006,11 @@ async def watch_agent_mailbox(channel_entry: dict):
                 # the same reason. There is no conversation thread here to
                 # dedupe against, and no idempotency key Discord will honour.
                 watcher.commit(fname)
+                # Counted into the same ledger the human-DM watcher beats from,
+                # so the beat's total covers every outbound surface. Only that
+                # one loop emits: a line per channel watcher would be six times
+                # the volume to say the same thing.
+                RELAY.record()
         except Exception as e:
             print(f"watch_agent_mailbox({agent}) loop error: {e}",
                   file=sys.stderr)
@@ -3235,6 +3327,7 @@ async def on_ready():
     # off; they just arrive as new top-level mail instead of threading.
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
     print(f"per-channel routing: {channels_status_line()}", flush=True)
+    print(f"delivery record: {relay_status_line()}", flush=True)
 
     # Auto-create + auto-wire any configured channel that has no live snowflake
     # yet (Slice A, mg-2fea). Runs before the watchers so a freshly-created

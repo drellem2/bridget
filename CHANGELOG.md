@@ -12,6 +12,63 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **A positive record for the delivery path, so silence is distinguishable from
+  death (mg-7c1b).** `~/.pogo/bridget.log` recorded delivery **only when it went
+  wrong**. A log that records only exceptions cannot be used to confirm the
+  normal path ran: its silence is consistent with perfect health *and* with
+  total death, and the reader cannot tell which without leaving the file.
+
+  This was load-bearing twice in one night, in two different hands. One agent
+  read `grep -c blackout ~/.pogo/bridget.log` → `0` as **"Discord carried
+  NONE"** — false; bridget had relayed all 33 alarms within seconds, and the
+  proof was in `bridget.conversations.json`, a file nobody thinks to open. The
+  other reported *"the dedup has held zero repeats"* for roughly five cycles off
+  the same shape of zero — true, and unjustified: since the previous restart the
+  file held nothing but startup lines, so nothing in it established that the
+  delivery path was running at all.
+
+  bridget's mail watcher now beats a line into the log it is read from:
+
+  ```
+  [2026-08-11T21:41:12Z] relay: 3 delivered in the last 729s (7 total since 2026-08-11T20:29:03Z)
+  [2026-08-11T22:41:12Z] relay: 0 delivered in the last 3600s (7 total since 2026-08-11T20:29:03Z)
+  ```
+
+  The `0 delivered` line is the one that matters, and it is why this is a
+  heartbeat rather than one line per relayed mail. A per-mail line separates
+  "delivered something" from "delivered nothing" — but an idle-and-healthy
+  bridget still writes nothing, so silence stays ambiguous, which *is* the
+  defect. Only a beat that fires with nothing to report makes silence mean
+  death. The count rides along, so the per-mail line's information is not lost.
+
+  It is gated, not merely periodic. A line appears **only** for a cycle that
+  reached Discord with no send failure — the same gate as
+  `bridget.delivery.heartbeat`. bridget already owns a heartbeat that ticked all
+  the way through a 70-hour delivery wedge because it proved the loop was
+  turning rather than that mail was moving (mg-e5b8); a positive record with
+  that defect would be worse than no record, because it reads as health.
+
+  Volume is bounded in both directions, because Daniel merged a duplication
+  limit into this same release for exactly this reason: at most one line per
+  hour when idle (`BRIDGET_RELAY_HEARTBEAT`, default `3600` — 24 lines a day),
+  at most one per minute when mail is flowing, with the interval's deliveries
+  folded into the count. The measured 33-alarm burst is **one** line reading
+  `relay: 33 delivered`, not 33. (A log file is not a Discord DM and does not
+  reach him; this is volume in the file people grep.) `0` switches the record
+  off and restores the old, meaningless zero.
+
+  Proven by watching it fail, not only by watching it work
+  (`tests/test_relay_record.py`, 15 cases against the real `watch_mailbox`):
+  the line appears on a real relay and on a healthy idle; it is **absent** when
+  the loop is stopped (with a control showing the beat was due the whole time
+  and lands the instant the loop restarts), absent when the loop turns while
+  every send fails, and — the pre-fix control — with the record switched off a
+  healthy run and a dead run write byte-identical delivery evidence, which is
+  the defect reproduced. Assertions grep a real file with real `grep -c`,
+  because `grep -c` on a real file is what both agents got wrong.
+
+  Takes effect on the **next start** of the bridget process, like the log
+  stamps: a bridget already up writes no `relay:` lines until it restarts.
 - **A duplication limit for repeated alerts (mg-5521).** Daniel: *"stall-watch
   etc send me emails which becomes crazy annoying on discord … bc they duplicate
   a lot, if there was some sort of duplication limit that would be fine."* A

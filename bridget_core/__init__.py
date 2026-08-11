@@ -29,6 +29,10 @@ Slack, Matrix, or a terminal:
                     the condition it describes, deliver the first occurrence
                     immediately, and re-notify on a decaying backoff instead of
                     once per firing (mg-5521).
+    relaylog      — when the delivery path should say "I am here", and what:
+                    a "relayed N since T" beat that fires even with nothing to
+                    report, so the log's silence stops being consistent with
+                    both perfect health and total death (mg-7c1b).
     acks          — the delivery / ambiguity / undeliverable outcome model.
     mgshim        — the mg CLI seam: detect whether this build of mg supports
                     correlation IDs, and degrade cleanly when it does not.
@@ -71,6 +75,7 @@ from .ratelimit import (
     claims_ancestry,
     normalize_subject,
 )
+from .relaylog import RelayBeat, RelayLedger
 from .settings import SettingsStore
 
 __all__ = [
@@ -82,6 +87,8 @@ __all__ = [
     'MG_SUBJECT_LIMIT',
     'MaildirWatcher',
     'MgCapabilities',
+    'RelayBeat',
+    'RelayLedger',
     'SettingsStore',
     'alert_key',
     'ambiguous',

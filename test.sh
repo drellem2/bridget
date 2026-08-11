@@ -58,6 +58,15 @@ python3 tests/test_watcher_liveness.py
 # stale the moment mail stops reaching Discord — the ~70h wedge the loop
 # heartbeat was blind to. Storms mg, wedges delivery; no live Discord.
 python3 tests/test_delivery_liveness.py
+# The delivery path's positive record (mg-7c1b): bridget.log recorded delivery
+# only when it went wrong, so a dead relay and an idle one produced a
+# byte-identical zero — and two agents drew conclusions from `grep -c` returning
+# 0 against it on one night, one of them false. Proves the "relayed N since T"
+# beat appears on a real relay AND on a healthy idle, is absent when the loop is
+# stopped and when it turns with every send failing, and is bounded in volume.
+# Carries a pre-fix control that reproduces the byte-identical zero. Greps a real
+# file with real grep; stubs discord.
+python3 tests/test_relay_record.py
 # The duplicate-watcher fix (mg-dc94): `on_ready` fires on every gateway
 # RECONNECT, and used to spawn a fresh watcher set each time with no teardown —
 # seven sets accumulated and each delivered the same mail, so one mail became

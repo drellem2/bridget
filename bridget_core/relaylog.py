@@ -1,0 +1,194 @@
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
+# bridget_core.relaylog — the delivery path's positive record.
+"""When the delivery path should say "I am here", and what it should say.
+
+Until mg-7c1b, `~/.pogo/bridget.log` recorded delivery only when it went
+wrong. That is an instrument with the same defect mg-35b1 fixed on the other
+axis: a log that records only exceptions cannot be used to confirm the normal
+path ran. Its silence is consistent with perfect health AND with total death,
+and the reader cannot tell which without leaving the file.
+
+Two readers were caught by that zero on the same night, in different hands:
+
+    grep -c blackout ~/.pogo/bridget.log   ->  0   # read as "Discord carried
+                                                   # NONE" — false; bridget had
+                                                   # relayed all 33 within
+                                                   # seconds
+    grep -c dedup    ~/.pogo/bridget.log   ->  0   # read as "the dedup held
+                                                   # zero repeats" — true, and
+                                                   # reported for ~5 cycles with
+                                                   # nothing establishing that
+                                                   # the path was even running
+
+**Why a heartbeat rather than one line per relayed mail.** The ticket offers
+both. A per-mail line distinguishes "delivered something" from "delivered
+nothing" — but an idle-and-healthy bridget still writes nothing, so silence
+stays ambiguous, which is the defect. Only a beat that fires with NOTHING to
+report makes silence mean death. The count rides along on it, so a per-mail
+line's information is not lost: `delivered 3 in the last 61s` is the three
+lines, folded.
+
+**Why it is not a bare "still alive".** bridget already has one of those, and
+the way it failed is the reason this module exists at all. `bridget.heartbeat`
+kept ticking through the ~70h wedge of mg-e5b8, because it is a LOOP heartbeat:
+it proved the poller was iterating while outbound delivery was dead. So the
+caller must gate this beat on a delivery-healthy cycle — the same gate as
+`bridget.delivery.heartbeat` — and this module's job is only to say *when* a
+beat is due. A record that ticks while delivery is broken is worse than no
+record: it reads as a positive.
+
+**Volume.** Daniel merged a duplication limit into this repo the same night
+(mg-5521) because he was drowning in repetition, so a record that buries the
+exception lines it sits among would have traded one unreadable file for
+another. The cadence is therefore two-rate:
+
+    idle      — one line per `interval` (default 3600s: 24 lines/day)
+    active    — one line per `min(60, interval)`, carrying the count of
+                everything relayed since the previous line
+
+so a burst of 33 alarms arriving within seconds is one line, not 33, and a
+quiet day costs 24. A log file is not a Discord DM and does not reach Daniel;
+this is volume in the file people grep, not volume in his notifications.
+
+Nothing here renders. `RelayBeat` is the fact; the adapter formats it, the way
+`Decision` and `format_repeat_notice` divide the same work.
+"""
+from __future__ import annotations
+
+import datetime
+from dataclasses import dataclass
+
+#: Ceiling on how fast the beat may fire when mail IS flowing. A cycle that
+#: delivered wants to be recorded near the delivery rather than up to an hour
+#: later — but one line per poll cycle under sustained load is exactly the
+#: repetition this must not become, so deliveries inside this window fold into
+#: the next line's count.
+ACTIVE_GAP_CAP = 60
+
+
+def isostamp(timestamp: float) -> str:
+    """Epoch seconds as `2026-08-11T20:29:03Z` — the fleet's log stamp format.
+
+    Deliberately the `Z` form used by `bridget_core.logstamp`, not the
+    `+00:00` form `ratelimit.isoformat` emits, because this value is read
+    *inside* a log line whose own prefix is the `Z` form: two spellings of the
+    same instant on one line is a thing to explain rather than a thing to read.
+    """
+    return datetime.datetime.fromtimestamp(
+        timestamp, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+@dataclass(frozen=True)
+class RelayBeat:
+    """One due beat. Facts only — the adapter turns this into a line.
+
+    `delivered` counts mail relayed since the PREVIOUS beat, `window` is how
+    long that took, and `total`/`since` carry the run's whole story so a single
+    line lifted out of the log still answers "has this process ever delivered
+    anything".
+    """
+    delivered: int
+    window: float
+    total: int
+    since: float
+
+
+class RelayLedger:
+    """Counts relayed mail and decides when the delivery path should speak.
+
+    Per process, not persisted: `since` is this run's start, and that is the
+    honest scope — a count restored across a restart would let a beat report
+    deliveries the current process never made.
+
+    Usage, from a cycle that is known delivery-healthy:
+
+        for mail in poll():
+            if deliver(mail):
+                ledger.record()
+        if delivery_ok:
+            beat = ledger.due(now)
+            if beat:
+                print(format_relay_beat(beat), flush=True)
+
+    `due()` mutates: it resets the per-window count and stamps the beat. Call
+    it once per cycle, and only on a healthy one — see the module docstring for
+    why gating matters more than cadence.
+    """
+
+    def __init__(self, started: float | None = None, *, interval: int = 3600,
+                 enabled: bool = True, clock=None):
+        self._clock = clock or _now
+        self.started = self._clock() if started is None else started
+        self.interval = interval
+        #: interval <= 0 switches the record off entirely. It is a knob rather
+        #: than a constant because the right cadence depends on how noisy this
+        #: file is for its reader, and that is not ours to guess.
+        self.enabled = enabled and interval > 0
+        self.total = 0
+        self._pending = 0
+        #: None until the first beat: the delivery loop's FIRST healthy cycle
+        #: emits one, so the log carries a positive within a poll interval of
+        #: startup instead of an hour of silence indistinguishable from a
+        #: watcher that never spawned.
+        self._last_beat: float | None = None
+
+    @property
+    def active_gap(self) -> int:
+        """Minimum seconds between beats when there is something to report."""
+        return min(ACTIVE_GAP_CAP, self.interval)
+
+    def record(self, count: int = 1) -> None:
+        """Count `count` mail as relayed. Cheap; call it per delivered mail."""
+        self.total += count
+        self._pending += count
+
+    def due(self, now: float | None = None) -> RelayBeat | None:
+        """The beat to emit at `now`, or None. Mutates when it returns a beat.
+
+        Three ways a beat comes due, in the order they matter:
+
+        1. No beat yet this run — the loop has completed its first healthy
+           cycle and the file should say so.
+        2. Mail was relayed and `active_gap` has passed — record it near the
+           event, folding a burst into one line.
+        3. `interval` has passed with nothing to report — the idle beat, and
+           the only one that makes silence mean death.
+        """
+        if not self.enabled:
+            return None
+        if now is None:
+            now = self._clock()
+        if self._last_beat is None:
+            return self._beat(now, self.started)
+        elapsed = now - self._last_beat
+        if self._pending and elapsed >= self.active_gap:
+            return self._beat(now, self._last_beat)
+        if elapsed >= self.interval:
+            return self._beat(now, self._last_beat)
+        return None
+
+    def _beat(self, now: float, window_start: float) -> RelayBeat:
+        beat = RelayBeat(delivered=self._pending,
+                         window=max(0.0, now - window_start),
+                         total=self.total,
+                         since=self.started)
+        self._pending = 0
+        self._last_beat = now
+        return beat
+
+
+def _now() -> float:
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
