@@ -94,7 +94,8 @@ All config lives in `~/.pogo/bridget.env`. See
 | `DISCORD_SERVER_ID`  | yes | Guild the bot is installed in. |
 | `MG_BIN`             | no  | Absolute path to `mg`. Default: resolved via `PATH`. |
 | `POGO_BIN`           | no  | Absolute path to `pogo`. Default: resolved via `PATH`. |
-| `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/`. Default: `~/.macguffin/mail/human`. Point at the representative's **output** box if you run one — see below. |
+| `POGO_MAIL_DIR`      | no  | Parent of `new/` and `cur/` that mail is **delivered** from. Default: `~/.macguffin/mail/human`. Point at the representative's **output** box if you run one — see below. |
+| `BRIDGET_APPROVAL_MAILBOX` | no | Mailbox the approval **scan** reads, as a bare name resolved beside the delivery box under the same mail root. Default: `human`. Deliberately does not follow a recipient re-point — see below. |
 | `POGO_DESIGNS_DIR`   | no  | Directory of `mg-XXXX.md` design docs (read by `next`). Default: `~/.pogo/designs`. |
 | `POGO_INBOX_REPO`    | no  | Repo where `idea:`, `bug:`, and `next` file new items. Default: `~/.pogo/inbox`. |
 | `POGO_MAIL_RECIPIENT` | no | Default recipient for `mail` command. Default: `mayor`. |
@@ -1002,7 +1003,7 @@ you: it owns `human` as its inbox, strips internal identifiers, makes agents
 supply the takeaway, collapses a burst of nine mails about one incident into
 one, and writes a separate terminal box.
 
-Two keys matter to bridget when that is running.
+Three keys matter to bridget when that is running.
 
 **`POGO_MAIL_DIR` — point it at the representative's OUTPUT box.** Not at
 `human`. Two reasons, and the second is easy to miss:
@@ -1013,8 +1014,41 @@ Two keys matter to bridget when that is running.
    box for mail nobody processed — the backstop would see a clean queue and
    never fire, and a dead representative would mean silence.
 
-Everything bridget derives from this path follows it, including `cur/` and the
-approval-request scan.
+Everything on the **delivery** path follows it: the DM watcher, `cur/`, and
+`read <mg-id>`.
+
+**`BRIDGET_APPROVAL_MAILBOX` — leave it alone.** The approval scan is a second
+reader with a different job, and it must *not* follow that re-point (mg-18bf).
+
+It used to. Both readers were one variable, so pointing `POGO_MAIL_DIR` at the
+representative's output box moved the scan there too — and that box holds
+**rewritten** subjects, because rewriting them is the representative's job. Its
+prompt forbids holding or dropping an approval request but requires the rewrite,
+and forbids internal identifiers in a subject. Nothing it writes matches
+`BRIDGET_APPROVAL_RE`, so `status` and `mine` would report
+
+> **Awaiting your approval:** *(nothing)*
+
+on a plate with approvals on it — at exactly the moment you started relying on
+the relay, and reading identically to a genuinely empty one.
+
+So the scan resolves against the mail **root** rather than the recipient:
+`~/.macguffin/mail/<BRIDGET_APPROVAL_MAILBOX>/new`, default `human`. Move the
+whole root and it comes along; re-point the recipient and it stays where the
+approval requests are. That is safe because the scan is a *pull view*: it fires
+no notification, and it never moves a file out of `new/`, so the fail-open
+deadman watching that queue still sees whatever the representative has not
+processed.
+
+Its zero now says which zero it is — no such directory, an empty directory, or
+mail read and none of it matched (naming the count and both knobs). `settings`
+and the startup log print which box it resolved to and whether that differs from
+the delivery box.
+
+One gap this does **not** close: `BRIDGET_DM_POLICY=curated` promotes an
+approval to a DM using the same regex against mail on the *delivery* path, so
+behind a subject-rewriting representative it will not fire either. Use `all`, or
+set `BRIDGET_APPROVAL_RE` to match what your representative writes.
 
 **`POGO_REPRESENTATIVE` — the representative's own mailbox.** Setting it files a
 marked **copy** of every reply you send into that box.
@@ -1075,6 +1109,12 @@ Common failure modes:
 - **No mail notifications** — verify `~/.macguffin/mail/human/new/` exists
   (or whatever you set `POGO_MAIL_DIR` to). bridget skips mail-watching
   silently when the directory is missing.
+- **"Awaiting your approval" is empty and you don't believe it** — run
+  `settings`. The `Approval scan:` line names the directory being read; the view
+  itself distinguishes a missing directory, an empty one, and one whose mail
+  matched nothing. If it says *none matched*, either `BRIDGET_APPROVAL_MAILBOX`
+  points at the wrong box or `BRIDGET_APPROVAL_RE` doesn't match the subjects
+  your fleet writes.
 - **The representative never learns what you replied** — `POGO_REPRESENTATIVE`
   names a mailbox `mg` has never seen. `mg mail send` refuses an unregistered
   recipient, so every inbound copy fails; bridget logs one line to stderr per

@@ -98,6 +98,21 @@ SAMPLE = ndjson(
 )
 
 
+def no_approvals(bridget):
+    """A scan that ran, over a real and empty box, and found nothing.
+
+    Since mg-18bf the view distinguishes that from a missing directory and from
+    a box full of mail nothing matched, so a stub has to say which world it is
+    describing — `[]` no longer carries enough to render.
+    """
+    return bridget.ApprovalScan([], 0, True, bridget.APPROVAL_DIR)
+
+
+def some_approvals(bridget, subjects):
+    return bridget.ApprovalScan(list(subjects), len(subjects), True,
+                                bridget.APPROVAL_DIR)
+
+
 class AssignedViewIsReadOnly(unittest.TestCase):
     """The whole point of the conservative first cut: it touches nothing."""
 
@@ -112,7 +127,7 @@ class AssignedViewIsReadOnly(unittest.TestCase):
                                return_value=(0, '', '')) as rp, \
              mock.patch.object(self.bridget, 'mark_mail_read') as mmr, \
              mock.patch.object(self.bridget, 'scan_pending_approvals',
-                               return_value=[]):
+                               return_value=no_approvals(self.bridget)):
             self.bridget.handle_command('mine')
         # One mg call, and it is a read: `list --assignee=human`.
         self.assertEqual(rm.call_count, 1)
@@ -128,7 +143,7 @@ class AssignedViewIsReadOnly(unittest.TestCase):
             with mock.patch.object(self.bridget, 'run_mg',
                                    return_value=(0, SAMPLE, '')), \
                  mock.patch.object(self.bridget, 'scan_pending_approvals',
-                                   return_value=[]):
+                                   return_value=no_approvals(self.bridget)):
                 reply = self.bridget.handle_command(verb)
             self.assertIn('On your plate', reply,
                           f'{verb!r} did not reach the assigned view')
@@ -144,7 +159,7 @@ class AssignedViewSeparatesOutstandingFromResolved(unittest.TestCase):
         with mock.patch.object(self.bridget, 'run_mg',
                                return_value=(0, SAMPLE, '')), \
              mock.patch.object(self.bridget, 'scan_pending_approvals',
-                               return_value=[]):
+                               return_value=no_approvals(self.bridget)):
             reply = self.bridget.handle_command('mine')
         # Three outstanding, surfaced by id.
         self.assertIn('3 outstanding', reply)
@@ -158,7 +173,7 @@ class AssignedViewSeparatesOutstandingFromResolved(unittest.TestCase):
         with mock.patch.object(self.bridget, 'run_mg',
                                return_value=(0, SAMPLE, '')), \
              mock.patch.object(self.bridget, 'scan_pending_approvals',
-                               return_value=[]):
+                               return_value=no_approvals(self.bridget)):
             reply = self.bridget.handle_command('mine')
         self.assertLess(reply.index('mg-cccc'), reply.index('mg-aaaa'),
                         'pending should sort before claimed')
@@ -169,7 +184,8 @@ class AssignedViewSeparatesOutstandingFromResolved(unittest.TestCase):
         with mock.patch.object(self.bridget, 'run_mg',
                                return_value=(0, SAMPLE, '')), \
              mock.patch.object(self.bridget, 'scan_pending_approvals',
-                               return_value=['approval needed: design mg-1f2a']):
+                               return_value=some_approvals(
+                                   self.bridget, ['approval needed: design mg-1f2a'])):
             reply = self.bridget.handle_command('mine')
         self.assertIn('Awaiting your approval (1)', reply)
         self.assertIn('mg-1f2a', reply)
@@ -178,7 +194,7 @@ class AssignedViewSeparatesOutstandingFromResolved(unittest.TestCase):
         with mock.patch.object(self.bridget, 'run_mg',
                                return_value=(0, '', '')), \
              mock.patch.object(self.bridget, 'scan_pending_approvals',
-                               return_value=[]):
+                               return_value=no_approvals(self.bridget)):
             reply = self.bridget.handle_command('mine')
         self.assertIn('0 outstanding', reply)
         self.assertIn('nothing assigned to you', reply)

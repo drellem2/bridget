@@ -75,7 +75,7 @@ Copy values from the old `~/.pogo/discord-bridge.env` into the new
 | `DISCORD_SERVER_ID` | `DISCORD_SERVER_ID` | Verbatim. |
 | `POGO_INBOX_REPO` (if set) | `POGO_INBOX_REPO` | Verbatim. |
 | `POGO_DESIGNS_DIR` (if set) | `POGO_DESIGNS_DIR` | Verbatim. |
-| `POGO_MAIL_DIR` (if set) | `POGO_MAIL_DIR` | Verbatim. |
+| `POGO_MAIL_DIR` (if set) | `POGO_MAIL_DIR` | Verbatim. Now the **delivery** box only — the approval scan reads `BRIDGET_APPROVAL_MAILBOX` (default `human`) beside it, so re-pointing this at a representative's output box no longer empties the approvals view (mg-18bf). |
 | `MG_BIN` (if set) | `MG_BIN` | Verbatim. |
 | — | `POGO_BIN` | New. Default: PATH lookup. Set only if `pogo` isn't on PATH under launchd. |
 | — | `POGO_MAIL_RECIPIENT` | New. Default: `mayor`. Set only if non-default. |

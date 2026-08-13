@@ -30,7 +30,11 @@ Required keys:
 
 Optional keys:
     MG_BIN           — full path to the mg binary (otherwise resolved on PATH)
-    POGO_MAIL_DIR    — parent of new/ and cur/ (default: ~/.macguffin/mail/human)
+    POGO_MAIL_DIR    — parent of new/ and cur/ that mail is DELIVERED from
+                       (default: ~/.macguffin/mail/human)
+    BRIDGET_APPROVAL_MAILBOX
+                     — mailbox the approval SCAN reads, a sibling of the
+                       delivery box under the same root (default: human)
     POGO_DESIGNS_DIR — directory containing mg-XXXX.md design docs
                        (default: ~/.pogo/designs)
     POGO_INBOX_REPO  — repo to file new ideas into via mg new
@@ -52,6 +56,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import tomllib  # Python 3.11+
@@ -427,6 +432,13 @@ def load_config() -> dict:
     except re.error as e:
         die(f"BRIDGET_APPROVAL_RE is not a valid regex: {e}")
 
+    # Which mailbox the approval SCAN reads (mg-18bf). Deliberately NOT derived
+    # from POGO_MAIL_DIR — see `approval_dir` below.
+    approval_mailbox = (lookup('BRIDGET_APPROVAL_MAILBOX') or 'human').strip()
+    if '/' in approval_mailbox or approval_mailbox in ('', '.', '..'):
+        die("BRIDGET_APPROVAL_MAILBOX must be a bare mailbox name "
+            f"(a sibling of the delivery box), not a path: {approval_mailbox!r}")
+
     restart_cmd_str = lookup('BRIDGET_RESTART_CMD') or 'bash build.sh'
     try:
         restart_cmd = shlex.split(restart_cmd_str)
@@ -479,6 +491,18 @@ def load_config() -> dict:
         'pogo_bin': pogo_bin,
         'mail_parent': mail_parent,
         'mail_dir': mail_parent / 'new',
+        # The approval scan's own directory (mg-18bf). It is a sibling of the
+        # DELIVERY box under the same mail root, not the delivery box itself:
+        #
+        #   POGO_MAIL_DIR=~/.macguffin/mail/human   → ~/.macguffin/mail/human/new
+        #   POGO_MAIL_DIR=~/.macguffin/mail/daniel  → ~/.macguffin/mail/human/new
+        #   POGO_MAIL_DIR=~/mail2/human             → ~/mail2/human/new
+        #
+        # so moving the whole mail root carries it along (the `agent_mail_dir`
+        # idiom), while re-pointing the RECIPIENT — which is what running behind
+        # a representative does — leaves it where the approval requests are.
+        'approval_mailbox': approval_mailbox,
+        'approval_dir': mail_parent.parent / approval_mailbox / 'new',
         'designs_dir': designs_dir,
         'inbox_repo': inbox_repo,
         'mail_recipient': mail_recipient,
@@ -692,6 +716,11 @@ USER_ID = CONFIG['user_id']
 SERVER_ID = CONFIG['server_id']
 MG_BIN = CONFIG['mg_bin']
 MAIL_DIR = CONFIG['mail_dir']
+#: Where the approval SCAN reads. Split from MAIL_DIR by mg-18bf: the two are
+#: different readers with different jobs, and only the delivery one moves when a
+#: representative takes over `human`.
+APPROVAL_MAILBOX = CONFIG['approval_mailbox']
+APPROVAL_DIR = CONFIG['approval_dir']
 DESIGNS_DIR = CONFIG['designs_dir']
 INBOX_REPO = CONFIG['inbox_repo']
 WORKFLOW_AGENT = CONFIG['workflow_agent']
@@ -1351,6 +1380,7 @@ def render_settings(summary: dict) -> str:
         '⚙️ **bridget settings**',
         f"• DM policy: `{summary['dm_policy']}`",
         f"• Per-channel routing: {channels_status_line()}",
+        f"• Approval scan: {approvals_status_line()}",
         f"• Mute all DMs: `{str(summary['mute_all']).lower()}`",
     ]
     muted = summary['muted']
@@ -1420,7 +1450,15 @@ def format_mail_card(mail: dict, thread_link: str = '', prefix: str = '',
 def wants_attention(mail: dict) -> bool:
     """True if this mail asks the human for a decision, and so earns a DM even
     under the `curated` policy. Today that means an approval request, matched
-    with the same BRIDGET_APPROVAL_RE the `status` view uses."""
+    with the same BRIDGET_APPROVAL_RE the `status` view uses.
+
+    Note this reads a mail already in hand off the DELIVERY path, so unlike
+    `scan_pending_approvals` it does not choose a directory and mg-18bf's split
+    does not touch it. It does share the regex, though: behind a representative
+    that rewrites subjects, nothing delivered will match this either, and the
+    `curated` policy would stop promoting approvals to a DM. That is a real gap
+    on the delivery side and is NOT fixed here — recorded, not repaired.
+    """
     return bool(APPROVAL_RE.match(f"Subject: {mail['subject']}"))
 
 
@@ -2531,22 +2569,101 @@ def mark_mail_read(mg_id=None, all_unread: bool = False) -> int:
     return n
 
 
-def scan_pending_approvals() -> list[str]:
-    """Subjects of unread mails in human/new/ that are approval requests."""
-    if not MAIL_DIR.exists():
-        return []
+class ApprovalScan(NamedTuple):
+    """What one pass over the approval mailbox actually saw.
+
+    A bare `list[str]` could only ever say "no approvals", and that one answer
+    covered three different worlds — a directory that isn't there, an inbox
+    that's empty, and an inbox full of mail the pattern doesn't match. The
+    third is a misconfiguration; the second is good news; and they read
+    identically to Daniel. Carrying the counts is what lets the views tell
+    them apart.
+    """
+    subjects: list[str]
+    #: Mails present in `path` this pass — the denominator for `subjects`.
+    scanned: int
+    exists: bool
+    path: Path
+
+
+def scan_pending_approvals() -> ApprovalScan:
+    """Unread mails in the approval mailbox that are approval requests.
+
+    Reads APPROVAL_DIR, **not** MAIL_DIR (mg-18bf). Those were one variable
+    until a representative was put in front of `human`: step 4 of that cutover
+    re-points POGO_MAIL_DIR at the representative's output box, because the DM
+    watcher must move or bridget DMs every raw queue mail and bypasses the
+    relay entirely. This scan was dragged along with it — and the output box
+    holds REWRITTEN subjects, which the representative's prompt requires and
+    which BRIDGET_APPROVAL_RE by construction does not match. The approvals
+    section would have gone quiet at the moment Daniel started relying on it,
+    reading exactly like a genuinely empty plate.
+
+    Leaving the scan on `human` does not reintroduce the noise the
+    representative exists to reduce: this is a pull view that fires no
+    notification. Nothing here DMs, and nothing here moves a file out of
+    `new/` — so the fail-open deadman watching that queue still sees whatever
+    the representative has not yet processed.
+    """
+    if not APPROVAL_DIR.exists():
+        return ApprovalScan([], 0, False, APPROVAL_DIR)
     out = []
-    for p in sorted(MAIL_DIR.iterdir()):
+    scanned = 0
+    for p in sorted(APPROVAL_DIR.iterdir()):
         try:
-            for line in p.read_text().splitlines():
-                if line == '':
-                    break
-                if APPROVAL_RE.match(line):
-                    out.append(line[len('Subject: '):] if line.startswith('Subject: ') else line)
-                    break
+            lines = p.read_text().splitlines()
         except Exception:
-            pass
-    return out
+            continue
+        scanned += 1
+        for line in lines:
+            if line == '':
+                break
+            if APPROVAL_RE.match(line):
+                out.append(line[len('Subject: '):] if line.startswith('Subject: ') else line)
+                break
+    return ApprovalScan(out, scanned, True, APPROVAL_DIR)
+
+
+def approvals_status_line() -> str:
+    """One line naming the box the approval scan reads, for `settings` and the
+    startup log.
+
+    The split in mg-18bf makes a divergence possible that nothing else in
+    bridget would show: the delivery box and the approval box can now be
+    different directories, and which is which is the whole of the fix. State it
+    where a misconfiguration is visible before it costs anyone an approval —
+    the same reason the DM-only routing fallback (mg-8bff) and the delivery
+    record's off switch (mg-7c1b) stopped being silent.
+    """
+    where = f"`{APPROVAL_MAILBOX}` ({APPROVAL_DIR})"
+    if APPROVAL_DIR == MAIL_DIR:
+        return f"scanning {where} — same box mail is delivered from"
+    return (f"scanning {where} — separate from the delivery box "
+            f"({MAIL_DIR}); set BRIDGET_APPROVAL_MAILBOX to change")
+
+
+def render_approvals(scan: ApprovalScan, label: str, prefix: str = '') -> list[str]:
+    """The approvals section, rendered so its zero is readable.
+
+    Shared by `status` and `mine` so the two views cannot drift into disagreeing
+    about what "nothing awaiting you" means.
+    """
+    head = f'\n{prefix}**{label}'
+    if scan.subjects:
+        return [f'{head} ({len(scan.subjects)}):**'] + [f'• {s}' for s in scan.subjects]
+    if not scan.exists:
+        return [f'{head}:** ⚠️ cannot tell — {scan.path} does not exist']
+    if scan.scanned:
+        # The mg-f04b shape, caught in the act: mail is there, it was read, and
+        # none of it matched. Say the count and name the knobs, because the
+        # remedy for this scan reading the wrong box is a scan that can still be
+        # pointed at a box whose subjects it will never match.
+        return [
+            f'{head}:** ⚠️ none matched — {scan.scanned} unread in '
+            f'{scan.path}, 0 matched `{APPROVAL_RE.pattern}` '
+            f'(BRIDGET_APPROVAL_RE / BRIDGET_APPROVAL_MAILBOX)'
+        ]
+    return [f'{head}:** none — {scan.path} is empty']
 
 
 def get_status_summary() -> str:
@@ -2575,11 +2692,7 @@ def get_status_summary() -> str:
             except Exception:
                 parts.append(f'  • (parse error: {p.name})')
 
-    approvals = scan_pending_approvals()
-    if approvals:
-        parts.append("\n**Pending approvals:**")
-        for s in approvals:
-            parts.append(f"• {s}")
+    parts.extend(render_approvals(scan_pending_approvals(), 'Pending approvals'))
 
     rc, out, err = run_mg(['list', '--json'])
     in_flight = []
@@ -2669,10 +2782,7 @@ def get_assigned_view() -> str:
     else:
         parts.append('  (nothing assigned to you)')
 
-    if approvals:
-        parts.append(f'\n📋 **Awaiting your approval ({len(approvals)}):**')
-        for s in approvals:
-            parts.append(f'• {s}')
+    parts.extend(render_approvals(approvals, 'Awaiting your approval', prefix='📋 '))
 
     if resolved:
         parts.append(
@@ -3328,6 +3438,7 @@ async def on_ready():
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
     print(f"per-channel routing: {channels_status_line()}", flush=True)
     print(f"delivery record: {relay_status_line()}", flush=True)
+    print(f"approval scan: {approvals_status_line()}", flush=True)
 
     # Auto-create + auto-wire any configured channel that has no live snowflake
     # yet (Slice A, mg-2fea). Runs before the watchers so a freshly-created

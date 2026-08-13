@@ -47,6 +47,16 @@ python3 tests/test_dm_echo.py
 # `mg list --assignee=human` into Discord, separating outstanding from resolved,
 # and — the conservative-first-cut guarantee — mutates nothing. Stubs discord.
 python3 tests/test_assigned_view.py
+# The approval scan's own directory (mg-18bf): the scan and the DM watcher were
+# one variable, so step 4 of the representative cutover — which re-points
+# POGO_MAIL_DIR at the representative's output box because the watcher MUST move
+# — dragged the scan onto a box of REWRITTEN subjects that BRIDGET_APPROVAL_RE
+# cannot match by construction. "Awaiting your approval" would have read zero and
+# looked exactly like an empty plate. Carries a pre-fix control that reproduces
+# the silent zero, pins that a ROOT move still carries the scan while a RECIPIENT
+# re-point does not, and proves the three zero-approval worlds now render
+# differently. Stubs discord.
+python3 tests/test_approval_scan.py
 # The watch_task_transitions silent-death fix (mg-3499): a single transient
 # `mg list` timeout must not kill the watcher thread, and a liveness heartbeat
 # whose mtime ticks every cycle must go stale only when the watcher is truly

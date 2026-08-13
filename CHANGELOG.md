@@ -10,6 +10,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Thread-per-conversation UX and a transport-agnostic core. Every addition is
 opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
+### Fixed
+
+- **The approval scan follows the mail root, not the recipient (mg-18bf).**
+  `scan_pending_approvals` and the DM watcher were one variable, `POGO_MAIL_DIR`.
+  Step 4 of the representative cutover re-points that at the representative's
+  **output** box, and it has to: the watcher must move or bridget DMs Daniel
+  every raw `human` queue mail and bypasses the relay entirely. The scan was
+  dragged along — onto a box whose subjects the representative has **rewritten**,
+  which is its job. `crew/representative.md` forbids holding or dropping an
+  approval request but requires the rewrite, and forbids internal identifiers in
+  a subject, so nothing in that box can match `^Subject: approval needed `.
+
+  The `status` and `mine` views would then have reported
+
+  > **Awaiting your approval:** *(nothing)*
+
+  on a plate with approvals on it, indistinguishable from a genuinely empty one,
+  at the moment Daniel started relying on the relay. Caught before the re-point
+  landed — `POGO_MAIL_DIR` is absent from `bridget.env`, `bridget-supervise`, the
+  plist and the running process's environment as of 2026-08-13 — so this is a
+  precondition rather than a post-mortem.
+
+  The scan now reads `<mail root>/<BRIDGET_APPROVAL_MAILBOX>/new`, default
+  `human`. Moving the whole mail root carries it along; re-pointing the recipient
+  does not. Leaving it on `human` reintroduces no noise — it is a pull view that
+  fires no notification and moves no file out of `new/`, so the fail-open deadman
+  watching that queue is untouched.
+
+  And because a remedy is an artifact of the same kind as the defect, its zero
+  now says **which** zero it is: no such directory, an empty directory, or *N*
+  unread of which none matched — that last naming both knobs, since the scan can
+  still be pointed at a box whose subjects it will never match. `settings` and
+  the startup log print the box it resolved to and whether that differs from the
+  delivery box.
+
+  Not fixed here, and recorded in the code: `BRIDGET_DM_POLICY=curated` promotes
+  an approval to a DM using the same regex on the **delivery** path, so behind a
+  rewriting representative it will not fire either.
+
 ### Added
 
 - **A positive record for the delivery path, so silence is distinguishable from
