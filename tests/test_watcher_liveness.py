@@ -38,7 +38,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -47,6 +46,10 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
@@ -104,7 +107,7 @@ class BackoffEscalationTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp = Path(tempfile.mkdtemp(prefix='bridget-backoff-test-'))
+        cls.tmp = testtmp.mkdtemp('backoff-test')
         cls.bridget = load_bridget(cls.tmp)
 
     def test_backoff_grows_from_poll_interval_and_caps(self):
@@ -126,7 +129,7 @@ class SurvivesTimeoutTest(unittest.TestCase):
     keep its heartbeat mtime ticking across the timeout."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-survive-test-'))
+        self.tmp = testtmp.mkdtemp('survive-test')
         self.bridget = load_bridget(self.tmp)
 
     def test_single_timeout_is_survived_and_posting_resumes(self):
@@ -235,7 +238,7 @@ class KilledWatcherGoesStaleTest(unittest.TestCase):
         return os.stat(path).st_mtime_ns
 
     def test_heartbeat_stale_after_pid_kill(self):
-        tmp = Path(tempfile.mkdtemp(prefix='bridget-kill-test-'))
+        tmp = testtmp.mkdtemp('kill-test')
         pogo = tmp / '.pogo'
         pogo.mkdir(parents=True)
         (pogo / 'bridget.env').write_text(

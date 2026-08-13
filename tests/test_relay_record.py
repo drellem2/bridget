@@ -58,7 +58,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -66,6 +65,10 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 sys.path.insert(0, str(REPO))
 
@@ -155,7 +158,7 @@ class RelayRecordHarness(unittest.TestCase):
     ENV: dict = {}
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-relay-'))
+        self.tmp = testtmp.mkdtemp('relay')
         self.bridget = load_bridget(self.tmp, self.ENV)
         self.clock = FakeClock()
         b = self.bridget

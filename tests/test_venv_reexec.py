@@ -23,10 +23,8 @@ provably lacks discord.py, so the re-exec is exercised rather than described.
 """
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -34,6 +32,10 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 # The stub stands in for discord.py. It exits during import: bridget's module
@@ -56,7 +58,7 @@ class VenvReexecTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp = Path(tempfile.mkdtemp(prefix='bridget-reexec-'))
+        cls.tmp = testtmp.mkdtemp('reexec')
 
         # An interpreter that definitely cannot import discord. --without-pip
         # keeps this offline, like the rest of the suite.
@@ -111,7 +113,9 @@ class VenvReexecTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, ignore_errors=True)
+        # Not ignore_errors — see tests/testtmp.py (mg-1f20). This one holds a
+        # real venv, which is the largest fixture the suite builds.
+        testtmp.rmtree(cls.tmp)
 
     def run_bridget(self, **env_overrides):
         env = dict(os.environ)
@@ -162,7 +166,7 @@ class DiscordImportableTest(unittest.TestCase):
     and importing bridget under test re-execs the test runner into a venv."""
 
     def test_sys_modules_stub_is_honored(self):
-        fake_home = Path(tempfile.mkdtemp(prefix='bridget-importable-'))
+        fake_home = testtmp.mkdtemp('importable')
         (fake_home / '.pogo').mkdir(parents=True)
         env_file = fake_home / '.pogo' / 'bridget.env'
         env_file.write_text(
@@ -202,7 +206,7 @@ class DiscordImportableTest(unittest.TestCase):
                 sys.modules['bridget'] = saved_bridget
             else:
                 sys.modules.pop('bridget', None)
-            shutil.rmtree(fake_home, ignore_errors=True)
+            testtmp.rmtree(fake_home)
 
 
 if __name__ == '__main__':

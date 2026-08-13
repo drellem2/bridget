@@ -48,7 +48,6 @@ import importlib.util
 import io
 import os
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -56,6 +55,10 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
@@ -111,7 +114,7 @@ class TeardownTest(unittest.TestCase):
     """`stop_watchers` — the primitive the whole fix rests on."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-idem-unit-'))
+        self.tmp = testtmp.mkdtemp('idem-unit')
         self.b = load_bridget(self.tmp)
         # `track_watcher` goes through client.loop.create_task; under the stub
         # `client` is a MagicMock, so point it at the real running loop.
@@ -229,7 +232,7 @@ class ReconnectDoesNotAccumulateTest(unittest.TestCase):
     """Property 1 + 3, at the level the bug was actually observed: reconnects."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-idem-recon-'))
+        self.tmp = testtmp.mkdtemp('idem-recon')
         self.b = load_bridget(self.tmp)
 
     def test_watcher_count_is_constant_across_reconnects(self):
@@ -342,7 +345,7 @@ class RealOnReadyTest(unittest.TestCase):
     RECONNECTS = 6  # the real incident: 7 sets = 1 start + 6 reconnects
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-idem-real-'))
+        self.tmp = testtmp.mkdtemp('idem-real')
         self.b = load_bridget(self.tmp)
 
     def _real_on_ready(self):
@@ -420,7 +423,7 @@ class StartupGreetingTest(unittest.TestCase):
     """The same reconnect path also re-sent the 'bridget online' DM each time."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-idem-greet-'))
+        self.tmp = testtmp.mkdtemp('idem-greet')
         self.b = load_bridget(self.tmp)
 
     def test_greeting_is_once_per_process_not_once_per_connection(self):

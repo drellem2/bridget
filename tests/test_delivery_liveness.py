@@ -44,7 +44,6 @@ import importlib.util
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -54,6 +53,10 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
@@ -123,7 +126,7 @@ class StormElementsTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp = Path(tempfile.mkdtemp(prefix='bridget-storm-unit-'))
+        cls.tmp = testtmp.mkdtemp('storm-unit')
         cls.bridget = load_bridget(cls.tmp)
 
     def test_storm_edge_fires_once_on_the_threshold(self):
@@ -154,7 +157,7 @@ class RunMgAsyncOffLoadsTest(unittest.TestCase):
     makes progress on the loop."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-offload-'))
+        self.tmp = testtmp.mkdtemp('offload')
         self.bridget = load_bridget(self.tmp)
 
     def test_loop_runs_while_mg_is_blocked(self):
@@ -207,7 +210,7 @@ class StormDoesNotStopDeliveryTest(unittest.TestCase):
     reaches the user."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-storm-deliv-'))
+        self.tmp = testtmp.mkdtemp('storm-deliv')
         self.bridget = load_bridget(self.tmp)
 
     def test_mail_delivered_while_mg_storms(self):
@@ -278,7 +281,7 @@ class DeliveryHeartbeatTest(unittest.TestCase):
     class the loop heartbeat is blind to."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-deliv-hb-'))
+        self.tmp = testtmp.mkdtemp('deliv-hb')
         self.bridget = load_bridget(self.tmp)
 
     def _prime_seen_empty(self, b):

@@ -40,12 +40,15 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 SUPERVISE = REPO / 'bridget-supervise'
 sys.path.insert(0, str(REPO))
@@ -256,7 +259,7 @@ class EndToEndTest(unittest.TestCase):
     that is perfect but never installed would pass every test above."""
 
     def test_a_date_grep_finds_the_startup_and_used_not_to(self):
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('logstamp') as td:
             tmp = Path(td)
             home = tmp / 'home'
             (home / '.pogo').mkdir(parents=True)
@@ -278,7 +281,7 @@ class EndToEndTest(unittest.TestCase):
     def test_no_line_of_a_multi_line_startup_failure_escapes(self):
         """`die()` prints four lines. Dating only the first would leave the
         remedy — the part a reader actually needs — undateable."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('logstamp') as td:
             home = Path(td)
             (home / '.pogo').mkdir(parents=True)
             r = run_startup(SCRIPT, home)
@@ -294,7 +297,7 @@ class SuperviseTest(unittest.TestCase):
     so half the file stayed outside the one grep that is supposed to work."""
 
     def test_supervisor_lines_share_the_anchored_prefix(self):
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('logstamp') as td:
             tmp = Path(td)
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith('BRIDGET_')}

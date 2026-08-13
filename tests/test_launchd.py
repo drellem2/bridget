@@ -28,7 +28,6 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import textwrap
 import time
 import unittest
@@ -36,6 +35,10 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SUPERVISE = REPO / 'bridget-supervise'
 PLIST_EXAMPLE = REPO / 'com.pogo.bridget.plist.example'
 
@@ -80,7 +83,7 @@ def supervise_env(tmp: Path, **overrides) -> dict:
 class SuperviseRestartTest(unittest.TestCase):
     def test_restarts_the_child_until_max_spawns(self):
         """The whole point: bridget dies, the wrapper starts it again."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marks = tmp / 'runs'
             child = fake_bridget(tmp, f"""
@@ -100,7 +103,7 @@ class SuperviseRestartTest(unittest.TestCase):
 
     def test_a_fast_exit_backs_off_and_a_healthy_run_does_not(self):
         """Backoff doubles only for children that die immediately."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             child = fake_bridget(tmp, 'exit 1\n')
             r = subprocess.run(
@@ -119,7 +122,7 @@ class SuperviseRestartTest(unittest.TestCase):
         back to $HOME/.pogo/bin/bridget — and papering over a bad BRIDGET_BIN
         would leave someone debugging a bridget they did not start.
         """
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             durable = fake_bridget(tmp, 'exit 5\n', name='.pogo/bin/bridget')
             r = subprocess.run(
@@ -160,7 +163,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
 
     def test_refuses_to_supervise_a_path_inside_a_polecat_worktree(self):
         """Even a working binary. Ephemeral is invalid by construction."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             child = self.polecat_bin(tmp, marker)
@@ -181,7 +184,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
         Run install.sh from a polecat worktree and it points there instead. The
         literal path looks durable; only the resolved one tells the truth.
         """
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             real = self.polecat_bin(tmp, marker)
@@ -200,7 +203,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
 
     def test_an_ephemeral_target_falls_back_to_the_durable_default(self):
         """Refusing the path and dying are separable. Only refuse the path."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             child = self.polecat_bin(tmp, marker)
@@ -217,7 +220,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
 
     def test_the_override_supervises_the_worktree_path_deliberately(self):
         """A polecat smoke-testing its own build opts in, explicitly."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             child = self.polecat_bin(tmp, marker)
@@ -237,7 +240,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
         This is why the target is re-resolved before every spawn rather than
         pinned once — a worktree is reaped while its bridget is supervised.
         """
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             pinned = fake_bridget(
@@ -258,7 +261,7 @@ class SuperviseEphemeralTargetTest(unittest.TestCase):
 
     def test_a_target_that_turns_ephemeral_mid_life_falls_back(self):
         """Durable at 14:40, a symlink into a worktree at 14:48."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             marker = tmp / 'ran'
             worktree = self.polecat_bin(tmp, marker)
@@ -307,7 +310,7 @@ class SuperviseAlertTest(unittest.TestCase):
             capture_output=True, text=True, timeout=30)
 
     def test_an_unrunnable_target_with_no_fallback_is_loud_on_both_streams(self):
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             r = self.run_until_fatal(tmp)
             self.assertEqual(r.returncode, 1)
@@ -324,7 +327,7 @@ class SuperviseAlertTest(unittest.TestCase):
         The stamp has to be on disk: each respawn is a fresh process, so an
         in-memory counter would rate-limit exactly nothing.
         """
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             first = self.run_until_fatal(tmp)
             second = self.run_until_fatal(tmp)   # same stamp: the next respawn
@@ -337,7 +340,7 @@ class SuperviseAlertTest(unittest.TestCase):
                           'throttling the mail must never throttle the log')
 
     def test_the_cooldown_expires(self):
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             self.run_until_fatal(tmp, BRIDGET_ALERT_COOLDOWN='0')
             self.run_until_fatal(tmp, BRIDGET_ALERT_COOLDOWN='0')
@@ -345,7 +348,7 @@ class SuperviseAlertTest(unittest.TestCase):
 
     def test_a_broken_notifier_does_not_stop_the_supervisor_from_exiting(self):
         """Alerting is best-effort. `mg` may not even be on launchd's PATH."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             r = subprocess.run(
                 ['bash', str(SUPERVISE)],
@@ -363,7 +366,7 @@ class SuperviseAlertTest(unittest.TestCase):
         otherwise hold the pipe open and this test would measure the notifier's
         lifetime instead of the supervisor's.
         """
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             hung = fake_bridget(tmp, 'sleep 60\n', name='hung-notifier')
             began = time.time()
@@ -383,7 +386,7 @@ class SuperviseAlertTest(unittest.TestCase):
 class SuperviseSignalTest(unittest.TestCase):
     def test_sigterm_is_forwarded_to_the_child_and_honored(self):
         """`launchctl bootout` and `kickstart -k` must be able to stop us."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             got = tmp / 'child-signal'
             child = fake_bridget(tmp, f"""
@@ -425,7 +428,7 @@ class SuperviseSignalTest(unittest.TestCase):
         with a dead supervisor and an orphaned bridget.
         """
         backoff = 30
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             ran = tmp / 'ran'
             child = fake_bridget(tmp, f"""
@@ -465,7 +468,7 @@ class SuperviseSignalTest(unittest.TestCase):
 
     def test_the_wrapper_does_not_restart_after_being_terminated(self):
         """A terminating wrapper must not resurrect the child on its way out."""
-        with tempfile.TemporaryDirectory() as td:
+        with testtmp.TemporaryDirectory('launchd') as td:
             tmp = Path(td)
             starts = tmp / 'starts'
             child = fake_bridget(tmp, f"""

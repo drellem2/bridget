@@ -40,11 +40,15 @@ No network and no launchctl: `origin/main` is a ref, and this writes it directly
 import os
 import re
 import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SUPERVISE = REPO / 'bridget-supervise'
 
 #: mg-35b1's anchored prefix. A multi-line alert body must not escape it.
@@ -139,7 +143,7 @@ class ActivationCase(unittest.TestCase):
     """One tmpdir per test: a $HOME, a checkout, an alert sink, a marker file."""
 
     def setUp(self):
-        self.td = tempfile.TemporaryDirectory()
+        self.td = testtmp.TemporaryDirectory('activation')
         self.addCleanup(self.td.cleanup)
         self.tmp = Path(self.td.name)
         self.marker = self.tmp / 'ran'

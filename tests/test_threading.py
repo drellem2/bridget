@@ -25,7 +25,6 @@ import asyncio
 import importlib.util
 import os
 import sys
-import tempfile
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -33,6 +32,10 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
@@ -211,7 +214,7 @@ def fake_discord_module():
 # --- loader ----------------------------------------------------------------
 
 def load_bridget(env_overrides: dict | None = None, env_file_extra: str = ''):
-    fake_home = Path(tempfile.mkdtemp(prefix='bridget-thread-test-'))
+    fake_home = testtmp.mkdtemp('thread-test')
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
     env_path = env_dir / 'bridget.env'

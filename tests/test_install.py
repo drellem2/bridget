@@ -30,11 +30,14 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 INSTALL = REPO / 'install.sh'
 
 #: Shape-valid for `token_shape_ok` (three dot-separated base64url chunks), and
@@ -49,8 +52,10 @@ class InstallerTestCase(unittest.TestCase):
     """Runs install.sh with $HOME pointed at a temp dir."""
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp(prefix='bridget-install-'))
-        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.home = testtmp.mkdtemp('install')
+        # addCleanup, not tearDown: it runs on the failure arm too. Not
+        # ignore_errors: see tests/testtmp.py (mg-1f20).
+        self.addCleanup(testtmp.rmtree, self.home)
         self.pogo = self.home / '.pogo'
         self.env_file = self.pogo / 'bridget.env'
         self.bin_link = self.pogo / 'bin' / 'bridget'

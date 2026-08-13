@@ -24,6 +24,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 python3 -m py_compile bridget
 python3 -m py_compile bridget_core/*.py
 bash -n install.sh
+# The harness's own temp directories (mg-1f20). tests/testtmp.py nests every
+# fixture under ONE swept root and reaps by pid ownership, because the teardown
+# that would otherwise do it is skipped by exactly the runs that need it: a
+# panic, a harness timeout, a kill. Before it, one ./test.sh left 444
+# directories in $TMPDIR — 209 of them bridget-thread-test-* — and this box
+# reached 100% capacity with every merge gate dying on Errno 28.
+python3 tests/test_testtmp.py
 python3 tests/test_core.py
 python3 tests/test_env_defaults.py
 # The representative relay's INBOUND seam (mg-65d2). Outbound agent mail routes
@@ -124,4 +131,10 @@ python3 tests/test_mg_threading.py
 # Drives handle_command on a fresh install. Needs the real discord module, so it
 # self-skips when ~/.pogo/venv-bridget is absent.
 bash tests/smoke-fresh-install.sh
+# THE MEASUREMENT (mg-1f20). Everything above it asserts behaviour; this counts
+# $TMPDIR before and after a run and fails on growth. It runs LAST because the
+# thing it measures is what the rest of this file leaves behind, and it is here
+# at all because a leak that surfaces months later as a full disk has no other
+# detector — nothing on this host reported the disk until a build died.
+bash tests/tmpdir-leak_test.sh
 echo "test.sh: ok"

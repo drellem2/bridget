@@ -34,18 +34,21 @@ import importlib.util
 import os
 import re
 import sys
-import tempfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 CONFIG_ERROR_RE = re.compile(r'is unavailable.*set', re.IGNORECASE)
 
 
 def main() -> int:
-    fake_home = Path(tempfile.mkdtemp(prefix='bridget-smoke-'))
+    fake_home = testtmp.mkdtemp('smoke')
     os.environ['HOME'] = str(fake_home)
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)

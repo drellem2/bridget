@@ -25,12 +25,14 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
 
 
 def tracked_files() -> list[Path]:
@@ -140,7 +142,7 @@ class TestEnvFilePermissions(unittest.TestCase):
         exec('import sys\nfrom pathlib import Path\n' + src[start:end], ns)
         warn = ns['warn_if_world_readable']
 
-        d = Path(tempfile.mkdtemp(prefix='bridget-perm-'))
+        d = testtmp.mkdtemp('perm')
         loose, tight = d / 'loose.env', d / 'tight.env'
         loose.write_text('DISCORD_BOT_TOKEN=x\n')
         tight.write_text('DISCORD_BOT_TOKEN=x\n')
@@ -185,7 +187,7 @@ class TestStateFilePermissions(unittest.TestCase):
     022 a plain write_text lands them at 0644."""
 
     def setUp(self):
-        self.d = Path(tempfile.mkdtemp(prefix='bridget-state-perm-'))
+        self.d = testtmp.mkdtemp('state-perm')
 
     def _mode(self, p: Path) -> int:
         return stat.S_IMODE(p.stat().st_mode)

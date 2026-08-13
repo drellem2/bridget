@@ -12,6 +12,48 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **The test harness stops leaking temp directories into the shared `$TMPDIR`
+  (mg-1f20).** Measured on this tree: one `./test.sh` left **444** directories
+  behind in a pinned `$TMPDIR`, 209 of them `bridget-thread-test-*`. They are not
+  a curiosity — the host reached 100% capacity with 204Mi free, and every merge
+  gate on the box failed with `Errno 28`, which presents as a *random branch
+  defect* because the gate that dies is whichever one happens to run when the
+  disk crosses. pogo fixed its own side first (mg-de3c) and measured that the
+  remainder was not pogo's; bridget's harness was among the named producers.
+
+  The obvious repair — pair every `tempfile.mkdtemp()` with a teardown — does not
+  hold, for three reasons that are the whole design:
+
+  1. Cleanup hanging off the end of a run is skipped by a crash, a harness
+     timeout or a kill, so it works on the success path and leaks exactly when
+     tests fail — which is when they are run most.
+  2. Helpers exit past their own cleanup on the failure arm, leaking every time
+     they report the failure they exist to report.
+  3. `shutil.rmtree(..., ignore_errors=True)`, which four teardowns said, stops
+     at the first unremovable entry and reports success. A read-only *directory*
+     (Go writes its module cache 0444 inside 0555, and a fake `$HOME` collects
+     one the moment a test shells out to `go build`) is not removable that way at
+     all — unlink is authorised by the parent's mode — so the largest thing in a
+     nest was never reclaimed and nothing said so.
+
+  So recovery cannot depend on the leaking process running any code. New
+  `tests/testtmp.py` nests every harness directory under **one swept root**
+  (`$TMPDIR/bridget-test-tmp`) and reaps it on the way IN, by **pid ownership**:
+  a live owner's fixtures survive at any age, a dead owner's are reclaimed, and
+  an unowned name ages out. Ownership rather than age because this box runs
+  several agents at once, and a sweep that deleted a running suite's fixtures
+  would be the same failure arriving by a new route. `testtmp.rmtree` removes
+  read-only nests and **raises** rather than reporting a removal that did not
+  happen.
+
+  `tests/tmpdir-leak_test.sh` is the detector, and it is the acceptance criterion
+  verbatim: count `$TMPDIR`, run a suite, count again, fail on growth — with a
+  positive control that plants the pre-fix call and shows the count moving, plus
+  ratchets that fail the build if any test reaches for `tempfile` directly or
+  swallows a removal error again. A cold `$TMPDIR` now gains exactly one entry;
+  a warm one gains nothing. This has no other detector: nothing on this host
+  reported the disk at all until a build died.
+
 - **The approval scan follows the mail root, not the recipient (mg-18bf).**
   `scan_pending_approvals` and the DM watcher were one variable, `POGO_MAIL_DIR`.
   Step 4 of the representative cutover re-points that at the representative's

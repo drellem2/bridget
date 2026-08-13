@@ -42,13 +42,16 @@ Stubs `discord` so this runs under system python3 (no venv-bridget required).
 import importlib.util
 import os
 import sys
-import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
@@ -58,7 +61,7 @@ def load_bridget(env_overrides: dict | None = None):
     Returns (module, fake_home) — the caller needs the home to seed maildirs
     under the same root bridget derived its paths from.
     """
-    fake_home = Path(tempfile.mkdtemp(prefix='bridget-approval-test-'))
+    fake_home = testtmp.mkdtemp('approval-test')
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
     (env_dir / 'bridget.env').write_text(

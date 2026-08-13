@@ -26,7 +26,6 @@ import importlib.util
 import json
 import os
 import sys
-import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -34,12 +33,16 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
 def load_bridget():
     """Import bridget into a fresh namespace with a clean fake HOME."""
-    fake_home = Path(tempfile.mkdtemp(prefix='bridget-transitions-test-'))
+    fake_home = testtmp.mkdtemp('transitions-test')
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
     (env_dir / 'bridget.env').write_text(

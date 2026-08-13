@@ -37,13 +37,14 @@ ticket asked to move.
 import asyncio
 import datetime
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
 
 from bridget_core.ratelimit import (  # noqa: E402
     DuplicateLimiter,
@@ -170,7 +171,7 @@ class TestClaimsAncestry(unittest.TestCase):
 
 class TestFirstOccurrence(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
         self.limiter = make_limiter(self.tmp, clock=self.clock)
 
@@ -210,7 +211,7 @@ class TestFirstOccurrence(unittest.TestCase):
 
 class TestBackoff(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
         self.limiter = make_limiter(self.tmp, clock=self.clock)
 
@@ -260,7 +261,7 @@ class TestBackoff(unittest.TestCase):
 
 class TestSuppressionIsRecoverable(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
         self.limiter = make_limiter(self.tmp, clock=self.clock)
 
@@ -301,7 +302,7 @@ class TestDeliveryIsCommittedNotAssumed(unittest.TestCase):
     """The at-least-once seam. `decide` must change nothing."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
         self.limiter = make_limiter(self.tmp, clock=self.clock)
 
@@ -327,7 +328,7 @@ class TestDeliveryIsCommittedNotAssumed(unittest.TestCase):
 
 class TestPersistence(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
 
     def test_a_restart_does_not_reopen_the_flood(self):
@@ -372,7 +373,7 @@ class TestTheMeasuredFlood(unittest.TestCase):
     """The number the ticket asked to move, replayed through the limiter."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix='bridget-dedup-'))
+        self.tmp = testtmp.mkdtemp('dedup')
         self.clock = FakeClock()
         self.limiter = make_limiter(self.tmp, clock=self.clock)
 

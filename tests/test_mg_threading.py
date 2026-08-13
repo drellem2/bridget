@@ -57,6 +57,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / 'tests'))
 
+import testtmp  # noqa: E402
 from bridget_core.conversations import ConversationStore  # noqa: E402
 from bridget_core.mgshim import help_advertises_in_reply_to  # noqa: E402
 from test_threading import FakeTextChannel, FakeUser, load_threaded  # noqa: E402
@@ -120,7 +121,9 @@ class RealMgTestCase(unittest.IsolatedAsyncioTestCase):
             os.environ.pop('HOME', None)
         else:
             os.environ['HOME'] = self._saved_home
-        shutil.rmtree(self.home, ignore_errors=True)
+        # Not ignore_errors: a teardown whose failure is invisible is how a
+        # leaked nest grew to a full disk with nothing reporting it (mg-1f20).
+        testtmp.rmtree(self.home)
 
     # -- driving the real mg ----------------------------------------------
 

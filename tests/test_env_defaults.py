@@ -23,7 +23,6 @@ import importlib.util
 import os
 import re
 import sys
-import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -31,13 +30,17 @@ from unittest import mock
 
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
+
 SCRIPT = REPO / 'bridget'
 
 
 def load_bridget(env_overrides: dict | None = None):
     """Import bridget into a fresh module namespace with a clean fake HOME and
     optional env overrides. Returns the imported module."""
-    fake_home = Path(tempfile.mkdtemp(prefix='bridget-env-test-'))
+    fake_home = testtmp.mkdtemp('env-test')
     env_dir = fake_home / '.pogo'
     env_dir.mkdir(parents=True)
     (env_dir / 'bridget.env').write_text(

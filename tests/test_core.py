@@ -32,13 +32,15 @@ import json
 import os
 import re
 import sys
-import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / 'tests'))
+
+import testtmp  # noqa: E402
 
 from bridget_core import (  # noqa: E402
     ConversationStore,
@@ -71,8 +73,14 @@ from bridget_core.mgshim import (  # noqa: E402
 )
 
 
-def tmpdir(prefix: str) -> Path:
-    return Path(tempfile.mkdtemp(prefix=prefix))
+def tmpdir(purpose: str) -> Path:
+    """A directory this process owns, reclaimed by the next run (mg-1f20).
+
+    purpose is a label, not a prefix — see tests/testtmp.py for why the
+    directory is nested rather than sitting in $TMPDIR, and why nothing here
+    hangs a teardown off it.
+    """
+    return testtmp.mkdtemp(purpose)
 
 
 def subject_arg(args: list[str]) -> str:
@@ -301,7 +309,7 @@ class TestThreadTitle(unittest.TestCase):
 
 class TestConversationStore(unittest.TestCase):
     def setUp(self):
-        self.path = tmpdir('bridget-conv-') / 'conversations.json'
+        self.path = tmpdir('conv') / 'conversations.json'
 
     def test_record_creates_and_persists(self):
         store = ConversationStore(self.path)
@@ -417,7 +425,7 @@ class TestStoreDefensiveBranches(unittest.TestCase):
     bridge; untested, that is an aspiration rather than a property."""
 
     def setUp(self):
-        self.dir = tmpdir('bridget-defensive-')
+        self.dir = tmpdir('defensive')
         self.path = self.dir / 'conversations.json'
 
     def test_a_non_dict_conversation_entry_is_skipped_not_fatal(self):
@@ -462,7 +470,7 @@ class TestPostedGuard(unittest.TestCase):
     thread post."""
 
     def setUp(self):
-        self.path = tmpdir('bridget-posted-') / 'conversations.json'
+        self.path = tmpdir('posted') / 'conversations.json'
         self.store = ConversationStore(self.path)
         self.store.record('k1', subject='s', agent='mayor', message_id='m1')
 
@@ -516,7 +524,7 @@ class TestConversationStoreResolve(unittest.TestCase):
     round-trip, once `References` stops naming the root."""
 
     def setUp(self):
-        self.path = tmpdir('bridget-resolve-') / 'conversations.json'
+        self.path = tmpdir('resolve') / 'conversations.json'
         self.store = ConversationStore(self.path)
 
     def test_resolves_a_recorded_message_to_its_conversation(self):
@@ -580,7 +588,7 @@ class TestConversationStoreResolve(unittest.TestCase):
 
 class TestSettingsStore(unittest.TestCase):
     def setUp(self):
-        self.path = tmpdir('bridget-settings-') / 'settings.json'
+        self.path = tmpdir('settings') / 'settings.json'
 
     def test_defaults_preserve_existing_behavior(self):
         s = SettingsStore(self.path)
@@ -716,7 +724,7 @@ class TestSettingsStore(unittest.TestCase):
 
 class TestMaildirWatcher(unittest.TestCase):
     def setUp(self):
-        root = tmpdir('bridget-maildir-')
+        root = tmpdir('maildir')
         self.new = root / 'new'
         self.new.mkdir(parents=True)
         self.cur = root / 'cur'
