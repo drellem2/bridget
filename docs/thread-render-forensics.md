@@ -193,6 +193,19 @@ rate-limiting on *thread creation* per unit time, and no coalescing of a drained
 backlog. That — not the standing population — is what this incident actually
 exercised, and it is what Daniel asked for.
 
+> **Followed up in mg-7dda.** Both controls now exist: creations are counted
+> over a trailing window, a drained backlog from one correspondent folds onto
+> the thread it already has open rather than opening one per message, and past
+> a hard ceiling a new conversation gets no thread until the rate falls back.
+> The `relay:` beat carries `span` and `peak` so a flush stops being reported
+> as an average. See "How fast threads may be created" in the README.
+>
+> **That work does not close the gap below, and does not claim to.** It is
+> justified as hygiene on the same footing as the bound — an unbounded creation
+> rate is a liability whatever broke the client — and `tests/test_thread_burst.py
+> ::TestItMakesNoCausalClaim` is a tripwire against the prose drifting back into
+> a cause, which is how mg-27e0's claim reached eight files.
+
 
 ## What survives
 

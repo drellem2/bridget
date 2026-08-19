@@ -98,6 +98,13 @@ from bridget_core.inbound import (  # noqa: E402
     dm_surface,
     plan_catchup,
 )
+from bridget_core.burst import (  # noqa: E402
+    DEFAULT_ANCHOR_TTL,
+    DEFAULT_CEILING,
+    DEFAULT_COALESCE_ABOVE,
+    DEFAULT_WINDOW as DEFAULT_BURST_WINDOW,
+    ThreadBurstLimiter,
+)
 from bridget_core.inbound import humanize as humanize_gap  # noqa: E402
 from bridget_core.logstamp import install_line_timestamps  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
@@ -631,6 +638,52 @@ def load_config() -> dict:
                 f"{', '.join(str(c) for c in THREAD_ARCHIVE_CHOICES)} — Discord "
                 f"accepts no other value (got {thread_archive_minutes}).")
 
+    # The thread-CREATION rate limit and backlog coalescing (mg-7dda). The cap
+    # above bounds how many threads are held OPEN; this bounds how fast they are
+    # opened. Different quantities: mg-2ab2 measured the open population rising
+    # monotonically (966 -> 971) across the window in which Daniel's client went
+    # from unreadable to readable, while the same window carried 122 creations
+    # in one hour, peak 27 in a minute, against ~36 for the whole rest of the
+    # day. A cap on the standing count does not bound that, and until this
+    # ticket nothing did.
+    #
+    # It is hygiene on its own merits, exactly as the cap is. It is NOT
+    # established that the burst is what stopped the client rendering — see
+    # docs/thread-render-forensics.md, which is explicit that a ~2h45m gap
+    # between the burst decaying and Daniel reporting the channel readable is
+    # unclosed.
+    burst_window = positive_int('BRIDGET_THREAD_BURST_WINDOW', DEFAULT_BURST_WINDOW)
+
+    # Creations per window at or above which new conversations start folding
+    # onto their correspondent's existing thread instead of opening another.
+    # This is the coalescing Daniel named ("needing better deduplication in the
+    # bridge"): the duplication limit already folds REPEATS of one condition,
+    # and it was running and suppressing that morning — a drained backlog is
+    # many DIFFERENT subjects, so the axis here is the correspondent. 0 turns
+    # coalescing off.
+    burst_coalesce_above = positive_int('BRIDGET_THREAD_BURST_ABOVE',
+                                        DEFAULT_COALESCE_ABOVE, allow_zero=True)
+
+    # The hard ceiling. Past this a new conversation opens no thread at all
+    # until the rate falls back; its mail is delivered by DM, with the reason on
+    # it, and it gets a thread on a later mail. Coalescing alone is not a
+    # ceiling — N first-time correspondents in one window are N threads — so
+    # without this the "rate limit" would be a reduction and not a bound. 0
+    # removes it and leaves only coalescing.
+    burst_ceiling = positive_int('BRIDGET_THREAD_BURST_CEILING', DEFAULT_CEILING,
+                                 allow_zero=True)
+    if burst_coalesce_above and burst_ceiling and burst_ceiling < burst_coalesce_above:
+        # The cheap remedy has to get first refusal. A ceiling below the
+        # coalescing threshold would strand first-time correspondents on the DM
+        # path while the coalescing that would have absorbed them never engages.
+        die(f"BRIDGET_THREAD_BURST_CEILING ({burst_ceiling}) must be >= "
+            f"BRIDGET_THREAD_BURST_ABOVE ({burst_coalesce_above}).")
+
+    # How long a correspondent's thread stays eligible to absorb their next
+    # mail. Only ever consulted while a burst is live.
+    burst_anchor_ttl = positive_int('BRIDGET_THREAD_BURST_ANCHOR_TTL',
+                                    DEFAULT_ANCHOR_TTL)
+
     correlation_ids = (lookup('BRIDGET_CORRELATION_IDS') or 'auto').strip().lower()
     if correlation_ids not in CORRELATION_MODES:
         die(f"BRIDGET_CORRELATION_IDS must be one of {', '.join(CORRELATION_MODES)} "
@@ -698,6 +751,10 @@ def load_config() -> dict:
         'max_live_threads': max_live_threads,
         'thread_eviction_batch': thread_eviction_batch,
         'thread_archive_minutes': thread_archive_minutes,
+        'burst_window': burst_window,
+        'burst_coalesce_above': burst_coalesce_above,
+        'burst_ceiling': burst_ceiling,
+        'burst_anchor_ttl': burst_anchor_ttl,
         'dm_policy': dm_policy,
         'correlation_ids': correlation_ids,
     }
@@ -968,6 +1025,22 @@ DEDUP = DuplicateLimiter(
     max_interval=CONFIG['dedup_max_window'],
     ttl=CONFIG['dedup_ttl'],
     enabled=CONFIG['dedup_window'] > 0,
+)
+
+#: The thread-CREATION rate limit and backlog coalescing (mg-7dda). MAX_LIVE_THREADS
+#: above bounds the standing population; this bounds the derivative. Both are
+#: hygiene: mg-2ab2 refuted the claim that the population was what broke
+#: Daniel's client, and this ticket makes no replacement claim — an unbounded
+#: creation rate is a liability whatever broke it.
+#:
+#: In memory and per-process, unlike the standing bound. A population is what it
+#: was a second before the process died, so forgetting it re-inflates it; a rate
+#: over a 60-second window rebuilds itself out of the next 60 seconds of traffic.
+BURST = ThreadBurstLimiter(
+    window=CONFIG['burst_window'],
+    coalesce_above=CONFIG['burst_coalesce_above'],
+    ceiling=CONFIG['burst_ceiling'],
+    anchor_ttl=CONFIG['burst_anchor_ttl'],
 )
 
 #: The delivery path's positive record (mg-7c1b). Every outbound surface counts
@@ -2039,6 +2112,135 @@ def log_suppressed(filename: str, mail: dict, decision) -> None:
           flush=True)
 
 
+#: The grep token for the creation-rate limit's lines (mg-7dda). Shares no
+#: prefix with `relay:` or `dedup:`, so counting one never counts another.
+THREAD_BURST_TOKEN = 'thread-burst:'
+
+
+def format_burst_fold(admission) -> str:
+    """The line on a mail that was folded onto its correspondent's thread.
+
+    It is on the mail rather than only in the log because the human is about to
+    read a card whose subject is not the thread's name, and an unexplained
+    mismatch is exactly the kind of thing that gets reported as a bug. The
+    mail's own sender and subject are on the card immediately below this.
+    """
+    return (f"🌊 backlog burst — folded into this thread (#{admission.folded}); "
+            f"{admission.rate} threads opened in the last {admission.window}s.\n")
+
+
+def format_burst_ceiling(admission) -> str:
+    """The line on a mail delivered with no thread, because of the ceiling.
+
+    Deliberately NOT the `log channel unreachable` wording the other stranded
+    path uses. Two different controls with one message is an instrument that
+    cannot be used to tell them apart, which is the defect this whole family of
+    tickets keeps re-finding one level in.
+    """
+    return (f"🌊 backlog burst — thread creation is at its ceiling "
+            f"({admission.rate} in the last {admission.window}s); delivering "
+            f"here, and this conversation opens its thread once the burst "
+            f"passes.\n")
+
+
+def format_thread_burst(report) -> str:
+    """One `thread-burst:` line. The burst said out loud while it is happening.
+
+    Its own grep token, sharing no prefix with `relay:` or `dedup:` — so
+    `grep -c thread-burst:` counts burst episodes and nothing else, the same
+    discipline `relay-stall:` keeps.
+
+    The three phases carry the same facts, so any one line scopes the episode
+    without reading back to the onset. Volume is one line at onset, one per
+    window while it lasts, and one when it ends: a flush the length of the
+    measured one (~06:49Z to ~07:14Z) costs about 26 lines, not 122.
+    """
+    tail = (f"{report.created} thread(s) created, {report.coalesced} folded onto "
+            f"them, {report.over_ceiling} delivered without one")
+    if report.phase == 'onset':
+        return (f"{THREAD_BURST_TOKEN} a backlog is draining — "
+                f"{report.rate} thread(s) created in the last {report.window}s, "
+                f"at the coalescing threshold of {BURST.coalesce_above}; new "
+                f"conversations now fold onto their correspondent's open thread "
+                f"(ceiling {BURST.ceiling or 'off'})")
+    if report.phase == 'continuing':
+        return (f"{THREAD_BURST_TOKEN} still draining after "
+                f"{round(report.elapsed)}s — {report.rate}/{report.window}s now, "
+                f"peak {report.peak}; {tail}")
+    return (f"{THREAD_BURST_TOKEN} drained after {round(report.elapsed)}s — "
+            f"peak {report.peak} thread(s) per {report.window}s; {tail}")
+
+
+def log_thread_burst() -> None:
+    """Emit the burst line if one is due. Call once per delivery cycle.
+
+    Unlike the relay beat this is NOT gated on a healthy cycle: a burst is a
+    fact about arrival rate, not a claim that delivery works, and the episode's
+    closing line has to be able to fire on a cycle where nothing was delivered
+    at all — otherwise a flush that ends by the transport falling over is left
+    permanently open in the log.
+    """
+    report = BURST.report()
+    if report is not None:
+        print(format_thread_burst(report), flush=True)
+
+
+def thread_burst_status() -> str:
+    """Whether the creation-rate limit is on, and at what.
+
+    Stated at startup for the reason `relay_status_line` states its own off
+    case: a control that can be switched off silently has the defect it was
+    built to remove, and the reader of this log has to be able to tell "no
+    `thread-burst:` lines because nothing burst" from "no `thread-burst:` lines
+    because nothing would have said so".
+    """
+    if not THREADS_ENABLED:
+        return 'n/a (threading off)'
+    if not BURST.enabled:
+        return ('OFF (BRIDGET_THREAD_BURST_ABOVE=0 and '
+                'BRIDGET_THREAD_BURST_CEILING=0) — creation is unbounded in '
+                'RATE, so a drained backlog opens one thread per message and '
+                'nothing in this file will say it happened')
+    parts = []
+    if BURST.coalesce_above:
+        parts.append(f'coalesce onto the correspondent\'s thread above '
+                     f'{BURST.coalesce_above} creations/{BURST.window}s')
+    else:
+        parts.append('coalescing OFF (BRIDGET_THREAD_BURST_ABOVE=0)')
+    if BURST.ceiling:
+        parts.append(f'no new thread at all above {BURST.ceiling}/{BURST.window}s')
+    else:
+        parts.append('no hard ceiling (BRIDGET_THREAD_BURST_CEILING=0) — '
+                     'coalescing reduces the rate but does not bound it')
+    parts.append(f'anchors expire after {BURST.anchor_ttl}s')
+    return 'on — ' + '; '.join(parts)
+
+
+def thread_burst_summary() -> str:
+    """The creation-rate limit as one line of the `settings` card.
+
+    The counters, not just the configuration: a control the human can see is
+    ON but cannot see has ever DONE anything is the same instrument as a total
+    with nothing to measure it against.
+    """
+    view = BURST.summary()
+    if not view['enabled']:
+        return '`off` — thread creation is unbounded in rate'
+    state = f"**{view['rate']}**/{view['window']}s now"
+    if view['bursting']:
+        state += ' — **bursting**'
+    line = (f"`on` — {state}; coalesce above `{view['coalesce_above']}`, "
+            f"ceiling `{view['ceiling'] or 'off'}`")
+    if view['peak']:
+        # The counters scope to the LATEST burst, not to the process. Saying
+        # "this episode" while none is running would be a number with nothing
+        # to attach it to, which is the failure mode this card is fixing.
+        when = 'this burst' if view['bursting'] else 'latest burst'
+        line += (f" ({when}: peak {view['peak']}, {view['coalesced']} folded, "
+                 f"{view['over_ceiling']} delivered without a thread)")
+    return line
+
+
 def format_relay_beat(beat) -> str:
     """The line that proves the delivery path ran (mg-7c1b).
 
@@ -2059,9 +2261,20 @@ def format_relay_beat(beat) -> str:
     own `dedup:` line sits in the same file saying so. A positive record that
     overstated would be the defect wearing the fix's clothes.
     """
-    return (f"relay: {beat.delivered} delivered in the last "
+    line = (f"relay: {beat.delivered} delivered in the last "
             f"{round(beat.window)}s ({beat.total} total since "
             f"{isostamp(beat.since)})")
+    if beat.is_burst:
+        # The clause mg-7dda is named for. The line above is an average, and
+        # averaging is what turned `171 delivered in the last 262762s` — a
+        # three-day backlog flushed in under five minutes — into something that
+        # reads as a trickle. `span` and `peak` are the two numbers that put it
+        # back, and they are appended rather than substituted so the line keeps
+        # its shape and its grep token.
+        line += (f" — BURST: they arrived in {round(beat.span)}s, peak "
+                 f"{beat.peak}/min at {isostamp(beat.peak_at)}; the window "
+                 f"averages that to {beat.per_minute:.1f}/min")
+    return line
 
 
 def relay_status_line() -> str:
@@ -2419,6 +2632,36 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
 
     notice = format_repeat_notice(decision) if decision and decision.kind == 'repeat' else ''
 
+    # The thread-CREATION rate limit and backlog coalescing (mg-7dda). Consulted
+    # only for a conversation that would OPEN a thread — one we have never seen,
+    # or one left without a thread by an earlier over-ceiling delivery. Waking an
+    # archived thread is deliberately NOT charged here: it costs the channel a
+    # slot, which is the standing bound's business, and charging it would make a
+    # long-running bridge read as bursting every time an old conversation got a
+    # reply.
+    #
+    # It runs AFTER the duplication limit, and the order is load-bearing: a
+    # repeat the limit already folded onto its first occurrence's thread opens
+    # nothing, so charging it would count a creation that is not happening.
+    admission = None
+    if THREADS_ENABLED:
+        existing = CONVERSATIONS.get(key)
+        if existing is None or existing.thread_id is None:
+            anchor = BURST.anchor_for(mail['from'])
+            if anchor and anchor not in CONVERSATIONS:
+                # The store pruned the conversation behind this anchor. Folding
+                # onto it would re-create an empty one and open a thread the
+                # limiter never charged for — a hole in the ceiling, dressed as
+                # a fold. Drop it and let this mail root its own.
+                BURST.forget_anchor(mail['from'])
+            admission = BURST.admit(mail['from'], key)
+            if admission.coalesced:
+                # A drained backlog from one correspondent is one thread, not
+                # N. The mail is filed onto the thread they already have open
+                # in this episode; its own subject rides on the card below.
+                key = admission.conversation
+                notice = format_burst_fold(admission) + notice
+
     if THREADS_ENABLED:
         message_id = reply_target(mail, fallback=filename)
         conv = CONVERSATIONS.record(
@@ -2427,9 +2670,21 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
             agent=mail['from'],
             message_id=message_id,
         )
-        # Idempotent in `message_id`: a redelivery gets the thread's URL, not a
-        # second copy in the thread.
-        url = await post_to_thread(conv, mail, message_id=message_id, prefix=notice)
+        if admission is not None and admission.over_ceiling:
+            # At the ceiling with nothing to fold into. Open no thread; the DM
+            # below carries the mail and says why. The conversation is recorded
+            # all the same, so its next message opens its thread once the rate
+            # has fallen back — the mail is paced, never dropped.
+            url = ''
+        else:
+            # Idempotent in `message_id`: a redelivery gets the thread's URL, not a
+            # second copy in the thread.
+            url = await post_to_thread(conv, mail, message_id=message_id, prefix=notice)
+            if not url and admission is not None and conv.thread_id is None:
+                # No thread exists, so the create is what failed rather than the
+                # send into it. Give the budget back: an outage must not spend
+                # the creation ceiling on threads that were never opened.
+                BURST.rollback(admission)
     else:
         # No threads, no thread map. Recording every mail here would rewrite the
         # conversation file on each delivery for a feature that is switched off.
@@ -2448,7 +2703,13 @@ async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
 
     prefix = notice
     if stranded:
-        prefix += '⚠️ log channel unreachable — delivering here instead.\n'
+        if admission is not None and admission.over_ceiling:
+            # Not an outage — a ceiling. Saying "unreachable" here would be the
+            # instrument lying about which control fired, and this is the one
+            # branch where the human sees the rate limit at all.
+            prefix += format_burst_ceiling(admission)
+        else:
+            prefix += '⚠️ log channel unreachable — delivering here instead.\n'
     try:
         await user.send(format_mail_card(mail, thread_link=url, prefix=prefix))
     except discord.HTTPException as e:
@@ -2638,6 +2899,10 @@ async def watch_mailbox(user: discord.User):
         # exactly the ~70h wedge a reaper needs to catch (mg-e5b8). If the loop
         # itself stops iterating (event-loop starvation, a dead task), it freezes
         # too: either way, stale == delivery is not happening.
+        # The creation-rate record (mg-7dda), outside the health gate on purpose
+        # — see `log_thread_burst`. A burst is a fact about arrival, and its
+        # closing line has to be able to fire on a cycle that delivered nothing.
+        log_thread_burst()
         if delivery_ok:
             touch_heartbeat(DELIVERY_HEARTBEAT_FILE)
             # ...and the same fact, in the file people actually grep (mg-7c1b).
@@ -3911,6 +4176,7 @@ def handle_command(text: str) -> str:
             out += f'\n• Open threads: {thread_cap_status()}'
             out += (f'\n• Idle archive: `{THREAD_ARCHIVE_MINUTES}min` '
                     f'(Discord retires an untouched thread after this)')
+            out += f'\n• Creation rate: {thread_burst_summary()}'
         out += f'\n• Correlation IDs (reply threading): `{MG_CAPS.describe()}`'
         dedup = DEDUP.summary()
         if dedup['enabled']:
@@ -4710,6 +4976,8 @@ async def on_ready():
     # off; they just arrive as new top-level mail instead of threading.
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
     print(f"per-channel routing: {channels_status_line()}", flush=True)
+    if THREADS_ENABLED:
+        print(f"thread creation rate: {thread_burst_status()}", flush=True)
     print(f"delivery record: {relay_status_line()}", flush=True)
     print(f"delivery wedge watch: {wedge_status_line()}", flush=True)
     print(f"approval scan: {approvals_status_line()}", flush=True)

@@ -379,6 +379,78 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **A rate limit on thread CREATION, and coalescing for a drained backlog
+  (mg-7dda).** mg-27e0 bounded how many threads bridget holds **open**. Nothing
+  bounded how fast it opens them, and mg-2ab2 established that the rate — not
+  the standing population — is what the 2026-08-19 incident exercised: the open
+  count rose monotonically (966 → 968 → 967 → **971**, nothing archived) across
+  the window in which the channel went from unreadable to readable, while
+  `thread_metadata.create_timestamp` shows **122 threads created in the 06:00Z
+  hour, peak 27 in the 06:56Z minute**, against 36 for the whole rest of that
+  day, as a 71h28m DNS outage's backlog flushed. mg-879c measured the same flush
+  on the DM side: 171 messages into one DM in under five minutes.
+
+  **A cap on a standing count does not bound a burst. They are different
+  quantities and only one of them had a control.**
+
+  Three parts, all of them new keys with conservative defaults, and nothing
+  changes at all below the threshold — the rest of that measured day ran
+  ~0.03 creations/min against a default threshold of 12/60s:
+
+  - **Coalescing.** Past `BRIDGET_THREAD_BURST_ABOVE` creations per window, a
+    new conversation from a correspondent who already has a thread open in this
+    episode is filed onto **that** thread, with a line on the card saying so.
+    This is the deduplication Daniel actually named — *"another instance of
+    needing better deduplication in the bridge"*. The duplication limit that
+    already exists (mg-5521) folds repeats of one **condition**, and it was
+    running and suppressing that morning; a drained backlog is many *different*
+    subjects from the same correspondent, so the axis here is the correspondent.
+  - **A ceiling.** Coalescing is a reduction, not a bound — N first-time
+    correspondents in one window are N threads. Past
+    `BRIDGET_THREAD_BURST_CEILING`, a new conversation gets **no thread** until
+    the rate falls back; its mail is delivered by DM carrying the reason, and
+    the conversation opens its thread on its next message. Nothing is dropped
+    and nothing is delayed on any branch. The DM deliberately does **not** reuse
+    the "log channel unreachable" wording of the other fallback: two controls
+    with one message is an instrument that cannot tell them apart.
+  - **The burst is said out loud.** A `thread-burst:` line at onset, one per
+    window while it lasts, and one at the close with the episode's totals — its
+    own grep token, sharing no prefix with `relay:` or `dedup:`. And the relay
+    beat stops averaging a flush into invisibility: `relay: 171 delivered in the
+    last 262762s` is true and reads as a trickle over three days, so a beat now
+    also carries `span` (how long the deliveries actually took) and `peak` (the
+    busiest clock minute), appended as a `— BURST: …` clause so `grep -c
+    'relay:'` still counts deliveries and nothing else. A steady stream is not a
+    burst however fast it runs: the test is whether reporting it over the window
+    misleads, not how much of it there is.
+
+  **This is hygiene, not a diagnosis, and the distinction is the point.**
+  mg-27e0 shipped a causal claim — that the standing population made the channel
+  unrenderable — which was false and had to be retracted from eight places.
+  mg-2ab2 established that the burst happened and that the population did not
+  move; it did **not** establish that the burst broke the client, and a ~2h45m
+  gap between the burst decaying (~07:00Z) and Daniel reporting the channel
+  readable (09:45Z) is unclosed, because server-side data cannot see a client
+  reload. An unbounded creation rate is a liability whatever broke it. So no
+  causal claim is made here, and
+  `tests/test_thread_burst.py::TestItMakesNoCausalClaim` is a tripwire against
+  the prose drifting back into one.
+
+  The limiter's state is deliberately **not** persisted, which is the opposite
+  of the standing bound's choice and for a stated reason: a population is what
+  it was a second before the process died, so forgetting it re-inflates it,
+  while a rate over a 60-second window rebuilds itself out of the next 60
+  seconds of traffic. And `admit()` records as it decides rather than splitting
+  decide/commit the way the duplication limit does — a split would open a
+  check-then-act window across the thread-create `await`, and every concurrent
+  delivery inside it would read "under the ceiling" and create, which is the
+  unbounded burst this bounds arriving by the back door.
+
+  New keys: `BRIDGET_THREAD_BURST_ABOVE` (12), `BRIDGET_THREAD_BURST_CEILING`
+  (30), `BRIDGET_THREAD_BURST_WINDOW` (60), `BRIDGET_THREAD_BURST_ANCHOR_TTL`
+  (900). Setting the first two to `0` restores the old behaviour, and bridget
+  says so at startup.
+
 - **A positive record for the delivery path, so silence is distinguishable from
   death (mg-7c1b).** `~/.pogo/bridget.log` recorded delivery **only when it went
   wrong**. A log that records only exceptions cannot be used to confirm the

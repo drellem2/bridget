@@ -65,7 +65,19 @@ from test_threading import (  # noqa: E402
 
 
 def threaded(cap='3', **kw):
-    """A bridget with threading on and the live-thread cap set."""
+    """A bridget with threading on and the live-thread cap set.
+
+    The thread-CREATION rate limit (mg-7dda) is switched OFF here unless a test
+    asks for it. It is a second, independent control on a different quantity —
+    threads opened per interval, not threads held open — and every test in this
+    file opens its whole population inside one process-second, which is a rate
+    no real traffic reaches (the incident's peak was 27/min, and the rest of
+    that day ran ~0.03/min). Left on, it would coalesce these fixtures onto one
+    correspondent's thread and every assertion here would be measuring the wrong
+    bound. tests/test_thread_burst.py measures that one on its own terms.
+    """
+    kw.setdefault('BRIDGET_THREAD_BURST_ABOVE', '0')
+    kw.setdefault('BRIDGET_THREAD_BURST_CEILING', '0')
     b = load_threaded(BRIDGET_MAX_LIVE_THREADS=cap, **kw)
     channel = FakeTextChannel(555, client=b.client)
     b.client.channels[555] = channel

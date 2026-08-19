@@ -131,6 +131,10 @@ See [Conversation threads](#conversation-threads-optional).
 | `BRIDGET_MAX_LIVE_THREADS` | `50` | How many threads bridget holds **open** at once. Past it, the least recently used is archived. `0` = unbounded. See [How many threads stay open](#how-many-threads-stay-open). |
 | `BRIDGET_THREAD_EVICTION_BATCH` | `8` | Most threads one new thread may archive to make room, so lowering the cap drains rather than mass-archiving. |
 | `BRIDGET_THREAD_ARCHIVE_MINUTES` | `60` | Discord's idle timer on a new thread. One of `60` / `1440` / `4320` / `10080`; anything else is refused at startup. |
+| `BRIDGET_THREAD_BURST_ABOVE` | `12` | Threads **created** per window at or above which a drained backlog starts folding onto its correspondent's open thread instead of opening another. `0` switches coalescing off. See [How fast threads may be created](#how-fast-threads-may-be-created). |
+| `BRIDGET_THREAD_BURST_CEILING` | `30` | Hard ceiling on creations per window. Past it a new conversation gets no thread until the rate falls back; its mail is DM'd with the reason. Must be >= `BRIDGET_THREAD_BURST_ABOVE`. `0` removes the ceiling. |
+| `BRIDGET_THREAD_BURST_WINDOW` | `60` | The trailing window both of those are measured over, in seconds. |
+| `BRIDGET_THREAD_BURST_ANCHOR_TTL` | `900` | How long a correspondent's thread stays eligible to absorb their next mail. Only consulted while a burst is live. |
 
 ### Duplication-limit knobs
 
@@ -350,6 +354,91 @@ The count is stated against the cap wherever it is stated: at startup
 replaced — "N conversation(s) restored" — rose 1120 → 1139 → 1147 across three
 restarts in one morning without reading as an alarm to anyone who saw it,
 because a number with nothing to measure it against is a statistic.
+
+### How fast threads may be created
+
+The cap above bounds how many threads are held **open**. It says nothing about
+how fast they are **opened**, and those are different quantities: the open
+population is what your client renders, the creation rate is what arrives.
+Only one of them had a control until this.
+
+The rate is what the 2026-08-19 incident actually exercised. A 71h28m DNS
+outage queued the whole fleet's mail; connectivity returning flushed it, and
+`thread_metadata.create_timestamp` shows what that looked like:
+
+```
+06:49Z   23      122 threads in the 06:00Z hour
+06:50Z   27      peak 27 in the 06:56Z minute
+06:56Z   27      36 threads in the whole rest of the day
+06:59Z   22
+07:02Z    2      <- decayed
+```
+
+**This is hygiene, not a diagnosis.** It is not established that the burst is
+what stopped the channel rendering — see
+[`docs/thread-render-forensics.md`](docs/thread-render-forensics.md), which is
+explicit that a ~2h45m gap between the burst decaying and the channel being
+reported readable is unclosed, and that server-side data cannot see a client
+reload. An unbounded creation rate is worth bounding either way.
+
+Under `BRIDGET_THREAD_BURST_ABOVE` creations per window — which is essentially
+all traffic; the rest of that day ran ~0.03/min — nothing changes at all. Above
+it:
+
+- **A drained backlog from one correspondent becomes one thread.** Their next
+  mail is filed onto the thread they already have open in this episode rather
+  than opening another, with a line on the card saying so. This is the
+  deduplication that was actually asked for. The [duplication
+  limit](#the-duplication-limit) folds repeats of one *condition* — same
+  sender, same subject once digits are normalised — and it was running and
+  suppressing that morning; a drained backlog is many *different* subjects, so
+  the axis here is the correspondent.
+- **Past `BRIDGET_THREAD_BURST_CEILING`, a new conversation gets no thread at
+  all** until the rate falls back. Coalescing alone is a reduction, not a
+  bound: N first-time correspondents in one window are N threads. Its mail is
+  delivered to your DMs with the reason on it — deliberately *not* the "log
+  channel unreachable" wording the other DM fallback uses — and the
+  conversation opens its thread on its next message.
+
+Nothing is dropped and nothing is delayed on any branch, which is the same
+contract the duplication limit keeps.
+
+The episode is legible while it happens, under its own grep token:
+
+```
+thread-burst: a backlog is draining — 12 thread(s) created in the last 60s, at
+              the coalescing threshold of 12; new conversations now fold onto
+              their correspondent's open thread (ceiling 30)
+thread-burst: still draining after 180s — 12/60s now, peak 27; 12 thread(s)
+              created, 88 folded onto them, 0 delivered without one
+thread-burst: drained after 671s — peak 27 thread(s) per 60s; 12 thread(s)
+              created, 113 folded onto them, 0 delivered without one
+```
+
+One line at onset, one per window while it lasts, one at the end — so a flush
+the length of the measured one costs the log ~26 lines rather than 122.
+
+The `relay:` beat learned the same lesson. It used to report a flush as an
+average, which is the operation that hides one:
+
+```
+relay: 171 delivered in the last 262762s (408 total since 2026-08-16T06:41:09Z)
+```
+
+Every number there is true and it reads as a trickle over three days; it was a
+backlog flushed in under five minutes. It now carries the two facts the average
+destroys:
+
+```
+relay: 171 delivered in the last 262762s (408 total since …) — BURST: they
+       arrived in 268s, peak 47/min at 2026-08-19T06:50:00Z; the window
+       averages that to 0.0/min
+```
+
+The clause is appended, never substituted, so `grep -c 'relay:'` still counts
+deliveries and nothing else. A steady stream is deliberately not a burst
+however fast it runs — the test is whether reporting it over the window
+*misleads*, not how much of it there is.
 
 ### Replying
 

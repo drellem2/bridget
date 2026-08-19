@@ -34,6 +34,10 @@ Slack, Matrix, or a terminal:
                     say whether we were even connected, and the persisted
                     last-seen ids a bounded REST catch-up sweep resumes from
                     after a fresh IDENTIFY, which Discord never replays across.
+    burst         — a rate limit on thread CREATION, and the coalescing of a
+                    drained backlog: the standing bound in `conversations`
+                    counts threads OPEN, which is a different quantity and does
+                    not bound how fast they are opened (mg-7dda).
     relaylog      — when the delivery path should say "I am here", and what:
                     a "relayed N since T" beat that fires even with nothing to
                     report, so the log's silence stops being consistent with
@@ -61,6 +65,7 @@ core module because that is where the data already is.
 """
 
 from .acks import Ack, ambiguous, delivered, undeliverable
+from .burst import BURST_TOKEN, Admission, BurstReport, ThreadBurstLimiter
 from .conversations import Conversation, ConversationStore
 from .inbound import (
     CATCHUP_TOKEN,
@@ -107,6 +112,9 @@ from .wedgewatch import (
 
 __all__ = [
     'Ack',
+    'Admission',
+    'BURST_TOKEN',
+    'BurstReport',
     'CATCHUP_TOKEN',
     'CatchupPlan',
     'CatchupResult',
@@ -130,6 +138,7 @@ __all__ = [
     'SeenStore',
     'SelfHeal',
     'SettingsStore',
+    'ThreadBurstLimiter',
     'Verdict',
     'WedgeWatch',
     'alert_key',

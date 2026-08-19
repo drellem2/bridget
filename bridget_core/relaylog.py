@@ -90,6 +90,21 @@ outage now costs ~24 lines a day and is dated at both ends. `RelayLedger.stall`
 is the negative; `RelayLedger.due` is the positive; a healthy cycle ends a
 stall, so the two can never both be live.
 
+**Why the count was not enough either (mg-7dda).** The recovery line above was
+read a second time, for a different ticket, and the misreading it invites is
+its own: `171 delivered in the last 262762s` is an AVERAGE, and averaging is
+the operation that turns a flush into a trickle. The reader who greps this file
+during an incident wants to know whether the mail arrived steadily or all at
+once, and the beat as shipped could not tell them — the same shape of defect as
+a total with nothing to measure it against (mg-27e0's `1147 conversation(s)
+restored`).
+
+So a beat now also carries `span` (how long the deliveries actually took) and
+`peak` (the busiest clock minute), and `RelayBeat.is_burst` says when the two
+have come apart far enough that quoting the window rate misleads. The adapter
+appends a clause rather than changing the line's shape: `relay:` still means
+one delivery beat and `grep -c` still counts them.
+
 Nothing here renders. `RelayBeat` and `RelayStall` are the facts; the adapter
 formats them, the way `Decision` and `format_repeat_notice` divide the same
 work.
@@ -105,6 +120,24 @@ from dataclasses import dataclass
 #: repetition this must not become, so deliveries inside this window fold into
 #: the next line's count.
 ACTIVE_GAP_CAP = 60
+
+#: Fewest deliveries a beat must carry before it can be called a burst. Below
+#: this the concentration test is met by any two messages that happen to arrive
+#: together, and "BURST: 2 arrived in 1s" is noise wearing an alarm's clothes.
+BURST_MIN_DELIVERED = 10
+
+#: How much more concentrated than its window a beat's deliveries must be. 2
+#: means "they took at most half the window", which is the point at which
+#: quoting the window average understates the real rate by 2x or more.
+BURST_CONCENTRATION = 2
+
+#: Resolution the peak rate is measured at: one clock minute. Fixed minute
+#: boundaries rather than a sliding window, so the arithmetic is a dict of
+#: counters rather than a retained list of every timestamp. A burst that
+#: straddles a minute boundary is therefore reported at up to half its true
+#: sliding peak — it changes `peak`, never `is_burst`, which is decided by
+#: `span` and does not go through the buckets.
+PEAK_BUCKET = 60
 
 
 def isostamp(timestamp: float) -> str:
@@ -127,11 +160,60 @@ class RelayBeat:
     long that took, and `total`/`since` carry the run's whole story so a single
     line lifted out of the log still answers "has this process ever delivered
     anything".
+
+    `span`, `peak` and `peak_at` are the burst half (mg-7dda). `window` is how
+    long the beat covers; `span` is how long the deliveries inside it actually
+    took, and the two coming apart is the whole point:
+
+        relay: 171 delivered in the last 262762s (408 total since ...)
+
+    is the line the 71.6h outage of mg-879c recovered with. Every number in it
+    is true, and it reads as a trickle over three days; it was a backlog
+    flushed into one DM in under five minutes. `window` alone cannot tell those
+    apart, because an average over a window is exactly the operation that
+    destroys the difference. `span` is 268s for the burst and ~262762s for the
+    trickle, and `peak` is the per-minute maximum — the same quantity mg-2ab2
+    used to describe the thread side ("peak 27 in the 06:56Z minute").
     """
     delivered: int
     window: float
     total: int
     since: float
+    #: Seconds between the first and last delivery in this beat's window. 0
+    #: when nothing was delivered, or when it all arrived inside one instant.
+    span: float = 0.0
+    #: The largest number of deliveries in any one clock minute of this window.
+    peak: int = 0
+    #: Start of that minute, epoch seconds. 0 when nothing was delivered.
+    peak_at: float = 0.0
+
+    @property
+    def is_burst(self) -> bool:
+        """True when this beat is a flush rather than throughput.
+
+        Two conditions, and both are needed. `delivered >= BURST_MIN_DELIVERED`
+        keeps the label off the ordinary case of two mails an hour apart, where
+        the ratio below is met trivially and means nothing. The concentration
+        test is the substantive one: the deliveries occupied at most
+        1/BURST_CONCENTRATION of the window they are being reported over, so
+        stating them as a rate over that window understates by at least that
+        factor.
+
+        A steady stream is deliberately NOT a burst here however fast it runs —
+        `span` tracks `window` and the reported rate is the real one. This
+        property is about the reporting being misleading, not about volume.
+        """
+        if self.delivered < BURST_MIN_DELIVERED:
+            return False
+        return self.span * BURST_CONCENTRATION <= self.window
+
+    @property
+    def per_minute(self) -> float:
+        """The window average, per minute — the number the burst clause exists
+        to stand next to."""
+        if self.window <= 0:
+            return float(self.delivered)
+        return self.delivered * 60.0 / self.window
 
 
 @dataclass(frozen=True)
@@ -187,6 +269,14 @@ class RelayLedger:
         #: startup instead of an hour of silence indistinguishable from a
         #: watcher that never spawned.
         self._last_beat: float | None = None
+        #: When the first and last delivery of the current window landed, and
+        #: how many landed in each clock minute of it. All three are cleared by
+        #: every beat, so the dict is bounded by the deliveries since the last
+        #: line rather than by the length of the window — an hour of silence
+        #: costs nothing to remember (mg-7dda).
+        self._first_at: float | None = None
+        self._last_at: float | None = None
+        self._buckets: dict[int, int] = {}
         #: When the current run of unhealthy cycles began, and when the last
         #: stall line was emitted. Both cleared by `due()`, which is only ever
         #: called from a healthy cycle — so a stall cannot outlive the outage
@@ -200,10 +290,26 @@ class RelayLedger:
         """Minimum seconds between beats when there is something to report."""
         return min(ACTIVE_GAP_CAP, self.interval)
 
-    def record(self, count: int = 1) -> None:
-        """Count `count` mail as relayed. Cheap; call it per delivered mail."""
+    def record(self, count: int = 1, now: float | None = None) -> None:
+        """Count `count` mail as relayed. Cheap; call it per delivered mail.
+
+        The timestamp is what lets the next beat say whether this was a flush
+        or a trickle. Callers pass nothing and get the clock, which is right
+        for every caller: `record` is called immediately after the send lands.
+        """
+        at = self._clock() if now is None else now
         self.total += count
         self._pending += count
+        if self._first_at is None:
+            self._first_at = at
+        # A clock step backwards would otherwise leave first > last and a
+        # negative span, which reads as a burst of infinite concentration. Take
+        # the wider interval instead: over-reporting the span un-flags a burst,
+        # which is the direction that cannot invent an alarm.
+        self._first_at = min(self._first_at, at)
+        self._last_at = at if self._last_at is None else max(self._last_at, at)
+        bucket = int(at // PEAK_BUCKET)
+        self._buckets[bucket] = self._buckets.get(bucket, 0) + count
 
     def due(self, now: float | None = None) -> RelayBeat | None:
         """The beat to emit at `now`, or None. Mutates when it returns a beat.
@@ -260,11 +366,22 @@ class RelayLedger:
                           started=self.started)
 
     def _beat(self, now: float, window_start: float) -> RelayBeat:
+        peak_bucket = max(self._buckets, key=lambda b: (self._buckets[b], b),
+                          default=None)
+        span = 0.0
+        if self._first_at is not None and self._last_at is not None:
+            span = max(0.0, self._last_at - self._first_at)
         beat = RelayBeat(delivered=self._pending,
                          window=max(0.0, now - window_start),
                          total=self.total,
-                         since=self.started)
+                         since=self.started,
+                         span=span,
+                         peak=self._buckets.get(peak_bucket, 0) if peak_bucket is not None else 0,
+                         peak_at=float(peak_bucket * PEAK_BUCKET) if peak_bucket is not None else 0.0)
         self._pending = 0
+        self._first_at = None
+        self._last_at = None
+        self._buckets = {}
         self._last_beat = now
         return beat
 

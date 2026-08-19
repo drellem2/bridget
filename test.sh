@@ -53,6 +53,19 @@ python3 tests/test_threading.py
 # reopens its own thread. Carries a pre-fix control that reproduces the
 # unbounded population with the cap switched off. Stubs discord.
 python3 tests/test_thread_cap.py
+# The thread-CREATION rate limit and backlog coalescing (mg-7dda). The cap above
+# bounds the standing population; this bounds the derivative, and they are
+# different quantities — mg-2ab2 measured the population RISING (966 -> 971)
+# across the window in which the channel went from unreadable to readable, while
+# the same window carried 122 creations in one hour, peak 27 in a minute, as a
+# 71h28m outage's backlog flushed. Proves a drained backlog from one
+# correspondent becomes ONE thread rather than N (the "deduplication in the
+# bridge" Daniel named), that the ceiling holds under a concurrent burst, that
+# nothing is dropped or delayed on any branch, that the burst says so in the log
+# and on the card, and that the `relay:` beat stops averaging a flush into
+# invisibility. Carries a pre-fix control and a tripwire against re-asserting
+# mg-27e0's retracted cause. Stubs discord.
+python3 tests/test_thread_burst.py
 # The task-transition diff. Guards the DM flood: `mg list --json --all` emits
 # some ids twice (live + archived tombstone), and a line-by-line diff
 # re-announced them on every single poll.
