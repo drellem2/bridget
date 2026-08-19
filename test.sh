@@ -41,6 +41,17 @@ python3 tests/test_env_defaults.py
 python3 tests/test_representative_copy.py
 python3 tests/test_channels.py
 python3 tests/test_threading.py
+# The live-thread bound (mg-27e0). bridget opened one Discord thread per
+# conversation and closed none: 966 accumulated in ONE channel, and a Discord
+# client cannot render a channel carrying that many — the notification fired,
+# the channel would not load, and Daniel could not open his own mail. Proves the
+# cap holds at BOTH ways into the open set (a fresh create, and a wake out of
+# the archive — bounding only creation leaves the busier path unbounded), that a
+# concurrent burst cannot outrun it, that a restart cannot re-inflate past it,
+# and that eviction archives rather than deletes so an evicted conversation
+# reopens its own thread. Carries a pre-fix control that reproduces the
+# unbounded population with the cap switched off. Stubs discord.
+python3 tests/test_thread_cap.py
 # The task-transition diff. Guards the DM flood: `mg list --json --all` emits
 # some ids twice (live + archived tombstone), and a line-by-line diff
 # re-announced them on every single poll.

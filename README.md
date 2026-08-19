@@ -128,6 +128,9 @@ See [Conversation threads](#conversation-threads-optional).
 | `BRIDGET_LOG_CHANNEL_ID` | *(unset)* | Guild text channel where conversation threads are rooted. Unset = threading off. |
 | `BRIDGET_DM_POLICY` | `all` | `all` / `curated` / `none` — how much mail reaches your DMs. Anything but `all` requires a log channel. |
 | `BRIDGET_CORRELATION_IDS` | `auto` | `auto` / `on` / `off` — whether replies thread via `mg mail send --in-reply-to`. |
+| `BRIDGET_MAX_LIVE_THREADS` | `50` | How many threads bridget holds **open** at once. Past it, the least recently used is archived. `0` = unbounded. See [How many threads stay open](#how-many-threads-stay-open). |
+| `BRIDGET_THREAD_EVICTION_BATCH` | `8` | Most threads one new thread may archive to make room, so lowering the cap drains rather than mass-archiving. |
+| `BRIDGET_THREAD_ARCHIVE_MINUTES` | `60` | Discord's idle timer on a new thread. One of `60` / `1440` / `4320` / `10080`; anything else is refused at startup. |
 
 ### Duplication-limit knobs
 
@@ -270,6 +273,63 @@ to the root, only to reach a message it has already seen.
 Mail with no correlation headers at all (anything written before gh#66) keys on
 its maildir filename, which is the value macguffin would have used as its id
 anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
+
+### How many threads stay open
+
+A conversation is cheap; an **open thread** is not, because your Discord client
+has to render every one of them in the channel they hang off. bridget used to
+open one per conversation and close none. 966 accumulated in a single channel,
+and past some point in the high hundreds the client stops rendering that channel
+at all: the notification still fires, and opening it fails, because the parent
+channel will not load. A channel list that never populates — "it says no text
+channels" — is the same failure one step earlier.
+
+So the open population is **bounded**. `BRIDGET_MAX_LIVE_THREADS` (default 50)
+is the cap; past it, bridget archives the **least recently used** open thread to
+make room for the new one.
+
+Three properties are worth stating, because each is a way this could have been
+built and been wrong:
+
+- **Archiving is not deleting.** Discord archiving is its own retirement: the
+  thread and every message in it stay, it just leaves the channel's live list.
+  The next mail in that conversation reopens the same thread, in place. Nothing
+  is lost by a low cap — you scroll past fewer live threads, and that is all.
+- **It is a bound, not a sweep.** The cap is enforced at the moments a thread
+  *enters* the open set, before the thread that would breach it is opened —
+  never on a timer. A periodic sweep loses the race with exactly the burst that
+  fills the channel. There are two such moments, not one: a fresh create, and a
+  wake out of the archive. A long-running bridge wakes far more threads than it
+  opens, so bounding only creation would leave the busier path unbounded.
+- **It survives a restart.** Which threads are open is persisted alongside the
+  conversation map, so the next process starts from the count the last one
+  enforced. Restore *admits* nothing — it only remembers — so there is no path
+  by which restarting re-inflates the population past the cap.
+
+Least-recently-*used* means what it says: every message folded into a
+conversation, including the replies you type yourself, moves it to the back of
+the eviction queue. The thread you are reading is the last thing closed.
+
+**Why cap the threads rather than change what a thread is.** One thread per
+*correspondent* instead of per conversation is the obvious structural answer,
+and it is weaker than it looks here: most of the agents on the other end are
+per-work-item and exist once, so the set of correspondent names grows without
+bound too — more slowly, and still forever. Capping the open population bounds
+what the client renders by construction, whatever the threading key is, and
+leaves the reply routing (which is keyed on the conversation) alone.
+
+`BRIDGET_THREAD_ARCHIVE_MINUTES` (default 60) is Discord's own idle timer on a
+new thread, and it is a mitigation rather than a fix. The direction is the part
+worth remembering: a *longer* timer keeps each thread open longer, so more are
+open at once. If the channel feels crowded, that number wants to go down. It
+cannot close the gap on its own at any value — creation outruns archival while
+there is a thread per conversation — which is what the cap is for.
+
+The count is stated against the cap wherever it is stated: at startup
+(`threads 12/50 open (24% of cap)`) and under `settings`. The bare total this
+replaced — "N conversation(s) restored" — rose 1120 → 1139 → 1147 across three
+restarts in one morning without reading as an alarm to anyone who saw it,
+because a number with nothing to measure it against is a statistic.
 
 ### Replying
 

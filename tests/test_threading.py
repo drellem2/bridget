@@ -67,6 +67,16 @@ class FakeThread:
         self.archived = archived
         self.sent = []
         self.unarchived = False
+        #: How many times the adapter has archived this thread — the live-thread
+        #: bound's eviction (mg-27e0) is an `edit(archived=True)`, and a test
+        #: that only looked at `archived` could not tell "evicted" from
+        #: "created archived".
+        self.archive_calls = 0
+        #: What `create_thread` was told to set Discord's idle timer to.
+        self.auto_archive_duration = None
+        #: Set by a test to make archiving fail, so the bound's tolerance of a
+        #: refused eviction is exercised rather than asserted.
+        self.refuse_archive = False
 
     async def send(self, content):
         if self.archived:
@@ -77,6 +87,11 @@ class FakeThread:
         if archived is False:
             self.archived = False
             self.unarchived = True
+        elif archived is True:
+            if self.refuse_archive:
+                raise FakeHTTPException('archive refused')
+            self.archived = True
+            self.archive_calls += 1
 
 
 class FakeMessage:
@@ -90,6 +105,7 @@ class FakeMessage:
     async def create_thread(self, name=None, **kw):
         thread = FakeThread(self._next_thread_id)
         thread.name = name
+        thread.auto_archive_duration = kw.get('auto_archive_duration')
         self.channel.threads.append(thread)
         # A real thread is immediately resolvable via the client, which is what
         # lets a later message in the same conversation find it again.

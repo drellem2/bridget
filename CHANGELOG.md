@@ -12,6 +12,60 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **The open-thread population in the log channel is now bounded, so bridget
+  cannot fill a channel past the point its client will render (mg-27e0).**
+  bridget opened one Discord thread per conversation and closed none. On
+  2026-08-19 the guild held **966 active threads, all 966 with the same parent**
+  — the conversations root — every one carrying `auto_archive_duration=1440`.
+  Threads auto-archive on 24h of *inactivity*, and this fleet touches enough
+  conversations often enough that a large population never goes quiet for a full
+  day, so creation outran archival indefinitely. bridget's own startup line said
+  so three times in one morning — `1120`, `1139`, `1147 conversation(s)
+  restored` — and nobody read a rising total as an alarm.
+
+  The consequence was user-visible and looked like something else: notifications
+  fired because mail genuinely arrived, and opening one failed because the parent
+  channel would not load. Daniel's "the server is still messed up and I get
+  notifications but can't view them", the bot's grey status icon, and "it says no
+  text channels" were all this — the client failing to populate a channel it
+  cannot render, not channels being absent or the bot being down.
+
+  What changed:
+
+  - `BRIDGET_MAX_LIVE_THREADS` (default **50**) caps how many threads bridget
+    holds open at once. Past it, the **least recently used** open thread is
+    archived to make room. Archiving is Discord's own retirement, not a delete:
+    the thread and everything in it stay, and the conversation's next mail
+    reopens it in place.
+  - The cap is enforced at **admission**, before the thread that would breach it
+    exists — not on a timer. A periodic sweep loses the race with exactly the
+    burst that fills the channel. There are two admission points and both are
+    covered: a fresh create, and a **wake out of the archive**. A long-running
+    bridge wakes far more threads than it opens, so a bound on creation alone
+    would have left the busier path unbounded.
+  - Which threads are open is **persisted** (conversation store schema v3), so
+    restore cannot re-inflate the population past a cap the last process
+    enforced. Restore admits nothing; it only remembers.
+  - `BRIDGET_THREAD_ARCHIVE_MINUTES` (default **60**) sets Discord's idle timer
+    on new threads, down from the 1440 every one of the 966 carried. Daniel's
+    read on seeing the flood was "threads should expire after 2 days of
+    inactivity"; the instinct was right and the number inverted — a longer timer
+    keeps each thread open longer and *grows* the population. It is a mitigation
+    at any value: creation outruns archival while there is a thread per
+    conversation, which is what the cap is for.
+  - `BRIDGET_THREAD_EVICTION_BATCH` (default **8**) bounds how many threads one
+    admission may archive, so lowering the cap drains the set instead of
+    mass-archiving hundreds of the human's threads in a burst.
+  - The startup line and `settings` now state the open count **against the cap**
+    (`threads 12/50 open (24% of cap)`), warn near it, and say so distinctly when
+    the bound is switched off. A total with nothing to measure it against is a
+    statistic, which is why the old one was read three times and acted on none.
+
+  **Not** included, deliberately: archiving the 966 threads already on the
+  server. That is a one-time, reversible cleanup of a recurring cause, it is a
+  visible change to Daniel's server, and it is his call. This ticket fixed the
+  generator; shipping it does not by itself restore his client.
+
 - **A delivery outage now escalates off this transport and restarts the process,
   instead of retrying forever into a log nobody reads (mg-3f08).** On 2026-08-19
   every send failed for eight minutes with the same line every ~35s:

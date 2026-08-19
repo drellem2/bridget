@@ -195,6 +195,11 @@ DISCORD_THREAD_NAME_LIMIT = 100
 #: hard cap for the ellipsis and for a subject that is all wide characters.
 THREAD_TITLE_LIMIT = 90
 
+#: The only `auto_archive_duration` values Discord accepts, in minutes:
+#: one hour, one day, three days, one week. See BRIDGET_THREAD_ARCHIVE_MINUTES
+#: in `load_config` for why the default is the smallest of them (mg-27e0).
+THREAD_ARCHIVE_CHOICES = (60, 1440, 4320, 10080)
+
 #: How far we trim an mg task/idea title before it becomes a label on a Discord
 #: card (transition announcements, idea-claim announcements, the status board's
 #: in-flight list). These are *labels* — the full title lives in the mg item the
@@ -516,6 +521,59 @@ def load_config() -> dict:
         except ValueError:
             die("BRIDGET_LOG_CHANNEL_ID must be an integer (a Discord channel snowflake).")
 
+    # The live-thread bound (mg-27e0). bridget opened one Discord thread per
+    # conversation and never closed one: 966 of them accumulated in a single
+    # channel, and a Discord client cannot render a channel carrying that many.
+    # The notification fired, the channel would not load, and the human could
+    # not open his own mail.
+    #
+    # This is the CAP on threads bridget will hold open at once. It is enforced
+    # at admission — every point where a thread enters the open set, whether by
+    # being created or by being woken out of the archive — and not by a sweep,
+    # because a sweep loses the race with exactly the burst that causes the
+    # problem. Past the cap, the least recently USED open thread is archived to
+    # make room — used, not merely old: every message folded into a
+    # conversation, including the human's own replies, moves it to the back of
+    # the queue, so the thread being read is the last one closed. Archiving is reversible and non-destructive: the thread and
+    # everything in it survive, and the next mail in that conversation reopens
+    # it (through the same bound).
+    #
+    # 0 disables the bound and restores the behaviour this ticket is about.
+    # It exists as an operator escape hatch, and it says so at startup.
+    max_live_threads = positive_int('BRIDGET_MAX_LIVE_THREADS', 50, allow_zero=True)
+
+    # Most threads ONE admission may archive to make room. The bound needs at
+    # most one eviction per admission in the steady state; a batch is only
+    # reached when the open set starts out over the cap — after the cap is
+    # lowered, or on the first run against a backlog. Bounding the batch is
+    # what keeps that from becoming a mass-archive of hundreds of the human's
+    # threads in a single burst, which mg-27e0 puts explicitly out of scope.
+    # The set still drains, at (batch - 1) per admission.
+    thread_eviction_batch = positive_int('BRIDGET_THREAD_EVICTION_BATCH', 8)
+
+    # How long a thread sits idle before Discord archives it by itself, in
+    # minutes. Discord permits exactly these four values.
+    #
+    # The default is the SHORTEST one, and the direction matters: Daniel's
+    # instinct on seeing the flood was "threads should expire after 2 days of
+    # inactivity". Every one of the 966 already carried 1440 (24h). Raising it
+    # to 2 days would keep each thread open LONGER and grow the population —
+    # the opposite of the fix. 60 minutes shrinks it. It is still only a
+    # mitigation: creation outruns archival at any duration, which is why the
+    # cap above, and not this, is the fix.
+    thread_archive_raw = lookup('BRIDGET_THREAD_ARCHIVE_MINUTES')
+    thread_archive_minutes = 60
+    if thread_archive_raw:
+        try:
+            thread_archive_minutes = int(thread_archive_raw)
+        except ValueError:
+            die(f"BRIDGET_THREAD_ARCHIVE_MINUTES must be an integer "
+                f"(got {thread_archive_raw!r}).")
+        if thread_archive_minutes not in THREAD_ARCHIVE_CHOICES:
+            die(f"BRIDGET_THREAD_ARCHIVE_MINUTES must be one of "
+                f"{', '.join(str(c) for c in THREAD_ARCHIVE_CHOICES)} — Discord "
+                f"accepts no other value (got {thread_archive_minutes}).")
+
     correlation_ids = (lookup('BRIDGET_CORRELATION_IDS') or 'auto').strip().lower()
     if correlation_ids not in CORRELATION_MODES:
         die(f"BRIDGET_CORRELATION_IDS must be one of {', '.join(CORRELATION_MODES)} "
@@ -576,6 +634,9 @@ def load_config() -> dict:
         'restart_cmd': restart_cmd,
         'crew_pattern': crew_pattern,
         'log_channel_id': log_channel_id,
+        'max_live_threads': max_live_threads,
+        'thread_eviction_batch': thread_eviction_batch,
+        'thread_archive_minutes': thread_archive_minutes,
         'dm_policy': dm_policy,
         'correlation_ids': correlation_ids,
     }
@@ -816,6 +877,19 @@ LOG_CHANNEL_ID = CONFIG['log_channel_id']
 #: Threading is opt-in: it needs somewhere to put the threads. Without a log
 #: channel the bridge behaves exactly as it did before threads existed.
 THREADS_ENABLED = LOG_CHANNEL_ID is not None
+
+#: The live-thread bound (mg-27e0) and its knobs. See `load_config`.
+MAX_LIVE_THREADS = CONFIG['max_live_threads']
+THREAD_EVICTION_BATCH = CONFIG['thread_eviction_batch']
+THREAD_ARCHIVE_MINUTES = CONFIG['thread_archive_minutes']
+
+#: Serialises thread ADMISSION — the check-then-open sequence in
+#: `resolve_thread`. Without it the bound is a check-then-act race: several
+#: delivery watchers run concurrently, each can await inside the check, and N
+#: coroutines that each read "one slot free" all take it. That is the same
+#: shape as the defect being fixed (an unbounded population under burst), which
+#: is precisely why the remedy has to be examined for it.
+THREAD_ADMISSION_LOCK = asyncio.Lock()
 
 #: The conversation <-> Discord-thread map, and the live mute/DM-policy state.
 #: Both persist to ~/.pogo/ and survive restarts.
@@ -1574,6 +1648,126 @@ def thread_url(thread_id) -> str:
     return f'https://discord.com/channels/{SERVER_ID}/{thread_id}'
 
 
+#: How close to the cap the open-thread count has to get before the startup
+#: line stops being a statistic and starts being a warning.
+THREAD_CAP_WARN_RATIO = 0.8
+
+
+def thread_cap_status() -> str:
+    """The open-thread population stated against its bound.
+
+    mg-27e0's fourth scope item, and the reason it is one: bridget already
+    printed "N conversation(s) restored" at every startup, and that number rose
+    1120 -> 1139 -> 1147 across three restarts in one morning without anyone —
+    including the agent reading it each time — registering it as an alarm. A
+    total with nothing to measure it against is not a signal. This states the
+    number that matters (threads held OPEN, not conversations tracked) against
+    the number it must not pass, so proximity is readable at a glance.
+    """
+    if not MAX_LIVE_THREADS:
+        return (f'{CONVERSATIONS.live_count()} open, UNBOUNDED '
+                f'(BRIDGET_MAX_LIVE_THREADS=0 — this is the mg-27e0 fault '
+                f'condition; a channel cannot render ~1000 open threads)')
+    live = CONVERSATIONS.live_count()
+    pct = round(100 * live / MAX_LIVE_THREADS)
+    line = f'{live}/{MAX_LIVE_THREADS} open ({pct}% of cap)'
+    legacy = CONVERSATIONS.legacy_thread_count
+    if legacy:
+        # First run after the upgrade. These threads were opened by a build with
+        # no bound and are charged to nobody, so the count above understates
+        # what the channel is actually carrying — by up to this much. Saying
+        # only the bounded number here would be the same instrument that read
+        # "1147 conversation(s) restored" three times without alarming anyone.
+        line += (f'; up to {legacy} more opened before the bound existed, not '
+                 f'counted here — each enters the cap as it is used, and the '
+                 f'backlog is archived separately (mg-27e0)')
+    if live > MAX_LIVE_THREADS:
+        line += (f' — OVER CAP by {live - MAX_LIVE_THREADS}; draining at up to '
+                 f'{THREAD_EVICTION_BATCH} per new thread')
+    elif live >= MAX_LIVE_THREADS * THREAD_CAP_WARN_RATIO:
+        line += ' — near cap; the least recently used will be archived to make room'
+    return line
+
+
+async def archive_thread(conv) -> bool:
+    """Close `conv`'s Discord thread. True if it is closed after this returns.
+
+    Archiving is Discord's own retirement, not a delete: the thread and every
+    message in it stay, it just stops being rendered in the channel's live list
+    — and the next mail in that conversation reopens it. That is what makes it
+    safe to do on a bound rather than on the human's say-so; deleting would not
+    be.
+
+    A thread that has been deleted out from under us counts as closed. It is
+    holding no slot, and refusing to free the slot would wedge the bound on a
+    thread that does not exist.
+    """
+    if conv.thread_id is None:
+        return True
+    thread = client.get_channel(conv.thread_id)
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(conv.thread_id)
+        except (discord.NotFound, discord.Forbidden):
+            return True
+        except discord.HTTPException as e:
+            print(f'thread fetch failed while archiving ({conv.thread_id}): {e}',
+                  file=sys.stderr)
+            return False
+    if getattr(thread, 'archived', False):
+        return True
+    try:
+        await thread.edit(archived=True)
+    except discord.HTTPException as e:
+        print(f'thread archive failed ({conv.thread_id}): {e}', file=sys.stderr)
+        return False
+    return True
+
+
+async def make_room_for_thread(key: str) -> None:
+    """Archive least-recently-used open threads until one more fits under the cap.
+
+    Called under THREAD_ADMISSION_LOCK, at every point a thread ENTERS the open
+    set: a fresh create, and a wake out of the archive. Both, because bounding
+    only creation leaves the wake path unbounded, and a bridge that has been
+    running a while wakes far more threads than it opens — the remedy would
+    have carried the defect it was fixing.
+
+    Not a periodic sweep. A sweep runs on a timer and can be outrun by exactly
+    the burst that overfills the channel; this runs *before* the thread that
+    would breach the cap, so the cap is never breached in the first place.
+
+    Failures are tolerated and reported rather than blocking the mail: a thread
+    that will not archive costs one slot over the cap, where refusing to open
+    the new one would cost the human the message.
+    """
+    if not MAX_LIVE_THREADS:
+        return
+    over = CONVERSATIONS.live_count() - (MAX_LIVE_THREADS - 1)
+    if over <= 0:
+        return
+    victims = CONVERSATIONS.lru_live(exclude=key, limit=min(over, THREAD_EVICTION_BATCH))
+    if not victims:
+        return
+    closed = []
+    for victim in victims:
+        if await archive_thread(victim):
+            closed.append(victim.key)
+    CONVERSATIONS.mark_threads_archived(closed)
+    remaining = CONVERSATIONS.live_count()
+    note = ''
+    if over > len(victims):
+        # The open set started over the cap — a lowered cap, or a backlog this
+        # build did not open. Say how far, so the drain is legible instead of
+        # looking like an eviction storm.
+        note = (f'; {over - len(victims)} more over cap, draining at up to '
+                f'{THREAD_EVICTION_BATCH} per new thread')
+    if len(closed) < len(victims):
+        note += f'; {len(victims) - len(closed)} would not archive'
+    print(f'thread cap: archived {len(closed)} least-recently-used thread(s) to '
+          f'make room; {remaining}/{MAX_LIVE_THREADS} open{note}', file=sys.stderr)
+
+
 async def resolve_thread(conv, mail: dict):
     """Return the Discord thread rendering `conv`, creating it if needed.
 
@@ -1582,56 +1776,90 @@ async def resolve_thread(conv, mail: dict):
     thread id is persisted, so a restart re-attaches to the existing thread
     rather than rooting a duplicate.
 
+    Every path out of here that leaves a thread OPEN goes through
+    `make_room_for_thread` first, and the whole sequence holds
+    THREAD_ADMISSION_LOCK — that pair is the bound on how many threads bridget
+    keeps open in the log channel at once (mg-27e0). Conversations stay
+    unbounded and cheap; open threads, which are what a chat client has to
+    render, do not.
+
+    The bound survives a restart because the open set is persisted, not counted
+    in memory. Restore itself admits nothing — it only remembers which threads
+    were open when the last process stopped — so there is no path by which a
+    restart re-inflates the population past the cap.
+
     Returns None if the log channel is unusable — the caller falls back to a DM
     rather than dropping the mail.
     """
-    if conv.thread_id is not None:
-        thread = client.get_channel(conv.thread_id)
-        if thread is None:
-            try:
-                thread = await client.fetch_channel(conv.thread_id)
-            except (discord.NotFound, discord.Forbidden):
-                # The human deleted the thread. Drop the binding and re-root.
-                thread = None
-            except discord.HTTPException as e:
-                print(f'thread fetch failed ({conv.thread_id}): {e}', file=sys.stderr)
-                return None
-        if thread is not None:
-            if getattr(thread, 'archived', False):
-                # Discord refuses sends to an archived thread; reopen it.
+    async with THREAD_ADMISSION_LOCK:
+        if conv.thread_id is not None:
+            thread = client.get_channel(conv.thread_id)
+            if thread is None:
                 try:
-                    await thread.edit(archived=False)
+                    thread = await client.fetch_channel(conv.thread_id)
+                except (discord.NotFound, discord.Forbidden):
+                    # The human deleted the thread. Drop the binding and re-root.
+                    CONVERSATIONS.mark_thread_archived(conv.key)
+                    thread = None
                 except discord.HTTPException as e:
-                    print(f'thread unarchive failed ({conv.thread_id}): {e}', file=sys.stderr)
+                    print(f'thread fetch failed ({conv.thread_id}): {e}', file=sys.stderr)
                     return None
-            return thread
+            if thread is not None:
+                if getattr(thread, 'archived', False):
+                    # Reconcile before acting: Discord retired this one on its
+                    # own idle timer, so whatever we believed, it is holding no
+                    # slot now. Then re-admit it through the bound like any
+                    # other entrant — Discord refuses sends to an archived
+                    # thread, so reopening it is what the send needs.
+                    CONVERSATIONS.mark_thread_archived(conv.key)
+                    await make_room_for_thread(conv.key)
+                    try:
+                        await thread.edit(archived=False)
+                    except discord.HTTPException as e:
+                        print(f'thread unarchive failed ({conv.thread_id}): {e}',
+                              file=sys.stderr)
+                        return None
+                elif not CONVERSATIONS.is_thread_live(conv.key):
+                    # Open on Discord, unaccounted for here: a thread opened by
+                    # a build older than the bound, or one whose flag was lost.
+                    # It is occupying a slot either way, so it is charged for
+                    # one — which is how the pre-existing population is drawn
+                    # into the bound through use rather than by a mass archive.
+                    await make_room_for_thread(conv.key)
+                CONVERSATIONS.mark_thread_live(conv.key)
+                return thread
 
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(LOG_CHANNEL_ID)
-        except discord.HTTPException as e:
-            print(f'log channel {LOG_CHANNEL_ID} unusable: {e}', file=sys.stderr)
+        channel = client.get_channel(LOG_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(LOG_CHANNEL_ID)
+            except discord.HTTPException as e:
+                print(f'log channel {LOG_CHANNEL_ID} unusable: {e}', file=sys.stderr)
+                return None
+        if not hasattr(channel, 'create_thread'):
+            print(
+                f'log channel {LOG_CHANNEL_ID} cannot host threads — '
+                f'BRIDGET_LOG_CHANNEL_ID must name a guild text channel, not a '
+                f'DM, category, or voice channel.',
+                file=sys.stderr,
+            )
             return None
-    if not hasattr(channel, 'create_thread'):
-        print(
-            f'log channel {LOG_CHANNEL_ID} cannot host threads — '
-            f'BRIDGET_LOG_CHANNEL_ID must name a guild text channel, not a '
-            f'DM, category, or voice channel.',
-            file=sys.stderr,
-        )
-        return None
 
-    try:
-        root = await channel.send(f"📬 **{mail['from']}** — {mail['subject']}")
-        thread = await root.create_thread(
-            name=conv.subject[:DISCORD_THREAD_NAME_LIMIT] or 'conversation')
-    except discord.HTTPException as e:
-        print(f'thread create failed for {conv.key}: {e}', file=sys.stderr)
-        return None
+        # Room first, then create. The other order is the bug: it opens the
+        # thread that breaches the cap and only then goes looking for space.
+        await make_room_for_thread(conv.key)
+        try:
+            root = await channel.send(f"📬 **{mail['from']}** — {mail['subject']}")
+            thread = await root.create_thread(
+                name=conv.subject[:DISCORD_THREAD_NAME_LIMIT] or 'conversation',
+                auto_archive_duration=THREAD_ARCHIVE_MINUTES)
+        except discord.HTTPException as e:
+            print(f'thread create failed for {conv.key}: {e}', file=sys.stderr)
+            return None
 
-    CONVERSATIONS.bind_thread(conv.key, thread.id)
-    return thread
+        # Marks the conversation live; room was made for it above.
+        CONVERSATIONS.bind_thread(conv.key, thread.id)
+        return thread
 
 
 def thread_messages(header: str, body: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]:
@@ -3599,6 +3827,9 @@ def handle_command(text: str) -> str:
         else:
             out += f'\n• Threads: `on` → <#{LOG_CHANNEL_ID}>'
             out += f'\n• Conversations tracked: **{len(CONVERSATIONS)}**'
+            out += f'\n• Open threads: {thread_cap_status()}'
+            out += (f'\n• Idle archive: `{THREAD_ARCHIVE_MINUTES}min` '
+                    f'(Discord retires an untouched thread after this)')
         out += f'\n• Correlation IDs (reply threading): `{MG_CAPS.describe()}`'
         dedup = DEDUP.summary()
         if dedup['enabled']:
@@ -3879,6 +4110,8 @@ async def on_ready():
     if THREADS_ENABLED:
         print(f"threading on: conversations root in channel {LOG_CHANNEL_ID}; "
               f"{len(CONVERSATIONS)} conversation(s) restored; "
+              f"threads {thread_cap_status()}; "
+              f"idle archive {THREAD_ARCHIVE_MINUTES}min; "
               f"dm_policy={SETTINGS.dm_policy}", flush=True)
     else:
         print("threading off: set BRIDGET_LOG_CHANNEL_ID to enable "
@@ -3910,7 +4143,10 @@ async def on_ready():
     # `resolve_thread` runs *before* it and is itself a check-then-act across an
     # await — every watcher sees `thread_id is None`, every watcher creates a
     # thread, and `bind_thread` clears `posted_ids` as it re-roots, so the guard is
-    # reset by the very race it would have caught.
+    # reset by the very race it would have caught. (THREAD_ADMISSION_LOCK, added
+    # for the live-thread bound in mg-27e0, now serialises that sequence too —
+    # but retiring the old set is still what makes the watcher count constant,
+    # and that is the property to check when this is suspected again.)
     #
     # Retiring the old set first makes the live watcher count constant across
     # reconnects, which is the property to check when this is suspected again.

@@ -106,6 +106,32 @@ actions; the latter is manual but his.)
 
 ## §3 — Auto-archive old / resolved threads — **proposal, needs sign-off**
 
+> **2026-08-19 — a bound now archives threads, and it is not this.** mg-27e0
+> shipped `BRIDGET_MAX_LIVE_THREADS` (default 50): past the cap, opening a
+> thread archives the least recently used one. That is automatic archiving, on
+> by default, and it lands in the same territory this section reserves to
+> Daniel — so the difference is worth being explicit about rather than leaving
+> to be discovered.
+>
+> It is not §3, and it does not settle §3. §3 asks *which threads deserve to be
+> retired*, keyed on whether the work is done — a judgement about Daniel's
+> attention, where a false positive removes his only pointer to outstanding
+> work. The bound asks only *how many threads the channel can carry*, and
+> answers with the ones he has gone longest without touching. It reads no `mg`
+> status and makes no claim that anything is resolved.
+>
+> The guardrail above still holds, and the reason the bound clears it is that
+> the alternative had already failed harder: 966 open threads in one channel
+> stopped the Discord client rendering that channel *at all*, so every pointer
+> in it was gone — not one thread mis-retired, all of them, plus the
+> notifications that pointed into it. Against that, an archived thread that
+> reopens on its next message and never lost a word is the conservative option.
+>
+> §3 is still unshipped and still needs sign-off. What it should now assume is
+> that the *population* is already bounded, so its job is choosing retirement
+> by meaning, not keeping the channel renderable.
+
+
 The most intrusive ask, and the one most able to hide outstanding work. Design
 constraints:
 

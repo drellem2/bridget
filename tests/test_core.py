@@ -53,7 +53,7 @@ from bridget_core import (  # noqa: E402
     undeliverable,
 )
 from bridget_core.acks import AMBIGUOUS, DELIVERED, UNDELIVERABLE  # noqa: E402
-from bridget_core.conversations import MAX_MESSAGE_IDS  # noqa: E402
+from bridget_core.conversations import MAX_MESSAGE_IDS, SCHEMA_VERSION  # noqa: E402
 from bridget_core.mail import (  # noqa: E402
     _is_field_name,
     _split_headers,
@@ -410,11 +410,71 @@ class TestConversationStore(unittest.TestCase):
         leftovers = list(self.path.parent.glob('*.tmp'))
         self.assertEqual(leftovers, [])
 
+    def test_live_threads_evict_in_use_order_not_clock_order(self):
+        """The eviction queue for the live-thread bound (mg-27e0) is ordered by
+        USE, not by `updated_at` — which is second-granular, so a queue ordered
+        by it collapses to alphabetical inside any one second. A burst is
+        exactly when the queue is consulted and exactly when every entry shares
+        a second, so this clock returns one fixed value: any ordering the
+        result still has must come from use, not from time."""
+        store = ConversationStore(self.path, clock=lambda: '2026-08-19T08:00:00+00:00')
+        for key in ('c', 'a', 'b'):
+            store.record(key)
+            store.bind_thread(key, f'thread-{key}')
+        self.assertEqual([c.key for c in store.lru_live()], ['c', 'a', 'b'])
+        store.record('c', message_id='m1')          # 'c' is used again
+        self.assertEqual([c.key for c in store.lru_live()], ['a', 'b', 'c'])
+        self.assertEqual([c.key for c in store.lru_live(exclude='a', limit=1)], ['b'])
+
+    def test_a_restart_restores_the_live_set_and_opens_nothing(self):
+        """mg-27e0 asked whether the bound belongs at creation, at restore, or
+        both. Restore ADMITS nothing — it only remembers — so a restart cannot
+        re-inflate the population past a cap the last process enforced."""
+        store = ConversationStore(self.path)
+        for key in ('k1', 'k2', 'k3'):
+            store.record(key)
+            store.bind_thread(key, f'thread-{key}')
+        store.mark_threads_archived(['k2'])
+        reborn = ConversationStore(self.path)
+        self.assertEqual(reborn.live_count(), 2)
+        self.assertEqual(len(reborn), 3)
+        self.assertTrue(reborn.is_thread_live('k1'))
+        self.assertFalse(reborn.is_thread_live('k2'))
+
+    def test_a_live_flag_with_no_thread_holds_no_slot(self):
+        """Otherwise a deleted thread's leftover flag would occupy a slot
+        nothing renders, and the usable bound would shrink at every restart."""
+        store = ConversationStore(self.path)
+        store.record('k1')
+        store.bind_thread('k1', 'thread-1')
+        raw = json.loads(self.path.read_text())
+        raw['conversations']['k1']['thread_id'] = None
+        self.path.write_text(json.dumps(raw))
+        reborn = ConversationStore(self.path)
+        self.assertEqual(reborn.live_count(), 0)
+        self.assertFalse(reborn.get('k1').thread_live)
+
+    def test_rebinding_a_thread_keeps_the_conversation_live(self):
+        """A re-root replaces the thread; it does not free a slot."""
+        store = ConversationStore(self.path)
+        store.record('k1')
+        store.bind_thread('k1', 'thread-1')
+        store.bind_thread('k1', 'thread-2')
+        self.assertEqual(store.live_count(), 1)
+        self.assertTrue(store.is_thread_live('k1'))
+
+    def test_forgetting_a_conversation_frees_its_slot(self):
+        store = ConversationStore(self.path)
+        store.record('k1')
+        store.bind_thread('k1', 'thread-1')
+        store.forget('k1')
+        self.assertEqual(store.live_count(), 0)
+
     def test_on_disk_schema_is_versioned(self):
         store = ConversationStore(self.path)
         store.record('k1', subject='s', agent='mayor', message_id='m1')
         raw = json.loads(self.path.read_text())
-        self.assertEqual(raw['version'], 2)
+        self.assertEqual(raw['version'], SCHEMA_VERSION)
         self.assertIn('k1', raw['conversations'])
         self.assertNotIn('key', raw['conversations']['k1'])
 
