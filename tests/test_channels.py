@@ -672,5 +672,98 @@ direction = "both"
         self.assertEqual(b.load_channel_ids(), {'mayor-ops': 8888})
 
 
+class UnwiredAgentMailIsAnnouncedTest(unittest.TestCase):
+    """The silent park (mg-879c).
+
+    `watch_agent_mailbox` correctly refuses to poll a mailbox it has nowhere to
+    put — polling would mark mail seen and lose it. What it did NOT do was say
+    so, and the branch is not only the transient "auto-create pending" it was
+    written for: without the Manage Channels grant it is the PERMANENT state.
+    It held for 35 days on Daniel's host. 6,899 mail across six agent boxes
+    reached no surface at all while startup printed `per-channel routing: on —
+    6 channel(s)` and `bridget.channels.toml` promised a DM fallback that this
+    loop does not have. Six per-agent seen-files still carried their
+    2026-07-15T19:54:20Z priming mtime, which is the only reason it was
+    provable after the fact.
+
+    So: the notice must appear, must carry the size of what is stuck, and must
+    not repeat per poll cycle.
+    """
+
+    TOML = '[channels.mayor]\nagent = "mayor"\n'
+
+    def setUp(self):
+        self.b = load_bridget(channels_toml=self.TOML)
+
+    def _watcher(self, agent='mayor', waiting=3):
+        """A real MaildirWatcher over a real dir with `waiting` unseen mail."""
+        b = self.b
+        d = b.agent_mail_dir(agent)
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(waiting):
+            (d / f'17000003{i:02d}.zzzz.host').write_text(
+                'From: x\nSubject: s\n\nbody\n')
+        seen = b.agent_seen_file(agent)
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        seen.write_text('')
+        from bridget_core.mailbox import MaildirWatcher
+        return MaildirWatcher(d, seen)
+
+    def _notices(self, fn):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            fn()
+        return [ln for ln in buf.getvalue().splitlines()
+                if ln.startswith('agent-mail:')]
+
+    def test_an_unwired_agent_says_so_with_the_backlog_size(self):
+        w = self._watcher(waiting=3)
+        self.b.UNWIRED_NOTICED.clear()
+        lines = self._notices(lambda: self.b.log_unwired_agent('mayor', w))
+        self.assertEqual(len(lines), 1)
+        self.assertIn('no channel wired for mayor', lines[0])
+        self.assertIn('NOT being relayed', lines[0])
+        self.assertIn('3 mail waiting', lines[0])
+        # The remedy is named, because "routing is on" is what the reader has
+        # already been told and it is the thing that misled them.
+        self.assertIn('Manage Channels', lines[0])
+
+    def test_it_does_not_repeat_once_per_poll_cycle(self):
+        """The loop turns every few seconds; an unconditional line would be the
+        mg-5521 flood moved into the log file. Same cadence as the relay beat.
+        """
+        b = self.b
+        w = self._watcher()
+        b.UNWIRED_NOTICED.clear()
+        lines = self._notices(lambda: [b.log_unwired_agent('mayor', w)
+                                       for _ in range(50)])
+        self.assertEqual(len(lines), 1)
+
+    def test_it_is_silent_when_the_delivery_record_is_switched_off(self):
+        """One knob, one instrument. A build that went quiet about deliveries
+        but loud about routing would not be the build the startup line
+        describes."""
+        self.b = load_bridget(channels_toml=self.TOML,
+                              env_overrides={'BRIDGET_RELAY_HEARTBEAT': '0'})
+        w = self._watcher()
+        self.b.UNWIRED_NOTICED.clear()
+        self.assertEqual(
+            self._notices(lambda: self.b.log_unwired_agent('mayor', w)), [])
+
+    def test_a_missing_maildir_still_produces_the_notice(self):
+        """The count is the nice-to-have; the statement is the point. An agent
+        with no maildir yet must not be the one case that stays silent."""
+        b = self.b
+        from bridget_core.mailbox import MaildirWatcher
+        w = MaildirWatcher(b.agent_mail_dir('nosuch'),
+                           b.agent_seen_file('nosuch'))
+        b.UNWIRED_NOTICED.clear()
+        lines = self._notices(lambda: b.log_unwired_agent('nosuch', w))
+        self.assertEqual(len(lines), 1)
+        self.assertIn('unknown mail waiting', lines[0])
+
+
 if __name__ == '__main__':
     unittest.main()

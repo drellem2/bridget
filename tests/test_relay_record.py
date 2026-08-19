@@ -49,6 +49,15 @@ repo the same night (mg-5521) because he was drowning in repetition.
 `grep -c` is used literally, on a real file, because `grep -c` on a real file is
 what both agents got wrong.
 
+S2 below still asserts that no POSITIVE lands on a wedged cycle — that gate is
+right and is not being loosened. What mg-879c measured is that the gate alone
+was not enough: across the 71.6h outage of 2026-08-16T06:41 → 2026-08-19T06:19
+the file said nothing whatsoever, and the agent who found the resulting hole
+read it as "a 3-DAY hole nobody has explained" rather than as an outage. So the
+S2 comment's claim — "the stop IS the signal" — is now a tested FALSE, and the
+stall record (T1–T4) is what replaced it. The stop was a signal only to a
+reader who already knew the beat was unconditional.
+
 Everything runs against a stubbed discord — no live Discord, no live relay.
 """
 import asyncio
@@ -307,12 +316,17 @@ class RecordAbsentWhenThePathStopsTest(RelayRecordHarness):
                                 'sanity: sends must have been attempted')
         self.assertEqual(self.grep_c('relay:'), 0,
                          'no positive record while delivery is wedged')
-        # And note where the evidence of the wedge actually is: the other file.
-        # A reader who greps only bridget.log — which is everyone, because that
-        # is the path in every runbook — sees the beat stop and nothing else.
-        # The stop IS the signal; before this fix there was no stop to see.
+        # The exception lines still land in the OTHER file, which the runbook
+        # reader never opens...
         self.assertEqual(self.grep_c('DM failed for', self.errfile), 3)
         self.assertEqual(self.grep_c('DM failed for'), 0)
+        # ...but bridget.log is no longer empty about it. This assertion is the
+        # correction to what this test used to claim: "the stop IS the signal"
+        # was the shipped reasoning, and mg-879c measured a reader failing to
+        # read it exactly that way across three days. The stall line is the
+        # signal now; the stop means what it always should have — nothing is
+        # turning.
+        self.assertGreaterEqual(self.grep_c('relay-stall:'), 1)
 
     def test_a_recovered_relay_speaks_again(self):
         """The other half of S2: the record must not latch. Once delivery works
@@ -441,6 +455,152 @@ class PreFixControlTest(RelayRecordHarness):
         line = self.bridget.relay_status_line()
         self.assertIn('OFF (BRIDGET_RELAY_HEARTBEAT=0)', line)
         self.assertIn('look identical in this log', line)
+        # The knob takes the negative record down with the positive, so the
+        # disclaimer has to cover both. Otherwise the stall line reintroduces
+        # the very ambiguity it was added to remove: a reader who knows outages
+        # get written down reads no `relay-stall:` as "no outage".
+        self.assertIn('relay-stall:', line)
+
+
+class StallIsRecordedTest(RelayRecordHarness):
+    """T1–T4 — the outage writes itself down (mg-879c).
+
+    The paired half of S2. S2 proves no POSITIVE appears on a wedged cycle;
+    these prove a NEGATIVE does, that it cannot be miscounted as a delivery,
+    that it is bounded, and that it stops when delivery works again.
+    """
+
+    def wedge(self, cycles=2, name='1700000010.ffff.host', subject='urgent'):
+        # A distinct subject per wedge: the duplication limiter would hold a
+        # repeat, no send would be attempted, and the cycle would be healthy —
+        # which is correct behaviour and would make this test measure nothing.
+        b = self.bridget
+        self.prime_seen_empty()
+        write_mail(b.MAIL_DIR, name, 'pm-pogo', subject, 'please read')
+        user = self.dead_user()
+        self.run_cycles(user, cycles)
+        return user
+
+    def test_the_outage_is_dated_at_its_onset(self):
+        """T1. The line lands on the FIRST failing cycle, not an hour later:
+        the reconstruction that needed it wanted to know when delivery broke,
+        and an hour of rounding on a 71.6h outage is the cheap part to get
+        right."""
+        self.wedge()
+        self.assertGreaterEqual(self.grep_c('relay-stall:'), 1)
+        self.assertRegex(
+            self.logfile.read_text(),
+            r'\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\] relay-stall: '
+            r'delivery failing since \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z '
+            r'\(0s so far\) — 0 total since ')
+
+    def test_a_stall_is_never_counted_as_a_delivery(self):
+        """T2. The load-bearing separation. `grep -c 'relay:'` is the
+        instrument two agents already got wrong once; a stall line that matched
+        it would make an outage read as traffic — the fix wearing the defect's
+        clothes."""
+        self.wedge()
+        self.assertGreaterEqual(self.grep_c('relay-stall:'), 1)
+        self.assertEqual(self.grep_c('relay:'), 0,
+                         "the stall token must not match the delivery token")
+
+    def test_a_three_day_outage_costs_a_line_an_hour_not_a_line_a_cycle(self):
+        """T3. V2's rule applied to the negative: the delivery loop turns every
+        few seconds, so an unstinted stall line would be the mg-5521 flood in
+        the file. 24 lines a day is what a quiet day already costs."""
+        interval = self.bridget.CONFIG['relay_heartbeat']
+        self.wedge()
+        self.assertEqual(self.grep_c('relay-stall:'), 1)
+        for _ in range(20):                      # 20 cycles, well inside it
+            self.clock.advance(interval / 100.0)
+            self.run_cycles(self.dead_user(), 1)
+        self.assertEqual(self.grep_c('relay-stall:'), 1)
+
+        self.clock.advance(interval)
+        self.run_cycles(self.dead_user(), 1)
+        self.assertEqual(self.grep_c('relay-stall:'), 2)
+        self.assertIn('so far)', self.logfile.read_text())
+
+    def test_the_stall_stops_and_the_positive_resumes_on_recovery(self):
+        """T4. The record must not latch in either direction — an outage that
+        kept announcing itself after it ended would be as unreadable as one
+        that never did. And the pairing is the proof: the same file carries the
+        outage and its end, so the window is scopable from bridget.log alone,
+        which is the whole thing mg-879c could not do."""
+        self.wedge()
+        self.assertGreaterEqual(self.grep_c('relay-stall:'), 1)
+        before = self.grep_c('relay-stall:')
+
+        self.run_cycles(self.ok_user(), 1)
+        self.assertEqual(self.grep_c('relay:'), 1, 'delivery resumed, and says so')
+        self.assertEqual(self.grep_c('relay-stall:'), before,
+                         'a healthy cycle must end the stall')
+
+        # A SECOND outage is announced at its own onset rather than folded into
+        # the first — otherwise two wedges an hour apart read as one.
+        self.clock.advance(5)
+        self.wedge(name='1700000011.gggg.host', subject='a second outage')
+        self.assertEqual(self.grep_c('relay-stall:'), before + 1)
+
+
+class StallCadenceTest(unittest.TestCase):
+    """The stall arithmetic on its own, mirroring LedgerCadenceTest."""
+
+    def ledger(self, **kw):
+        self.clock = FakeClock()
+        return RelayLedger(started=self.clock(), clock=self.clock, **kw)
+
+    def test_first_unhealthy_cycle_stalls_immediately(self):
+        led = self.ledger(interval=3600)
+        led.due()
+        stall = led.stall()
+        self.assertIsNotNone(stall)
+        self.assertEqual(stall.stalled_for, 0.0)
+
+    def test_stall_repeats_on_the_idle_interval(self):
+        led = self.ledger(interval=3600)
+        led.due()
+        led.stall()
+        self.clock.advance(3599)
+        self.assertIsNone(led.stall())
+        self.clock.advance(2)
+        second = led.stall()
+        self.assertIsNotNone(second)
+        self.assertEqual(round(second.stalled_for), 3601)
+
+    def test_the_total_stands_still_across_the_outage(self):
+        """The number that made the real log readable in hindsight: 237 for
+        three days. A stall line carries it so one line lifted out still says
+        whether anything has ever been delivered — and whether it moved."""
+        led = self.ledger(interval=60)
+        led.due()
+        led.record(3)
+        self.clock.advance(60)
+        led.due()
+        first = led.stall()
+        self.clock.advance(60)
+        second = led.stall()
+        self.assertEqual((first.total, second.total), (3, 3))
+
+    def test_a_healthy_cycle_clears_the_stall(self):
+        led = self.ledger(interval=3600)
+        led.due()
+        opened = led.stall().since
+        self.clock.advance(10)
+        led.due()                       # healthy
+        self.clock.advance(10)
+        reopened = led.stall()
+        self.assertIsNotNone(reopened, 'a new outage gets its own onset line')
+        self.assertGreater(reopened.since, opened)
+        self.assertEqual(reopened.stalled_for, 0.0)
+
+    def test_disabled_ledger_never_stalls(self):
+        """The knob turns off BOTH records or neither. A build that went silent
+        on delivery but loud on outages would be a different instrument than
+        the one the startup line describes."""
+        led = self.ledger(interval=0)
+        self.clock.advance(100_000)
+        self.assertIsNone(led.stall())
 
 
 class LedgerCadenceTest(unittest.TestCase):

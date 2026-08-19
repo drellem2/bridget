@@ -44,6 +44,21 @@
 # you later hand-type for the same <name>. If a hand-typed snowflake can't be
 # resolved, bridget resolves the entry by name (adopt-or-create) instead of
 # retrying a dead id forever.
+#
+# WITHOUT the "Manage Channels" permission and with no pre-existing channel of
+# that name to adopt, the entry never resolves. Its `mail` is then NOT relayed
+# anywhere — not to a channel and not to a DM (see the routing note below) —
+# and it is not lost either: it stays unread in ~/.macguffin/mail/<agent>/new/
+# until the entry resolves. bridget says so in bridget.log once an hour, with
+# the size of the backlog:
+#
+#   agent-mail: no channel wired for mayor — its mail is NOT being relayed to
+#   any surface (no DM fallback on this path); 4121 mail waiting. ...
+#
+# That notice exists because this state held silently for 35 days on the
+# author's host and swallowed 6,899 mail while startup printed
+# `per-channel routing: on — 6 channel(s)` (mg-879c). Grant the permission, or
+# hand-write a `snowflake` for an existing channel.
 
 # ── Example 1: a two-way operator channel ────────────────────────────────────
 # Type in #general → goes to mayor's mailbox. Mayor's outbound mail and task
@@ -89,9 +104,15 @@ direction = "both"
 # - Free-form (non-verb) text in an inbound-mapped channel is mailed to the
 #   channel's `agent` with the first line as the subject and the rest as the
 #   body.
-# - Outbound events for an agent with no mapping (or an agent whose mapping
-#   excludes the event's `kind`) fall back to DMing DISCORD_USER_ID — exactly
-#   the v1.0.0 behavior.
+# - Outbound events for an agent with NO mapping (or whose mapping excludes the
+#   event's `kind`) fall back to DMing DISCORD_USER_ID — exactly the v1.0.0
+#   behavior.
+# - That fallback covers task-transitions and idea-claims. It does NOT cover
+#   `mail` for an agent that HAS a mapping which has not resolved to a live
+#   channel: the per-agent mail watcher deliberately does not poll a mailbox it
+#   has nowhere to put, because polling would mark the mail seen and lose it.
+#   "Configured but unresolved" and "not configured" are therefore different
+#   states with different outcomes; only the second DMs you.
 # - Two entries pointing at the same snowflake with overlapping inbound
 #   directions will collide; bridget keeps the first and logs the duplicate
 #   to stderr.

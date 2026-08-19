@@ -1691,9 +1691,11 @@ def relay_status_line() -> str:
     """
     if not RELAY.enabled:
         return ("OFF (BRIDGET_RELAY_HEARTBEAT=0) — an idle relay and a dead one "
-                "look identical in this log")
+                "look identical in this log, and a wedged one is silent too "
+                "(no `relay-stall:` either)")
     return (f"on — `relay:` line every {RELAY.interval}s when idle, "
-            f"within {RELAY.active_gap}s of a delivery")
+            f"within {RELAY.active_gap}s of a delivery; `relay-stall:` every "
+            f"{RELAY.interval}s while delivery is failing")
 
 
 def log_relay_beat() -> None:
@@ -1707,6 +1709,52 @@ def log_relay_beat() -> None:
     beat = RELAY.due()
     if beat is not None:
         print(format_relay_beat(beat), flush=True)
+
+
+def format_relay_stall(stall) -> str:
+    """The line that says the delivery path is DOWN, in the file people grep.
+
+        relay-stall: delivery failing since 2026-08-16T06:40:38Z (0s so far)
+                     — 237 total since 2026-08-11T21:57:09Z
+        relay-stall: delivery failing since 2026-08-16T06:40:38Z (3600s so far)
+                     — 237 total since 2026-08-11T21:57:09Z
+
+    `relay-stall:` and not `relay:`, deliberately and load-bearingly. The whole
+    value of the positive record is that `grep -c 'relay:'` counts deliveries
+    and nothing else; a stall line sharing that token would inflate the count
+    with outages, which is the fix wearing the defect's clothes. The two tokens
+    are greppable independently and `relay-stall:` does not contain `relay:`.
+
+    The `total`/`since` tail is the same pair the beat carries, so a stall line
+    lifted out of the log on its own still answers "has this process ever
+    delivered anything" — during the 71.6h outage of mg-879c that number stood
+    still at 237 for three days, and standing still is the fact.
+    """
+    return (f"relay-stall: delivery failing since {isostamp(stall.since)} "
+            f"({round(stall.stalled_for)}s so far) — {stall.total} total "
+            f"since {isostamp(stall.started)}")
+
+
+def log_relay_stall() -> None:
+    """Emit the stall line if one is due. Call only from an UNHEALTHY cycle.
+
+    The exact mirror of `log_relay_beat`, and it exists because the mirror was
+    missing: gating the positive on health left bridget.log saying nothing at
+    all across a three-day outage, and the reader who found that silence read
+    it as an unexplained hole rather than as an outage (mg-879c). Silence is
+    now what it was always meant to be — the loop not running — and a running
+    loop that cannot deliver says so.
+
+    Its scope is the human-DM watcher, which is the loop that owns the ledger.
+    A send failure inside a per-agent channel watcher does NOT raise a stall:
+    that path logs `agent-mail send failed` to stderr and nothing to this file.
+    Stated here rather than left to be discovered, because "no `relay-stall:`"
+    must not be read as "no outage anywhere" — which is the same misreading,
+    one level in.
+    """
+    stall = RELAY.stall()
+    if stall is not None:
+        print(format_relay_stall(stall), flush=True)
 
 
 async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
@@ -1972,6 +2020,13 @@ async def watch_mailbox(user: discord.User):
             # to stat it; the log line answers it to everyone reading the log,
             # and answers it about the past, which an mtime cannot.
             log_relay_beat()
+        else:
+            # The heartbeat file is deliberately NOT touched here — a stale
+            # mtime is what a reaper watches for. But the log needs the
+            # opposite treatment: an mtime nobody stats and a file that says
+            # nothing left a 71.6h outage looking like a quiet weekend
+            # (mg-879c). So the wedge writes itself down.
+            log_relay_stall()
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -1992,6 +2047,48 @@ def format_agent_mail_msg(mail: dict) -> str:
     """Same card as the human DM, minus the `read <mg-id>` hint — that command
     only makes sense in the human's own DM."""
     return format_mail_card(mail, hint='')
+
+
+#: agent -> when its "no channel wired" notice was last written. Same cadence
+#: as the relay beat, and for the same reason: this loop turns every few
+#: seconds, so an unconditional line would be thousands a day (mg-5521).
+UNWIRED_NOTICED: dict[str, float] = {}
+
+
+def log_unwired_agent(agent: str, watcher) -> None:
+    """Say that `agent`'s mail is reaching nothing, at most once per interval.
+
+    The count is the part that makes this actionable rather than decorative: a
+    reader who sees "0 mail waiting" can leave it alone, and one who sees
+    "4,121 mail waiting" knows the size of what routing has been swallowing.
+    It is recomputed each notice because it is the only number that moves.
+
+    Written to stdout, not stderr. This is a statement about routing STATE — it
+    belongs beside the `per-channel routing: on` line that startup already
+    prints to bridget.log, and it exists precisely because the reader of that
+    line has no way to tell "on" from "on and delivering nowhere".
+    """
+    if not RELAY.enabled:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    last = UNWIRED_NOTICED.get(agent)
+    if last is not None and 0 <= now - last < RELAY.interval:
+        return
+    # A backwards clock step (sleep/wake, NTP) leaves `now - last` negative,
+    # which the comparison above would read as "not yet due" for as long as the
+    # step lasts. Falling through is the right way round: this record's whole
+    # job is to not go quiet, so it errs toward one extra line.
+    UNWIRED_NOTICED[agent] = now
+    try:
+        waiting = sum(1 for f in watcher.mail_dir.iterdir()
+                      if f.is_file() and f.name not in watcher.seen)
+    except OSError:
+        waiting = -1
+    count = 'unknown' if waiting < 0 else f'{waiting}'
+    print(f"agent-mail: no channel wired for {agent} — its mail is NOT being "
+          f"relayed to any surface (no DM fallback on this path); "
+          f"{count} mail waiting. Grant the bot Manage Channels, or set a "
+          f"`snowflake` for it in {CHANNELS_FILE.name}.", flush=True)
 
 
 async def watch_agent_mailbox(channel_entry: dict):
@@ -2023,6 +2120,17 @@ async def watch_agent_mailbox(channel_entry: dict):
                 # guild, or the snowflake is wrong. Don't churn — just wait and
                 # retry, and crucially don't poll: a mail consumed now would be
                 # marked seen and never reach the channel.
+                #
+                # Not polling is right; doing it SILENTLY was not. This branch
+                # is not only the transient "auto-create pending" it was
+                # written for — it is also the permanent state when the bot
+                # lacks Manage Channels, and it held for 35 days without
+                # emitting one byte: 6,899 mail across six agent boxes reached
+                # no surface at all, while `bridget.channels.toml` said routing
+                # was "on" and its own comment promised a DM fallback that this
+                # loop does not have (mg-879c). So say it, on the same cadence
+                # as the relay beat, in the file people grep.
+                log_unwired_agent(agent, watcher)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
             if QUIET_RESPECTS_OUTBOUND and is_quiet_now():

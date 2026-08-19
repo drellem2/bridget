@@ -12,6 +12,49 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **A delivery outage now writes itself down, instead of leaving a hole in
+  `bridget.log` (mg-879c).** The `relay:` beat is gated on a delivery-healthy
+  cycle — correctly, since a positive printed while sends are failing is the
+  loop-liveness lie mg-e5b8 was about. But that gate left an outage saying
+  *nothing at all*, and the shipped reasoning ("the stop IS the signal") was
+  then measured against a real reader and failed:
+
+  ```
+  bridget.log  2026-08-16T07:26:41Z   <last line>
+  bridget.log  2026-08-19T06:54:30Z   logged in as pogo-bridge#9730
+  ```
+
+  71.6 hours, 164 mail stuck, ~8,600 failed sends — and the agent who found the
+  gap filed it as *"a 3-DAY hole nobody has explained"*, because a stop looks
+  identical to a quiet fleet, a slept host, a rotated file or a killed process.
+  The evidence was in `bridget.err.log` at a flat 120 lines/hour the whole time;
+  nothing in the file people actually grep pointed at it. An unhealthy cycle now
+  emits `relay-stall:` on the same cadence as the idle beat — immediately at the
+  onset, then hourly — so the outage is dated at both ends from `bridget.log`
+  alone. Deliberately a **different grep token**: `grep -c 'relay:'` still counts
+  deliveries and only deliveries.
+
+- **An agent whose channel never resolved says so, instead of parking its mail
+  in silence (mg-879c).** `watch_agent_mailbox` is right not to poll a mailbox it
+  has nowhere to put — polling would mark the mail seen and lose it — but it did
+  that silently, and the branch is not only the transient "auto-create pending"
+  it was written for. Without the guild's *Manage Channels* permission it is the
+  **permanent** state: on the author's host it held for 35 days and 6,899 mail
+  across six agent boxes reached no surface at all, while startup printed
+  `per-channel routing: on — 6 channel(s)` and `bridget.channels.toml` promised a
+  DM fallback that this path does not have. It now prints, hourly, per agent:
+
+  ```
+  agent-mail: no channel wired for mayor — its mail is NOT being relayed to any
+  surface (no DM fallback on this path); 4121 mail waiting. Grant the bot Manage
+  Channels, or set a `snowflake` for it in bridget.channels.toml.
+  ```
+
+  `bridget.channels.toml.example` is corrected too: the DM fallback covers
+  task-transitions and idea-claims, not `mail` for a *configured but unresolved*
+  entry. "Not configured" and "configured and never resolved" are different
+  states with different outcomes, and only the first DMs you.
+
 - **The test harness stops leaking temp directories into the shared `$TMPDIR`
   (mg-1f20).** Measured on this tree: one `./test.sh` left **444** directories
   behind in a pinned `$TMPDIR`, 209 of them `bridget-thread-test-*`. They are not

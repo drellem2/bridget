@@ -63,8 +63,36 @@ so a burst of 33 alarms arriving within seconds is one line, not 33, and a
 quiet day costs 24. A log file is not a Discord DM and does not reach Daniel;
 this is volume in the file people grep, not volume in his notifications.
 
-Nothing here renders. `RelayBeat` is the fact; the adapter formats it, the way
-`Decision` and `format_repeat_notice` divide the same work.
+**Why silence was not enough (mg-879c).** The gate above is right about the
+beat: a positive printed on a cycle whose sends were failing would be
+`bridget.heartbeat` all over again. But gating it left the outage itself
+unwritten, and that was tested for and shipped on the reasoning "the stop IS
+the signal". It was then measured, and the reasoning did not hold:
+
+    bridget.log  2026-08-16T07:26:41Z  <last line>
+    bridget.log  2026-08-19T06:54:30Z  logged in as pogo-bridge#9730
+
+71.6 hours, 164 mail stuck, ~8,600 failed sends — and the reader who found
+this hole read it as "a 3-DAY hole nobody has explained", not as "delivery was
+down", because a stop looks the same as a quiet fleet, a slept host, a rotated
+file or a killed process. The stop is a signal only to someone who already
+knows the beat is unconditional, and the file does not say that at the point of
+absence. Worse, the beat that finally landed on recovery read
+
+    relay: 171 delivered in the last 262762s (408 total since ...)
+
+which is true and reads as a steady trickle over three days; it was a backlog
+flushed into one DM burst in under five minutes.
+
+So the stall gets its own line — `relay-stall:`, a DIFFERENT grep token, so it
+can never be counted as a delivery — on the same cadence as the idle beat. An
+outage now costs ~24 lines a day and is dated at both ends. `RelayLedger.stall`
+is the negative; `RelayLedger.due` is the positive; a healthy cycle ends a
+stall, so the two can never both be live.
+
+Nothing here renders. `RelayBeat` and `RelayStall` are the facts; the adapter
+formats them, the way `Decision` and `format_repeat_notice` divide the same
+work.
 """
 from __future__ import annotations
 
@@ -106,6 +134,21 @@ class RelayBeat:
     since: float
 
 
+@dataclass(frozen=True)
+class RelayStall:
+    """One due stall line — what the gated beat could not say.
+
+    `stalled_for` is 0 on the onset line by design: that line's job is to stamp
+    WHEN delivery broke, and a duration is not yet a fact about it. The lines
+    after it carry the growing number, so the outage can be scoped from any one
+    of them without reading back to the onset.
+    """
+    stalled_for: float
+    since: float
+    total: int
+    started: float
+
+
 class RelayLedger:
     """Counts relayed mail and decides when the delivery path should speak.
 
@@ -144,6 +187,13 @@ class RelayLedger:
         #: startup instead of an hour of silence indistinguishable from a
         #: watcher that never spawned.
         self._last_beat: float | None = None
+        #: When the current run of unhealthy cycles began, and when the last
+        #: stall line was emitted. Both cleared by `due()`, which is only ever
+        #: called from a healthy cycle — so a stall cannot outlive the outage
+        #: that opened it, and a second outage is announced at its own onset
+        #: rather than folded into the first.
+        self._stalled_since: float | None = None
+        self._last_stall: float | None = None
 
     @property
     def active_gap(self) -> int:
@@ -171,6 +221,11 @@ class RelayLedger:
             return None
         if now is None:
             now = self._clock()
+        # This cycle was healthy, so any stall is over. Clearing here rather
+        # than in a separate call keeps the two records from ever both being
+        # live: there is exactly one place a healthy cycle is reported.
+        self._stalled_since = None
+        self._last_stall = None
         if self._last_beat is None:
             return self._beat(now, self.started)
         elapsed = now - self._last_beat
@@ -179,6 +234,30 @@ class RelayLedger:
         if elapsed >= self.interval:
             return self._beat(now, self._last_beat)
         return None
+
+    def stall(self, now: float | None = None) -> RelayStall | None:
+        """The stall line to emit at `now`, or None. Call only from an
+        UNHEALTHY cycle — the mirror of `due()`, and mutating in the same way.
+
+        Fires immediately on the first unhealthy cycle, so the log stamps the
+        onset rather than the first hour mark, then at most once per
+        `interval`. The cadence is the idle beat's on purpose: an outage should
+        cost the reader what a quiet day costs them, and no more.
+        """
+        if not self.enabled:
+            return None
+        if now is None:
+            now = self._clock()
+        if self._stalled_since is None:
+            self._stalled_since = now
+            self._last_stall = None
+        if self._last_stall is not None and now - self._last_stall < self.interval:
+            return None
+        self._last_stall = now
+        return RelayStall(stalled_for=max(0.0, now - self._stalled_since),
+                          since=self._stalled_since,
+                          total=self.total,
+                          started=self.started)
 
     def _beat(self, now: float, window_start: float) -> RelayBeat:
         beat = RelayBeat(delivered=self._pending,
