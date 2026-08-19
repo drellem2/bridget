@@ -160,11 +160,19 @@ class FakeAllowedMentions:
 class FakeInboundMessage:
     """A message the human typed, as `on_message` sees it: it carries its
     channel and content, and records the reactions bridget puts on it — the ack
-    surface for a routed reply (mg-aefb)."""
+    surface for a routed reply (mg-aefb).
 
-    def __init__(self, channel, content, author_id=1, is_bot=False):
+    `id` is not decoration: the inbound receipt keys on it (mg-8961), and the
+    catch-up sweep resumes from it. A real Discord message always has one, so a
+    fixture without one models a message that cannot exist.
+    """
+
+    _next_id = iter(range(10 ** 17, 10 ** 18))
+
+    def __init__(self, channel, content, author_id=1, is_bot=False, id=None):   # noqa: A002
         self.channel = channel
         self.content = content
+        self.id = next(FakeInboundMessage._next_id) if id is None else id
         self.author = types.SimpleNamespace(id=author_id, bot=is_bot)
         self.reactions = []
 

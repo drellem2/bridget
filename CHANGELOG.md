@@ -12,6 +12,81 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **bridget's receiving half now has an instrument, and can recover a message
+  the gateway never delivered (mg-8961).** Successor to mg-879c, which fixed the
+  outbound instruments and left the inbound half with nothing to repair.
+  `grep -n "print(" bridget`, restricted to `on_message` / `handle_command` /
+  `reply_in_conversation` / `handle_channel_message`, returned **zero**: a
+  message from Daniel that arrived, was handled, was refused, or was ignored all
+  wrote the same nothing. The only receipt was the reaction on his own Discord
+  message, and that exists solely on the thread path.
+
+  What that cost, measured by a read-only REST sweep of every guild channel and
+  the human DM on 2026-08-19:
+
+  ```
+  08-15T15:55:06Z  DM  "mail have pm-onethird mail me an update please"  -> mayor/
+  08-19T07:37:05Z  DM  "Mail pause one third once the executive ..."     -> NOWHERE
+  08-19T07:39:59Z  DM  "Mail pause one third once the executive ..."     -> NOWHERE
+  ```
+
+  Both 08-19 messages arrived inside the 07:30:00–07:38:10Z resolver wedge
+  (mg-3f08). The verb parse is case-insensitive and `POGO_MAIL_RECIPIENT`
+  defaults to `mayor`, so had `on_message` fired, mail would exist; none does, in
+  any of the seven watched boxes, and no error was logged anywhere. The process
+  was SIGTERMed at 07:43:06 and re-IDENTIFYed at 07:43:11, and Discord replays
+  nothing across a fresh IDENTIFY. Daniel retried once, three minutes apart, got
+  no answer either time, and reported the bridge as "flaky".
+
+  Three things were missing and each fails differently, so each got its own fix:
+
+  - **A receipt for every inbound branch.** One `inbound: recv` line as a message
+    is accepted and one `inbound: done … route=… outcome=…` line once it is
+    routed, under a grep token distinct from `relay:` / `relay-stall:` /
+    `agent-mail:`. Two lines rather than the one the ticket asked for, because a
+    line written after routing cannot record a message whose handler raised,
+    hung, or was killed — which is this ticket's own failure class; a `recv` with
+    no `done` is now itself the finding. An unrecognised command is visibly
+    `outcome=unrecognised` rather than silence, and the unmapped-channel path
+    that used to `return` with no trace now names the channel that refused to
+    route. `BRIDGET_INBOUND_RECEIPTS=0` restores the old silence.
+  - **Gateway state.** `client.run(TOKEN, log_handler=None)` suppresses
+    discord.py's own connect/disconnect/resume logging, so nothing in either log
+    said the gateway dropped on 08-16 or came back on 08-19 — the only evidence
+    was a bare `logged in as` appearing mid-run. Four explicit handlers now
+    journal it under a `gateway:` token, and the load-bearing distinction is
+    RESUME versus IDENTIFY: a RESUME replays what the socket missed and says so,
+    a re-IDENTIFY replays nothing and says *that*. Explicit handlers rather than
+    a `log_handler`, so library noise stays out of the file people grep.
+  - **Gap recovery.** A log can record what arrived; it cannot record what did
+    not. On every `on_ready` bridget now sweeps the human DM, the log channel and
+    each inbound-mapped channel by REST from the last message it finished
+    routing (`~/.pogo/bridget.inbound-seen.json`), and replays anything new
+    through **the same router** the gateway path uses. That would have recovered
+    both lost messages. It is at-least-once by design — the resume point is
+    written *after* routing, so a crash mid-handle replays rather than drops,
+    because a duplicate mail is visible and a lost one is not. A surface with no
+    state adopts its current head and replays nothing, so upgrading does not
+    re-run months of DM history. `BRIDGET_INBOUND_CATCHUP_LIMIT` (50/surface) and
+    `BRIDGET_INBOUND_CATCHUP_MAX_AGE` (86400s) bound it, and a sweep truncated by
+    either says so and names the knob.
+
+  Two things this deliberately does **not** cover, stated here rather than left
+  to be discovered: messages from anyone other than the configured
+  `DISCORD_USER_ID` are still dropped before the receipt, and **conversation
+  threads are not swept** — a thread reply typed while the gateway is down is
+  still lost. The startup line says the second one every time.
+
+  Both halves are watched to fail. `tests/test_inbound_record.py` carries two
+  pre-fix controls — receipts off, which reproduces the byte-identical silence
+  between a handled message and a dropped one, and catch-up off, which
+  reproduces the loss of the measured 08-19 messages — and reverting `bridget`
+  to its pre-fix state fails 29 of its 39 assertions (the 10 survivors are the
+  pure-core ones, which do not depend on the wiring). C9 is the remedy examined
+  for its own defect: `on_ready` is dispatched as a task and fires on every
+  reconnect, so two sweeps can overlap over one resume point; removing the lock
+  makes that test replay the recovered message twice.
+
 - **The open-thread population in the log channel is now bounded, so bridget
   cannot fill a channel past the point its client will render (mg-27e0).**
   bridget opened one Discord thread per conversation and closed none. On

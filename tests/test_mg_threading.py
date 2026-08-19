@@ -439,6 +439,9 @@ class TestInboundMessageSurvivesRoundTrip(RealMgTestCase):
         channel = FakeTextChannel(777, client=self.b.client)
         self.b.CHANNELS_BY_SNOWFLAKE[777] = {'agent': 'mayor', 'inbound': True}
         message = types.SimpleNamespace(
+            # `id` is what the inbound receipt keys on (mg-8961); a real
+            # Discord message always carries one.
+            id=1405072000000000000,
             author=types.SimpleNamespace(id=self.b.USER_ID, bot=False),
             channel=channel, content=self.LONG)
 

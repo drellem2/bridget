@@ -85,6 +85,20 @@ from bridget_core.mail import (  # noqa: E402
     reply_target,
     thread_title,
 )
+from bridget_core.inbound import (  # noqa: E402
+    CATCHUP_TOKEN,
+    DEFAULT_CATCHUP_LIMIT,
+    DEFAULT_CATCHUP_MAX_AGE,
+    GATEWAY_TOKEN,
+    INBOUND_TOKEN,
+    CatchupResult,
+    GatewayJournal,
+    SeenStore,
+    channel_surface,
+    dm_surface,
+    plan_catchup,
+)
+from bridget_core.inbound import humanize as humanize_gap  # noqa: E402
 from bridget_core.logstamp import install_line_timestamps  # noqa: E402
 from bridget_core.mgshim import MODES as CORRELATION_MODES  # noqa: E402
 from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
@@ -139,6 +153,15 @@ TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 #: the two id-views never clobber each other (mg-4fc0).
 TASK_STATES_FULL_FILE = HOME / '.pogo' / 'bridget.task-states-full.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
+#: The last inbound message bridget has finished ROUTING, per swept surface —
+#: the human DM and each inbound-mapped channel (mg-8961). This is the resume
+#: point for the REST catch-up sweep on `on_ready`, and it is the only thing
+#: standing between a fresh IDENTIFY and permanent message loss: Discord replays
+#: nothing across a new session, so a message typed while the socket was down is
+#: gone unless something goes and fetches it. Lost state costs a bootstrap (the
+#: surface adopts its current head and replays nothing), never a double-replay
+#: of history — see bridget_core.inbound.
+INBOUND_SEEN_FILE = HOME / '.pogo' / 'bridget.inbound-seen.json'
 #: Epoch stamps of the delivery self-heals bridget has taken lately (mg-3f08).
 #: The one piece of this fix's state that CANNOT live in the process, because
 #: the process is what the self-heal restarts: an in-memory cap on restarts is
@@ -440,6 +463,30 @@ def load_config() -> dict:
     # told apart from a dead relay.
     relay_heartbeat = positive_int('BRIDGET_RELAY_HEARTBEAT', 3600, allow_zero=True)
 
+    # The RECEIVING half's instrument (mg-8961). Two of Daniel's DMs died on
+    # 2026-08-19 leaving no trace in any log, and only a read-only Discord REST
+    # sweep could prove it — the inbound path had zero log statements anywhere.
+    #
+    #   RECEIPTS — one `inbound: recv` line as a message is accepted and one
+    #   `inbound: done` line once it is routed. 0 restores the pre-mg-8961 file,
+    #   in which a handled message and a dropped one are both silent.
+    inbound_receipts = positive_int('BRIDGET_INBOUND_RECEIPTS', 1, allow_zero=True)
+    #   CATCH-UP — the bounded REST sweep on `on_ready` over the human DM and
+    #   each inbound-mapped channel, resuming from INBOUND_SEEN_FILE. This is the
+    #   only part that can recover a message the gateway never delivered; 0
+    #   switches it off, and bridget then SAYS on every re-IDENTIFY that it may
+    #   have missed messages rather than printing `logged in as` and appearing
+    #   whole.
+    inbound_catchup = positive_int('BRIDGET_INBOUND_CATCHUP', 1, allow_zero=True)
+    #   Its two bounds, both logged when they bite. LIMIT caps how many missed
+    #   messages one surface replays in one sweep; MAX_AGE is how stale a missed
+    #   message may be and still be acted on — a `mail` command from last week is
+    #   not a request any more.
+    inbound_catchup_limit = positive_int('BRIDGET_INBOUND_CATCHUP_LIMIT',
+                                         DEFAULT_CATCHUP_LIMIT)
+    inbound_catchup_max_age = positive_int('BRIDGET_INBOUND_CATCHUP_MAX_AGE',
+                                           DEFAULT_CATCHUP_MAX_AGE)
+
     # When a delivery outage stops being bridget's problem (mg-3f08). The
     # resolver wedge this ticket is named for failed 100% of sends for eight
     # minutes while the host resolved discord.com 5/5, and produced no alert,
@@ -624,6 +671,10 @@ def load_config() -> dict:
         'dedup_max_window': dedup_max_window,
         'dedup_ttl': dedup_ttl,
         'relay_heartbeat': relay_heartbeat,
+        'inbound_receipts': bool(inbound_receipts),
+        'inbound_catchup': bool(inbound_catchup),
+        'inbound_catchup_limit': inbound_catchup_limit,
+        'inbound_catchup_max_age': inbound_catchup_max_age,
         'wedge_escalate_after': wedge_escalate_after,
         'wedge_selfheal_after': wedge_selfheal_after,
         'wedge_repeat': wedge_repeat,
@@ -928,6 +979,25 @@ WEDGE = WedgeWatch(
                          limit=CONFIG['wedge_restart_budget'],
                          window=CONFIG['wedge_budget_window']),
 )
+
+#: The RECEIVING half's instrument (mg-8961). Everything above this line is the
+#: OUTBOUND path; until this ticket the inbound path had no instrument at all,
+#: so two of Daniel's DMs died on 2026-08-19 leaving no trace in any log and only
+#: a read-only Discord REST sweep could prove it.
+#:
+#: INBOUND_RECEIPTS gates the per-message record. GATEWAY is the socket journal —
+#: `client.run(TOKEN, log_handler=None)` suppresses discord.py's own
+#: connect/disconnect/resume logging, so without this nothing in either file says
+#: whether "no inbound" meant "nobody typed" or "we were not connected".
+#: INBOUND_SEEN is the resume point the catch-up sweep restarts from; it is
+#: loaded lazily in `on_ready` because a state file read at import time would run
+#: inside every test that imports this module.
+INBOUND_RECEIPTS = CONFIG['inbound_receipts']
+INBOUND_CATCHUP = CONFIG['inbound_catchup']
+INBOUND_CATCHUP_LIMIT = CONFIG['inbound_catchup_limit']
+INBOUND_CATCHUP_MAX_AGE = CONFIG['inbound_catchup_max_age']
+GATEWAY = GatewayJournal()
+INBOUND_SEEN = SeenStore(INBOUND_SEEN_FILE)
 
 #: The last exception the delivery path raised, and how many mail were waiting
 #: when it did. Carried into the escalation because "delivery is failing" is not
@@ -4086,6 +4156,505 @@ def recent_conversations(limit: int = 5) -> list:
     return [(conversation_label(c), c.key) for c in convs[:limit]]
 
 
+# --------------------------------------------------------------------------
+# The RECEIVING half's instrument (mg-8961)
+#
+# Everything above this point instruments what bridget SENDS. Until this ticket
+# nothing instrumented what it receives: `grep -n "print(" bridget` restricted
+# to on_message / handle_command / reply_in_conversation /
+# handle_channel_message returned zero, so a message from Daniel that arrived,
+# was handled, was refused, or was ignored all wrote the same nothing. Two of
+# his DMs died on 2026-08-19 inside the mg-3f08 resolver wedge and only a
+# read-only Discord REST sweep could prove it.
+#
+# The facts live in bridget_core.inbound; this is the adapter that turns them
+# into lines, the way format_relay_beat renders a RelayBeat.
+# --------------------------------------------------------------------------
+
+def format_inbound_receipt(surface: str, message_id, chars: int,
+                           swept: bool = False) -> str:
+    """The line written the moment an inbound message is accepted for routing.
+
+    Emitted BEFORE the routing decision, so it exists even when routing does
+    not return — a `recv` with no matching `done` is a handler that raised,
+    blocked on a hung `mg`, or was killed mid-flight, which is the failure class
+    this ticket is about. `swept=True` marks a message the catch-up sweep
+    recovered rather than one the gateway delivered.
+    """
+    origin = ' via=catchup' if swept else ''
+    return (f'{INBOUND_TOKEN} recv id={message_id} surface={surface} '
+            f'chars={chars}{origin}')
+
+
+def format_inbound_disposition(surface: str, message_id, route: str,
+                               outcome: str, detail: str = '') -> str:
+    """The line written once routing has finished — what we did about it."""
+    tail = f' — {detail}' if detail else ''
+    return (f'{INBOUND_TOKEN} done id={message_id} surface={surface} '
+            f'route={route} outcome={outcome}{tail}')
+
+
+def inbound_status_line() -> str:
+    """One line for `on_ready`, saying whether the receiving half is recorded.
+
+    Stated at startup for the same reason `relay_status_line` is: a reader who
+    greps `inbound:` and gets zero must be able to tell "nothing arrived" from
+    "someone set BRIDGET_INBOUND_RECEIPTS=0", and the file has to say which.
+    """
+    if not INBOUND_RECEIPTS:
+        return ('OFF (BRIDGET_INBOUND_RECEIPTS=0) — an inbound message that is '
+                'handled and one that is dropped both write nothing')
+    return (f'on — one `{INBOUND_TOKEN} recv` + `{INBOUND_TOKEN} done` pair '
+            f'per message from the configured user')
+
+
+def log_inbound(line: str) -> None:
+    """Emit an inbound receipt line, unless receipts are switched off."""
+    if INBOUND_RECEIPTS:
+        print(line, flush=True)
+
+
+def format_gateway(event) -> str:
+    """Render a `GatewayEvent`.
+
+    The load-bearing distinction is not up/down, it is RESUME versus IDENTIFY.
+    A RESUME replays what the socket missed; a fresh IDENTIFY starts a new
+    session and Discord replays nothing across it, which is exactly how Daniel's
+    two 08-19 messages died. The line says so rather than leaving it as folklore.
+    """
+    if event.kind == 'connected':
+        if event.down_for:
+            return (f'{GATEWAY_TOKEN} socket connected after '
+                    f'{humanize_gap(event.down_for)} down')
+        return f'{GATEWAY_TOKEN} socket connected'
+    if event.kind == 'disconnected':
+        return (f'{GATEWAY_TOKEN} socket DISCONNECTED after '
+                f'{humanize_gap(event.up_for)} connected — inbound is dead '
+                f'until it comes back')
+    if event.kind == 'resumed':
+        return (f'{GATEWAY_TOKEN} session RESUMED after '
+                f'{humanize_gap(event.down_for)} down — Discord replays events '
+                f'buffered during the gap, so nothing was missed')
+    if event.kind == 'identified':
+        head = (f'{GATEWAY_TOKEN} session IDENTIFY #{event.identifies} after '
+                f'{humanize_gap(event.down_for)} down')
+        if not event.lossy:
+            return f'{head} — first session of this run'
+        return (f'{head} — a FRESH session: Discord replays nothing across it, '
+                f'so anything sent during the gap was never delivered')
+    return f'{GATEWAY_TOKEN} {event.kind}'
+
+
+def format_identify_notice(event) -> str:
+    """What to say immediately after a lossy re-IDENTIFY, sweep on or off.
+
+    The ticket's fallback ask, made unconditional: with catch-up off bridget must
+    still admit it may be incomplete rather than "printing `logged in as` and
+    appearing whole".
+    """
+    if not event.lossy:
+        return ''
+    if INBOUND_CATCHUP:
+        return (f'{CATCHUP_TOKEN} re-IDENTIFY after '
+                f'{humanize_gap(event.down_for)} down; sweeping by REST for '
+                f'messages the gateway never delivered')
+    return (f'{CATCHUP_TOKEN} re-IDENTIFY after {humanize_gap(event.down_for)} '
+            f'down and catch-up is OFF (BRIDGET_INBOUND_CATCHUP=0) — messages '
+            f'sent during the gap were NOT delivered and will NOT be recovered')
+
+
+def format_catchup(result, plan) -> str:
+    """Render one surface's sweep. Always emitted — including the boring case.
+
+    A sweep that finds nothing must still write a line. Its absence is what made
+    the 08-19 loss undetectable: "the catch-up found nothing" and "the catch-up
+    never ran" have to look different in the file.
+    """
+    head = f'{CATCHUP_TOKEN} {result.surface}'
+    if result.error:
+        return f'{head} UNREADABLE: {result.error}'
+    if result.bootstrap:
+        at = f' at id={result.head}' if result.head else ''
+        return (f'{head} first sight — adopted the current head{at}, '
+                f'replayed nothing')
+    bits = [f'fetched={result.fetched}', f'replayed={result.replayed}']
+    if result.skipped_other_author:
+        bits.append(f'skipped-not-yours={result.skipped_other_author}')
+    if result.skipped_too_old:
+        bits.append(f'skipped-too-old={result.skipped_too_old}')
+    line = f'{head} {" ".join(bits)}'
+    if plan is not None and plan.floor_reason:
+        line += f' ({plan.floor_reason})'
+    if result.capped and plan is not None:
+        # The no-silent-caps rule: a bounded sweep that says nothing about its
+        # own bound reads as complete coverage, which is the defect wearing a
+        # fix's clothes.
+        line += (f' — CAPPED at limit={plan.limit}, anything older was NOT '
+                 f'replayed; raise BRIDGET_INBOUND_CATCHUP_LIMIT to widen it')
+    return line
+
+
+def format_catchup_summary(results: list) -> str:
+    """One closing line over every surface, so a reader who greps only this
+    token gets the verdict without adding the rows up."""
+    replayed = sum(r.replayed for r in results)
+    errors = [r.surface for r in results if r.error]
+    boots = sum(1 for r in results if r.bootstrap)
+    bits = [f'{len(results)} surface(s)', f'{replayed} message(s) recovered']
+    if boots:
+        bits.append(f'{boots} bootstrapped')
+    if errors:
+        bits.append(f'UNREADABLE: {", ".join(errors)}')
+    return f'{CATCHUP_TOKEN} sweep done — {"; ".join(bits)}'
+
+
+def catchup_status_line() -> str:
+    """One line for `on_ready`, in the shape of `relay_status_line`.
+
+    Names the residual gap out loud. A reader must not have to infer from
+    silence that conversation threads are outside the sweep — that inference is
+    the same class of mistake this whole ticket is about.
+    """
+    if not INBOUND_CATCHUP:
+        return ('OFF (BRIDGET_INBOUND_CATCHUP=0) — messages sent while the '
+                'gateway is down are lost with no record')
+    bits = [f'limit={INBOUND_CATCHUP_LIMIT}/surface',
+            f'max_age={INBOUND_CATCHUP_MAX_AGE}s',
+            f'state {INBOUND_SEEN_FILE.name}']
+    if INBOUND_SEEN.load_error:
+        bits.append(f'state unreadable ({INBOUND_SEEN.load_error}) — '
+                    f'bootstrapping')
+    return (f'on — DM + log channel + inbound-mapped channels, '
+            f'{", ".join(bits)}; conversation THREADS are not swept, so a '
+            f'thread reply typed while the gateway is down is still lost')
+
+
+#: Surface keys the catch-up sweep resumes from, and therefore the only ones
+#: worth persisting. Threads and unmapped channels get a receipt but no row: a
+#: row per thread would grow the state file without bound, and every key in the
+#: file would no longer mean the same thing.
+SWEPT_SURFACE_PREFIXES = ('dm:', 'channel:')
+
+
+def inbound_surface(channel) -> str:
+    """The surface key for the channel a message arrived on.
+
+    One vocabulary for the receipt, the state file and the sweep: a `surface=`
+    in a log line is the same string a reader can grep for in
+    `bridget.inbound-seen.json`.
+    """
+    if isinstance(channel, discord.DMChannel):
+        return dm_surface(USER_ID)
+    if isinstance(channel, discord.Thread):
+        return f'thread:{channel.id}'
+    if CHANNELS_BY_SNOWFLAKE.get(channel.id) is not None:
+        return channel_surface(channel.id)
+    if THREADS_ENABLED and channel.id == LOG_CHANNEL_ID:
+        return channel_surface(channel.id)
+    return f'unmapped:{channel.id}'
+
+
+def mark_inbound_seen(surface: str, message_id) -> None:
+    """Record `message_id` as routed, if `surface` is one the sweep resumes.
+
+    Called AFTER routing, deliberately. A crash between handling a message and
+    marking it therefore replays it on the next sweep rather than dropping it:
+    a duplicate mail is visible to its recipient and can be ignored, a lost one
+    is invisible to everyone, and this ticket exists because of the second.
+    """
+    if not INBOUND_CATCHUP:
+        return
+    if not surface.startswith(SWEPT_SURFACE_PREFIXES):
+        return
+    INBOUND_SEEN.mark(surface, message_id)
+
+
+async def route_message(message, swept: bool = False) -> None:
+    """Route one inbound message from the configured user, and write it down.
+
+    The single router for BOTH the live gateway path and the catch-up sweep.
+    That is not tidiness: a sweep with its own copy of the routing rules is a
+    second implementation that drifts, and the drift would only ever be visible
+    on the reconnect path — the one nobody watches.
+
+    The caller has already established that the author is the configured user;
+    `on_message` does it so a bot's own traffic never reaches a receipt, and the
+    sweep does it per fetched message.
+    """
+    channel = message.channel
+    surface = inbound_surface(channel)
+    content = message.content or ''
+    log_inbound(format_inbound_receipt(surface, message.id, len(content),
+                                       swept=swept))
+    route = 'unknown'
+    outcome = 'error'
+    detail = ''
+    try:
+        if isinstance(channel, discord.DMChannel):
+            route = 'dm'
+            reply = handle_command(content)
+            outcome = ('unrecognised' if reply == UNRECOGNIZED_REPLY
+                       else 'replied')
+        elif isinstance(channel, discord.Thread):
+            # A conversation thread we opened: the message is a reply to that
+            # conversation. Threads we don't own (the human's own, or another
+            # bot's) are ignored, same as unmapped channels.
+            conv = CONVERSATIONS.by_thread(channel.id)
+            if conv is None:
+                # Ignored exactly as before, but no longer in silence.
+                route = 'thread-foreign'
+                outcome = 'ignored'
+                return
+            SETTINGS.reload_if_changed()
+            # A thread command (mute / help / an unambiguous workflow verb)
+            # still answers with text. A plain reply, though, is acknowledged by
+            # reacting on the human's own message — not by a "✅ delivered…" post
+            # that clutters the very thread he's reading (mg-aefb). 👀 goes on
+            # first, so he sees "seen" the instant he hits enter; then the mg
+            # send resolves it to ✅, or to ❌ plus the reason (a bare ❌ would be
+            # a worse silence).
+            cmd = thread_command_reply(content, conv)
+            if cmd is None:
+                route = 'thread-reply'
+                await _add_reaction(message, ACK_EMOJI_RECEIVED)
+                ack = reply_in_conversation(content, conv)
+                await ack_reaction(message, ack)
+                outcome = 'ack-ok' if ack.ok else 'ack-failed'
+                if not ack.ok:
+                    detail = ack.kind
+                    await post_text(message.channel, render_ack(ack))
+                return
+            route = 'thread-command'
+            reply = cmd
+            outcome = 'replied'
+        elif THREADS_ENABLED and channel.id == LOG_CHANNEL_ID:
+            # Free-form text in the log channel itself, outside any thread. We
+            # cannot know which conversation it answers — say so, and show what
+            # it might have meant, rather than silently doing nothing.
+            route = 'log-channel'
+            reply = handle_command(content)
+            if reply == UNRECOGNIZED_REPLY:
+                reply = render_ack(acks.ambiguous(recent_conversations()))
+                outcome = 'ambiguous'
+            else:
+                outcome = 'replied'
+        else:
+            # Guild text channel: only respond if it's mapped for inbound
+            # routing.
+            channel_entry = CHANNELS_BY_SNOWFLAKE.get(channel.id)
+            if channel_entry is None:
+                # Still ignored — bridget must not chat in arbitrary guild
+                # channels just because the bot is in the server — but the
+                # receipt now says WHICH channel refused to route, so "I typed
+                # at it and nothing happened" has an answer.
+                route = 'ignored-unmapped'
+                outcome = 'ignored'
+                detail = f'channel {channel.id} is not in bridget.channels.toml'
+                return
+            route = f"channel:{channel_entry['agent']}"
+            reply = handle_channel_message(content, channel_entry)
+            outcome = 'replied'
+        await post_text(message.channel, reply)
+    except Exception as e:                       # noqa: BLE001
+        # The receipt's whole point is that a message which arrives and dies
+        # leaves a trace. Swallowing the traceback would defeat that, so the
+        # disposition is written and the exception re-raised to discord.py's
+        # handler, which prints it to the stamped stderr.
+        outcome = 'error'
+        detail = f'{type(e).__name__}: {e}'
+        raise
+    finally:
+        if outcome == 'error':
+            # Deliberately NOT marked. Advancing the resume point past a message
+            # whose handling died would drop it from recovery — the defect this
+            # whole change exists to remove, reintroduced by its own bookkeeping.
+            # Retry is bounded for free by the monotonic mark: any LATER message
+            # in the same sweep advances past this one, so a poison message is
+            # retried only while it is still the newest thing on the surface.
+            detail = (f'{detail}; not marked seen — the next catch-up sweep '
+                      f'will retry it' if detail else
+                      'not marked seen — the next catch-up sweep will retry it')
+        else:
+            mark_inbound_seen(surface, message.id)
+        log_inbound(format_inbound_disposition(surface, message.id, route,
+                                               outcome, detail))
+
+
+# --------------------------------------------------------------------------
+# The catch-up sweep — the only part that can recover a message the gateway
+# never delivered.
+# --------------------------------------------------------------------------
+
+#: Serialises the sweep against itself. `on_ready` is dispatched as a task and
+#: fires again on every reconnect, so a reconnect during a slow sweep would run
+#: two concurrently over the same surfaces — each reading a last-seen id the
+#: other has not yet written, and each replaying the same messages. That is the
+#: check-then-act shape of the very loss this recovers from, so the remedy gets
+#: the lock rather than the benefit of the doubt.
+INBOUND_CATCHUP_LOCK = asyncio.Lock()
+
+
+async def _surface_head(channel):
+    """The newest message id on `channel`, or None.
+
+    Used only to bootstrap a surface we have never seen, where the answer means
+    "start here and replay nothing". `last_message_id` is free when Discord has
+    populated it; the single-message history fetch is the fallback.
+    """
+    head = getattr(channel, 'last_message_id', None)
+    try:
+        if head is not None:
+            return int(head)
+    except (TypeError, ValueError):
+        pass
+    try:
+        async for m in channel.history(limit=1):
+            return int(m.id)
+    except (discord.HTTPException, discord.Forbidden, AttributeError):
+        return None
+    return None
+
+
+async def catchup_surface(channel, surface: str):
+    """Sweep one surface. Returns (CatchupResult, CatchupPlan)."""
+    plan = plan_catchup(INBOUND_SEEN, surface,
+                        limit=INBOUND_CATCHUP_LIMIT,
+                        max_age=INBOUND_CATCHUP_MAX_AGE)
+    if plan.bootstrap:
+        head = await _surface_head(channel)
+        if head is not None:
+            INBOUND_SEEN.mark(surface, head)
+        return CatchupResult(surface=surface, bootstrap=True, head=head), plan
+
+    fetched = []
+    try:
+        async for m in channel.history(limit=plan.limit,
+                                       after=discord.Object(id=plan.after),
+                                       oldest_first=True):
+            fetched.append(m)
+    except Exception as e:                       # noqa: BLE001
+        # A 403 here is the mg-8614 Manage-Channels shape, and it is a finding:
+        # a surface bridget cannot read is a surface where loss is undetectable.
+        # Reported per surface rather than aborting the sweep, so one unreadable
+        # channel does not cost the recovery of every other one.
+        return CatchupResult(surface=surface, error=f'{type(e).__name__}: {e}'), plan
+
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    replayed = other = too_old = 0
+    for m in fetched:
+        # The gateway can deliver a message while this sweep is paging, and the
+        # live path marks it. Re-reading the mark per message — rather than
+        # trusting the plan taken before the first fetch — is what stops the two
+        # paths both routing it. Same check-then-act shape as the lock above,
+        # one level down.
+        already = INBOUND_SEEN.last_seen(surface)
+        if already is not None and m.id <= already:
+            continue
+        author = getattr(m, 'author', None)
+        if author is None or getattr(author, 'bot', False) \
+                or getattr(author, 'id', None) != USER_ID:
+            other += 1
+            mark_inbound_seen(surface, m.id)
+            continue
+        if now - SeenStore.snowflake_time(m.id) > INBOUND_CATCHUP_MAX_AGE:
+            too_old += 1
+            mark_inbound_seen(surface, m.id)
+            continue
+        await route_message(m, swept=True)       # marks the id itself
+        replayed += 1
+
+    return CatchupResult(surface=surface,
+                         fetched=len(fetched),
+                         replayed=replayed,
+                         skipped_other_author=other,
+                         skipped_too_old=too_old,
+                         capped=len(fetched) >= plan.limit), plan
+
+
+async def catchup_targets(user) -> list:
+    """(surface, channel) for every surface the sweep reads.
+
+    The human DM, the log channel, and each channel mapped for INBOUND routing.
+    Conversation threads are deliberately absent — see `catchup_status_line`,
+    which says so on every start rather than leaving it to be inferred.
+    """
+    targets = []
+    try:
+        dm = user.dm_channel or await user.create_dm()
+    except Exception as e:                       # noqa: BLE001
+        print(f'{CATCHUP_TOKEN} {dm_surface(USER_ID)} UNREADABLE: '
+              f'{type(e).__name__}: {e}', file=sys.stderr, flush=True)
+        dm = None
+    if dm is not None:
+        targets.append((dm_surface(USER_ID), dm))
+
+    seen_ids = set()
+    if THREADS_ENABLED:
+        seen_ids.add(LOG_CHANNEL_ID)
+        log_channel = client.get_channel(LOG_CHANNEL_ID)
+        if log_channel is not None:
+            targets.append((channel_surface(LOG_CHANNEL_ID), log_channel))
+    for snowflake, entry in CHANNELS_BY_SNOWFLAKE.items():
+        if entry['direction'] not in ('inbound', 'both'):
+            continue
+        if snowflake in seen_ids:
+            continue
+        seen_ids.add(snowflake)
+        channel = client.get_channel(snowflake)
+        if channel is None:
+            # Configured, mapped, and not resolvable by this process — the
+            # channel a message would arrive on that we cannot even ask about.
+            print(f'{CATCHUP_TOKEN} {channel_surface(snowflake)} UNREADABLE: '
+                  f'channel not resolvable from the client cache', flush=True)
+            continue
+        targets.append((channel_surface(snowflake), channel))
+
+    # A channel configured for inbound routing whose snowflake never resolved
+    # (the mg-8614 Manage-Channels shape) is not in CHANNELS_BY_SNOWFLAKE at
+    # all, so it is invisible to the loop above. Leaving it out silently is the
+    # defect being fixed, one level up: a surface where messages could arrive
+    # and no record that it was skipped.
+    for name, entry in sorted(CHANNELS.items()):
+        if entry['direction'] not in ('inbound', 'both'):
+            continue
+        if entry.get('snowflake') is not None:
+            continue
+        print(f'{CATCHUP_TOKEN} {entry.get("channel_name", name)} NOT SWEPT: '
+              f'[channels.{name}] is configured for inbound but has no live '
+              f'channel id — a message typed there while the gateway is down '
+              f'cannot be recovered', flush=True)
+    return targets
+
+
+async def catchup_inbound(user) -> list:
+    """The bounded REST sweep for messages the gateway never delivered.
+
+    Runs on every `on_ready`, including the first. On a first start every
+    surface bootstraps and nothing is replayed; on a reconnect only what arrived
+    while the socket was down is fetched, because the resume point is persisted
+    per message rather than per session.
+    """
+    if not INBOUND_CATCHUP:
+        return []
+    async with INBOUND_CATCHUP_LOCK:
+        results = []
+        for surface, channel in await catchup_targets(user):
+            try:
+                result, plan = await catchup_surface(channel, surface)
+            except Exception as e:               # noqa: BLE001
+                result, plan = CatchupResult(
+                    surface=surface, error=f'{type(e).__name__}: {e}'), None
+            results.append(result)
+            print(format_catchup(result, plan), flush=True)
+        print(format_catchup_summary(results), flush=True)
+        if INBOUND_SEEN.write_error:
+            print(f'{CATCHUP_TOKEN} state file unwritable '
+                  f'({INBOUND_SEEN.write_error}) — the next sweep will replay '
+                  f'from the last id that did persist', file=sys.stderr,
+                  flush=True)
+        return results
+
+
 def handle_channel_message(text: str, channel_entry: dict) -> str:
     """Route an inbound guild-channel message. Workflow verbs (approve/reject/
     revise/idea:/etc.) keep routing through `POGO_WORKFLOW_AGENT` exactly like
@@ -4101,6 +4670,16 @@ def handle_channel_message(text: str, channel_entry: dict) -> str:
 @client.event
 async def on_ready():
     print(f"logged in as {client.user} (id={client.user.id})", flush=True)
+    # `on_ready` is a SESSION event, not a process-start hook: discord.py fires
+    # it again on every re-IDENTIFY. Journalling it here is what turns a bare
+    # `logged in as` appearing mid-run — the only evidence anyone had of the
+    # 08-16..08-19 outage — into a dated transition that says whether messages
+    # could have been lost across it (mg-8961).
+    identify = GATEWAY.identified()
+    print(format_gateway(identify), flush=True)
+    notice = format_identify_notice(identify)
+    if notice:
+        print(notice, flush=True)
     try:
         user = await client.fetch_user(USER_ID)
     except discord.NotFound:
@@ -4123,6 +4702,16 @@ async def on_ready():
     print(f"delivery record: {relay_status_line()}", flush=True)
     print(f"delivery wedge watch: {wedge_status_line()}", flush=True)
     print(f"approval scan: {approvals_status_line()}", flush=True)
+    # The receiving half's two lines (mg-8961). Loaded here rather than at
+    # import time so the state file is not read by every test that imports this
+    # module; re-loading on each reconnect also picks up a hand-edit.
+    INBOUND_SEEN.load()
+    if INBOUND_SEEN.load_error:
+        print(f"{INBOUND_SEEN_FILE.name} parse error: {INBOUND_SEEN.load_error}"
+              f" — every surface will bootstrap from its current head",
+              file=sys.stderr, flush=True)
+    print(f"inbound record: {inbound_status_line()}", flush=True)
+    print(f"inbound catch-up: {catchup_status_line()}", flush=True)
 
     # Auto-create + auto-wire any configured channel that has no live snowflake
     # yet (Slice A, mg-2fea). Runs before the watchers so a freshly-created
@@ -4177,58 +4766,32 @@ async def on_ready():
     # A log where it climbs is the mg-dc94 leak, back.
     print(f"watcher set live: {len(WATCHER_TASKS)} task(s)", flush=True)
 
+    # LAST, and after the channels are wired: the sweep reads the same
+    # CHANNELS_BY_SNOWFLAKE the router does, and paging REST must not delay the
+    # watcher set coming up. A failure here is reported and swallowed — a
+    # recovery mechanism that can take the bridge down is worse than the gap it
+    # recovers from (mg-8961).
+    try:
+        await catchup_inbound(user)
+    except Exception as e:                       # noqa: BLE001
+        print(f"{CATCHUP_TOKEN} sweep failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
 
 @client.event
 async def on_message(message: discord.Message):
+    """Every inbound message from the gateway. The routing lives in
+    `route_message`, which the catch-up sweep calls too — see mg-8961."""
+    # Filtered BEFORE the receipt, and that is a choice with a cost. bridget is
+    # a single-human bridge; receipting every bot post in a shared guild would
+    # bury the three lines a day that matter under bridget's own outbound
+    # traffic. The consequence is real: if someone other than the configured
+    # DISCORD_USER_ID types at bridget, the log still says nothing.
     if message.author.bot:
         return
     if message.author.id != USER_ID:
         return
-
-    channel = message.channel
-
-    if isinstance(channel, discord.DMChannel):
-        reply = handle_command(message.content)
-    elif isinstance(channel, discord.Thread):
-        # A conversation thread we opened: the message is a reply to that
-        # conversation. Threads we don't own (the human's own, or another
-        # bot's) are ignored, same as unmapped channels.
-        conv = CONVERSATIONS.by_thread(channel.id)
-        if conv is None:
-            return
-        SETTINGS.reload_if_changed()
-        # A thread command (mute / help / an unambiguous workflow verb) still
-        # answers with text. A plain reply, though, is acknowledged by reacting
-        # on the human's own message — not by a "✅ delivered…" post that
-        # clutters the very thread he's reading (mg-aefb). 👀 goes on first, so
-        # he sees "seen" the instant he hits enter; then the mg send resolves it
-        # to ✅, or to ❌ plus the reason (a bare ❌ would be a worse silence).
-        cmd = thread_command_reply(message.content, conv)
-        if cmd is None:
-            await _add_reaction(message, ACK_EMOJI_RECEIVED)
-            ack = reply_in_conversation(message.content, conv)
-            await ack_reaction(message, ack)
-            if not ack.ok:
-                await post_text(message.channel, render_ack(ack))
-            return
-        reply = cmd
-    elif THREADS_ENABLED and channel.id == LOG_CHANNEL_ID:
-        # Free-form text in the log channel itself, outside any thread. We
-        # cannot know which conversation it answers — say so, and show what it
-        # might have meant, rather than silently doing nothing or guessing.
-        reply = handle_command(message.content)
-        if reply == UNRECOGNIZED_REPLY:
-            reply = render_ack(acks.ambiguous(recent_conversations()))
-    else:
-        # Guild text channel: only respond if it's mapped for inbound routing.
-        # Unmapped channels are ignored silently — bridget shouldn't chat in
-        # arbitrary guild channels just because the bot is in the server.
-        channel_entry = CHANNELS_BY_SNOWFLAKE.get(channel.id)
-        if channel_entry is None:
-            return
-        reply = handle_channel_message(message.content, channel_entry)
-
-    await post_text(message.channel, reply)
+    await route_message(message)
 
 
 async def post_text(channel, text: str) -> None:
@@ -4245,6 +4808,35 @@ async def post_text(channel, text: str) -> None:
         except discord.HTTPException as e:
             print(f"reply send failed: {e}", file=sys.stderr)
             return
+
+
+@client.event
+async def on_connect():
+    """The websocket came up. Not yet a session — IDENTIFY or RESUME follows."""
+    print(format_gateway(GATEWAY.connected()), flush=True)
+
+
+@client.event
+async def on_disconnect():
+    """The websocket went down. From here until it returns, inbound is dead.
+
+    This is the line whose absence made the 08-16..08-19 gap unreadable: with
+    `log_handler=None` suppressing discord.py's own logging, nothing said the
+    gateway had dropped, so "no inbound" was indistinguishable from "nobody
+    typed" — the same ambiguity mg-879c removed on the outbound side.
+    """
+    print(format_gateway(GATEWAY.disconnected()), flush=True)
+
+
+@client.event
+async def on_resumed():
+    """The session RESUMED — the non-lossy reconnect.
+
+    Discord replays the events buffered while the socket was down, so no
+    catch-up is needed and none is run. Saying so is what stops a reader
+    treating every blip as a possible message loss.
+    """
+    print(format_gateway(GATEWAY.resumed()), flush=True)
 
 
 if __name__ == '__main__':

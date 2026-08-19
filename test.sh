@@ -105,6 +105,19 @@ python3 tests/test_relay_record.py
 # exits 75 for the supervisor to respawn, and that the restart budget survives
 # the restarts it counts and fails CLOSED. Stubs discord, mg and pogo.
 python3 tests/test_delivery_escalation.py
+# The RECEIVING half's instrument (mg-8961). The inbound path had ZERO log
+# statements anywhere — on_message, handle_command, reply_in_conversation,
+# handle_channel_message — so a message from Daniel that arrived, was handled,
+# was refused, or was ignored all wrote the same nothing. Two of his DMs died on
+# 2026-08-19 inside the mg-3f08 resolver wedge and only a read-only Discord REST
+# sweep could prove it. Proves every inbound branch now writes a receipt, that a
+# handler which RAISES still leaves one, that RESUME and re-IDENTIFY read
+# differently (Discord replays across the first and not the second), and that a
+# bounded REST catch-up on on_ready recovers the measured loss exactly once,
+# within its bounds, saying when a bound bit. Carries TWO pre-fix controls — the
+# receipts off, reproducing the byte-identical silence, and the sweep off,
+# reproducing the loss. Stubs discord; no live Discord, no live mg.
+python3 tests/test_inbound_record.py
 # The duplicate-watcher fix (mg-dc94): `on_ready` fires on every gateway
 # RECONNECT, and used to spawn a fresh watcher set each time with no teardown —
 # seven sets accumulated and each delivered the same mail, so one mail became

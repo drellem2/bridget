@@ -148,6 +148,17 @@ See [The duplication limit](#the-duplication-limit).
 | `BRIDGET_WEDGE_RESTART_BUDGET` | `3` | Self-heals allowed per `BRIDGET_WEDGE_BUDGET_WINDOW`, counted in `~/.pogo/bridget.selfheal.json` so the count survives the restarts it counts. `0` switches the self-heal off. |
 | `BRIDGET_WEDGE_BUDGET_WINDOW` | `3600` | The window that budget is measured over. |
 
+### Inbound knobs
+
+See [Was it received?](#was-it-received).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `BRIDGET_INBOUND_RECEIPTS` | `1` | Write an `inbound: recv` line as each message from you is accepted and an `inbound: done` line once it is routed. `0` switches the record off, restoring a log in which a handled message and a dropped one are both silent. |
+| `BRIDGET_INBOUND_CATCHUP` | `1` | On every `on_ready`, sweep your DM, the log channel and each inbound-mapped channel by REST for messages the gateway never delivered, resuming from `~/.pogo/bridget.inbound-seen.json`. `0` switches recovery off; bridget then says on each re-IDENTIFY that it may have missed messages. |
+| `BRIDGET_INBOUND_CATCHUP_LIMIT` | `50` | Per-surface ceiling on how many missed messages one sweep replays. A sweep that hits it says so and names this knob. |
+| `BRIDGET_INBOUND_CATCHUP_MAX_AGE` | `86400` | How stale a missed message may be and still be acted on. A `mail` command from last week is not a request any more. |
+
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
 
@@ -1074,6 +1085,112 @@ grep 'delivery-wedge' ~/.pogo/bridget.log
 and retries, so the task-states mtime freezes during exactly the burst you would
 want to detect. `~/.pogo/bridget.seen` is not a heartbeat either — it is only
 rewritten when mail actually arrives.)
+
+### Was it received?
+
+The outbound sections above answer "did bridget deliver it?". This one answers
+the other direction, and until v2 (mg-8961) it had no answer at all: the inbound
+path — `on_message`, `handle_command`, `reply_in_conversation`,
+`handle_channel_message` — contained **zero** log statements. A message you sent
+that arrived, was handled, was refused, or was ignored all wrote the same
+nothing. The only receipt was the 👀/✅/❌ reaction on your own Discord message,
+and that exists solely on the thread path; a DM answered with text and an
+unmapped channel answered with silence.
+
+What that cost, measured on 2026-08-19 by a read-only REST sweep of every guild
+channel and the human DM:
+
+```
+08-15T15:55:06Z  DM  "mail have pm-onethird mail me an update please"  -> landed in mayor/
+08-19T07:37:05Z  DM  "Mail pause one third once the executive ..."     -> NOWHERE
+08-19T07:39:59Z  DM  "Mail pause one third once the executive ..."     -> NOWHERE  (the retry)
+```
+
+Both 08-19 messages arrived while the gateway was down. The process was then
+restarted and re-IDENTIFYed, and **Discord replays nothing across a fresh
+IDENTIFY** — so they were never delivered to the process at all, and no log
+anywhere recorded their absence. Three lines now cover the three ways that
+failed.
+
+**1. A receipt per message.** One pair of lines per message from you:
+
+```bash
+grep 'inbound:' ~/.pogo/bridget.log
+```
+```
+inbound: recv id=1405072... surface=dm:1234 chars=52
+inbound: done id=1405072... surface=dm:1234 route=dm outcome=replied
+```
+
+`recv` is written *before* any routing decision and `done` after it, so a `recv`
+with no matching `done` is a handler that raised, hung, or was killed
+mid-flight. `outcome=` distinguishes `replied`, `unrecognised`, `ack-ok`,
+`ack-failed`, `ambiguous`, `ignored` and `error` — so a typo is now visibly a
+typo rather than silence, and an unmapped channel says which channel refused to
+route.
+
+Only messages from your configured `DISCORD_USER_ID` are receipted. Bots and
+other humans are dropped before the record — otherwise bridget's own outbound
+traffic would bury the handful of lines a day that matter. If someone else types
+at bridget, the log still says nothing.
+
+**2. Gateway transitions.** `client.run(..., log_handler=None)` suppresses
+discord.py's own connect/disconnect logging, which is why nothing said the
+gateway had dropped:
+
+```bash
+grep 'gateway:' ~/.pogo/bridget.log
+```
+```
+gateway: socket DISCONNECTED after 2h11m connected — inbound is dead until it comes back
+gateway: session RESUMED after 45s down — Discord replays events buffered during the gap, so nothing was missed
+gateway: session IDENTIFY #2 after 5m00s down — a FRESH session: Discord replays nothing across it, so anything sent during the gap was never delivered
+```
+
+The distinction that matters is the last two. A **RESUME** is safe: Discord
+replays what the socket missed. A re-**IDENTIFY** is not, and that is the line
+under which messages go missing.
+
+**3. A catch-up sweep, because a log cannot record what never arrived.** On
+every `on_ready`, bridget re-reads your DM, the log channel and each
+inbound-mapped channel over REST from the last message it finished routing, and
+replays anything new through the same router the gateway path uses:
+
+```bash
+grep 'inbound-catchup:' ~/.pogo/bridget.log
+```
+```
+inbound-catchup: dm:1234 fetched=2 replayed=2
+inbound-catchup: channel:5678 fetched=0 replayed=0
+inbound-catchup: sweep done — 2 surface(s); 2 message(s) recovered
+```
+
+Four things worth knowing about it:
+
+- **The resume point is per message, not per session** — `~/.pogo/bridget.inbound-seen.json`,
+  written after each message is routed. Restarting bridget twice does not replay
+  anything twice.
+- **It is at-least-once on purpose.** A crash between handling a message and
+  marking it replays that message rather than dropping it, and a message whose
+  handling raised is never marked at all — the `inbound: done … outcome=error`
+  line says so. A duplicate mail is visible to its recipient; a lost one is
+  invisible to everyone. A message that always raises does not become a poison
+  pill: any later message on the same surface advances the resume point past
+  it.
+- **The first start after upgrading replays nothing.** Each surface adopts its
+  current newest message id and sweeps from there, so the upgrade does not
+  re-run your whole DM history.
+- **Conversation threads are not swept.** A thread reply typed while the gateway
+  is down is still lost. This is a real residual gap; the startup line says so
+  every time rather than leaving you to infer it.
+
+Both instruments announce themselves at startup, so a `grep` returning zero is
+never ambiguous:
+
+```
+inbound record: on — one `inbound: recv` + `inbound: done` pair per message from the configured user
+inbound catch-up: on — DM + log channel + inbound-mapped channels, limit=50/surface, max_age=86400s, state bridget.inbound-seen.json; conversation THREADS are not swept, so a thread reply typed while the gateway is down is still lost
+```
 
 ### Reading the log
 

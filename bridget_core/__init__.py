@@ -29,6 +29,11 @@ Slack, Matrix, or a terminal:
                     the condition it describes, deliver the first occurrence
                     immediately, and re-notify on a decaying backoff instead of
                     once per firing (mg-5521).
+    inbound       — the RECEIVING half's instrument (mg-8961): a receipt for
+                    every message that arrives, the gateway transitions that
+                    say whether we were even connected, and the persisted
+                    last-seen ids a bounded REST catch-up sweep resumes from
+                    after a fresh IDENTIFY, which Discord never replays across.
     relaylog      — when the delivery path should say "I am here", and what:
                     a "relayed N since T" beat that fires even with nothing to
                     report, so the log's silence stops being consistent with
@@ -57,6 +62,20 @@ core module because that is where the data already is.
 
 from .acks import Ack, ambiguous, delivered, undeliverable
 from .conversations import Conversation, ConversationStore
+from .inbound import (
+    CATCHUP_TOKEN,
+    GATEWAY_TOKEN,
+    INBOUND_TOKEN,
+    CatchupPlan,
+    CatchupResult,
+    GatewayEvent,
+    GatewayJournal,
+    SeenStore,
+    channel_surface,
+    dm_surface,
+    humanize as humanize_gap,
+    plan_catchup,
+)
 from .mail import conversation_key, correlation_candidates, parse_mail
 from .mailbox import MaildirWatcher
 from .mgshim import (
@@ -88,12 +107,19 @@ from .wedgewatch import (
 
 __all__ = [
     'Ack',
+    'CATCHUP_TOKEN',
+    'CatchupPlan',
+    'CatchupResult',
     'Conversation',
     'ConversationStore',
     'Decision',
     'DuplicateLimiter',
     'EXIT_SELFHEAL',
     'Escalation',
+    'GATEWAY_TOKEN',
+    'GatewayEvent',
+    'GatewayJournal',
+    'INBOUND_TOKEN',
     'MG_SUBJECT_LIMIT',
     'MaildirWatcher',
     'MgCapabilities',
@@ -101,6 +127,7 @@ __all__ = [
     'RelayLedger',
     'RelayStall',
     'RestartBudget',
+    'SeenStore',
     'SelfHeal',
     'SettingsStore',
     'Verdict',
@@ -108,12 +135,16 @@ __all__ = [
     'alert_key',
     'ambiguous',
     'build_send_args',
+    'channel_surface',
     'claims_ancestry',
     'compose_subject_body',
     'conversation_key',
     'correlation_candidates',
     'delivered',
+    'dm_surface',
+    'humanize_gap',
     'normalize_subject',
+    'plan_catchup',
     'is_unknown_flag_error',
     'parse_mail',
     'parse_sent_message_id',
