@@ -120,16 +120,22 @@ actions; the latter is manual but his.)
 > answers with the ones he has gone longest without touching. It reads no `mg`
 > status and makes no claim that anything is resolved.
 >
-> The guardrail above still holds, and the reason the bound clears it is that
-> the alternative had already failed harder: 966 open threads in one channel
-> stopped the Discord client rendering that channel *at all*, so every pointer
-> in it was gone — not one thread mis-retired, all of them, plus the
-> notifications that pointed into it. Against that, an archived thread that
-> reopens on its next message and never lost a word is the conservative option.
+> The guardrail above still holds. The bound clears it because an archived
+> thread that reopens on its next message and never lost a word is the
+> conservative option against an unbounded population — 966 in one channel,
+> growing without limit.
+>
+> **Corrected (mg-2ab2):** this paragraph used to justify the bound by claiming
+> those 966 threads had stopped the Discord client rendering the channel at all.
+> They had not. The count was 971 and rising when the channel became readable
+> again, having archived nothing; the incident was an arrival burst out of a
+> 71-hour network outage. The bound is justified as hygiene, not as the remedy
+> for that failure. See `docs/thread-render-forensics.md`.
 >
 > §3 is still unshipped and still needs sign-off. What it should now assume is
 > that the *population* is already bounded, so its job is choosing retirement
-> by meaning, not keeping the channel renderable.
+> by meaning — which was always its job; keeping the channel renderable was
+> never the population's to do (mg-2ab2).
 
 
 The most intrusive ask, and the one most able to hide outstanding work. Design

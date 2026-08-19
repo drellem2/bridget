@@ -18,10 +18,14 @@
 bridget opened one Discord thread per conversation and closed none. 966 of them
 accumulated in a single channel — every one with `auto_archive_duration=1440`,
 every one still active, because this fleet touches enough conversations often
-enough that a large population never goes quiet for a whole day. A Discord
-client cannot render a channel carrying that many threads, so the notification
-fired and the channel would not load: Daniel got mail he could not open, and
-"it says no text channels" was the same failure one step earlier.
+enough that a large population never goes quiet for a whole day. An unbounded
+generator pointed at one channel is worth capping on its own merits.
+
+mg-27e0 additionally blamed that population for Daniel's client failing to
+render #log on 2026-08-19. mg-2ab2 refuted it: the count was 971 and RISING when
+the channel became readable again, with nothing archived. The bound is hygiene,
+not the remedy for that incident — see docs/thread-render-forensics.md. These
+tests pin the bound's behaviour and make no claim about the render failure.
 
 The generator is what is fixed here, not the backlog. These tests pin:
 
@@ -459,6 +463,25 @@ class TestTheCountIsStatedAgainstItsBound(unittest.IsolatedAsyncioTestCase):
         line = b.thread_cap_status()
         self.assertIn('UNBOUNDED', line)
         self.assertIn('mg-27e0', line)
+
+    async def test_the_unbounded_warning_does_not_re_assert_the_refuted_cause(self):
+        """The warning may say the population grows without limit. It may NOT
+        say a client cannot render it.
+
+        mg-27e0 shipped "a channel cannot render ~1000 open threads" in this
+        very line. mg-2ab2 measured 971 rendering fine, so the line was stating
+        a refuted claim to every operator who ran with the bound off. Pinned
+        here because a warning string is exactly the kind of prose that gets
+        re-embellished later by someone reaching for urgency, and the number it
+        reached for last time was wrong.
+        """
+        b, channel, user = threaded(cap='0')
+        for n in range(1, 11):
+            await deliver(b, user, n)
+        line = b.thread_cap_status().lower()
+        self.assertNotIn('cannot render', line)
+        self.assertNotIn('will not render', line)
+        self.assertNotIn('unrenderable', line)
 
     async def test_the_settings_command_shows_it_too(self):
         b, channel, user = threaded(cap='4')

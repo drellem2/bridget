@@ -12,6 +12,55 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **Retracted: ~966 open threads were NOT what stopped Daniel's Discord client
+  rendering `#log` (mg-2ab2).** mg-27e0 shipped that causal claim into the
+  CHANGELOG, the README, two source comments, a design doc and the test suite.
+  It is refuted, and the refutation is one API call: the guild held **971**
+  active threads (re-derived for mg-2ab2) — up from the mayor's 966, with **zero**
+  archived — at the moment the channel was readable again. A client that could
+  not render 966 renders 971.
+  The standing population is not the variable.
+
+  What the measurements say instead — offered as the leading explanation, not as
+  a proven cause, because the same adjacency reasoning is what produced the
+  claim being retracted here. bridget was **not** down for the preceding
+  three days, though its stdout log is silent for 71h28m and reads that way:
+  `bridget.err.log` carries **40,449** `ClientConnectorDNSError: Cannot connect
+  to host discord.com:443 ... nodename nor servname provided` lines from
+  2026-08-16T06:41:09Z to 2026-08-19T06:48:43Z. The process was alive, unable to
+  resolve DNS, and queueing. When connectivity returned at ~06:49Z the backlog
+  drained as a **burst**: 122 threads created in the 06:00Z hour, peak **27 in
+  the 06:56Z minute**, against 36 for the whole rest of the day, and
+  `relay: 171 delivered in the last 262762s`. The rate had collapsed to ≤2/min
+  by 07:00Z — before either of the restarts that were credited with the fix.
+
+  **Daniel diagnosed this himself at 09:35:28Z**, twelve minutes before the
+  forensics ticket was filed, in reply to the third request to authorise
+  archiving the backlog: *"The fleet was down for a couple days so probably what
+  happened was the bridge came up and a bunch of automated alerts blew up the
+  server. Another instance of needing better deduplication in the bridge I bet."*
+  Every clause checks out. It was read as a non-answer to the archive question
+  rather than as evidence.
+
+  One of the three symptoms mg-27e0 bundled was never a rendering failure: *"the
+  bot has a grey status icon so it looks not active"* is the presence indicator
+  working correctly, because for those 71 hours the bot genuinely could not
+  reach Discord. It was evidence for the outage, and it was read as evidence for
+  the render theory.
+
+  Corrected in place rather than deleted, because the wrong cause is the useful
+  part of the record: `README.md`, `docs/outstanding-ux.md`, `test.sh`,
+  `tests/test_thread_cap.py`, `bridget_core/conversations.py` and two comments in
+  `bridget`. The startup line's *"the backlog is archived separately"* was checked
+  and is **true** — 958 threads created before the 09:08Z deploy still carry
+  `auto_archive_duration=1440` and the 13 created after carry `60`, so the build
+  never touched the backlog. The bound itself stays: an unbounded
+  thread-per-conversation generator in one channel is a liability regardless. It
+  is hygiene, not the remedy for this incident. Full measurements, including the
+  ~2h45m between the burst decaying and Daniel reporting the channel readable
+  that this evidence does **not** close, are in
+  [`docs/thread-render-forensics.md`](docs/thread-render-forensics.md).
+
 - **bridget's receiving half now has an instrument, and can recover a message
   the gateway never delivered (mg-8961).** Successor to mg-879c, which fixed the
   outbound instruments and left the inbound half with nothing to repair.
@@ -87,8 +136,11 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   reconnect, so two sweeps can overlap over one resume point; removing the lock
   makes that test replay the recovered message twice.
 
-- **The open-thread population in the log channel is now bounded, so bridget
-  cannot fill a channel past the point its client will render (mg-27e0).**
+- **The open-thread population in the log channel is now bounded (mg-27e0).**
+  *Corrected by mg-2ab2 — this entry originally read "so bridget cannot fill a
+  channel past the point its client will render", and claimed the paragraph
+  below. Both are refuted; see the mg-2ab2 entry above. The bound is good
+  hygiene and is unchanged, but it did not fix the incident it was filed for.*
   bridget opened one Discord thread per conversation and closed none. On
   2026-08-19 the guild held **966 active threads, all 966 with the same parent**
   — the conversations root — every one carrying `auto_archive_duration=1440`.
@@ -98,12 +150,13 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
   so three times in one morning — `1120`, `1139`, `1147 conversation(s)
   restored` — and nobody read a rising total as an alarm.
 
-  The consequence was user-visible and looked like something else: notifications
+  ~~The consequence was user-visible and looked like something else: notifications
   fired because mail genuinely arrived, and opening one failed because the parent
   channel would not load. Daniel's "the server is still messed up and I get
   notifications but can't view them", the bot's grey status icon, and "it says no
   text channels" were all this — the client failing to populate a channel it
-  cannot render, not channels being absent or the bot being down.
+  cannot render, not channels being absent or the bot being down.~~ **Struck by
+  mg-2ab2.** The thread population did not cause any of those symptoms.
 
   What changed:
 
@@ -137,9 +190,10 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
     statistic, which is why the old one was read three times and acted on none.
 
   **Not** included, deliberately: archiving the 966 threads already on the
-  server. That is a one-time, reversible cleanup of a recurring cause, it is a
-  visible change to Daniel's server, and it is his call. This ticket fixed the
-  generator; shipping it does not by itself restore his client.
+  server. That is a one-time, reversible cleanup, it is a visible change to
+  Daniel's server, and it is his call. This ticket fixed the generator. It was
+  asked for three times and never authorised — and mg-2ab2 established it was
+  never needed: the channel became readable with the backlog fully intact.
 
 - **A delivery outage now escalates off this transport and restarts the process,
   instead of retrying forever into a log nobody reads (mg-3f08).** On 2026-08-19

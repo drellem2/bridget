@@ -570,9 +570,19 @@ def load_config() -> dict:
 
     # The live-thread bound (mg-27e0). bridget opened one Discord thread per
     # conversation and never closed one: 966 of them accumulated in a single
-    # channel, and a Discord client cannot render a channel carrying that many.
-    # The notification fired, the channel would not load, and the human could
-    # not open his own mail.
+    # channel.
+    #
+    # mg-27e0 recorded that population as the reason Daniel's client would not
+    # render the channel. mg-2ab2 refuted that: the count was 971 and rising
+    # when the channel became readable again, having archived nothing. The
+    # leading explanation is RATE, not population — a 71-hour DNS outage drained
+    # as a burst of 122 threads in one hour, peak 27 in a minute — but that is
+    # not proven. docs/thread-render-forensics.md has the measurements and is
+    # explicit about what they do not reach.
+    #
+    # The bound stays anyway, on its own merits: an unbounded thread-per-
+    # conversation generator in one channel is a liability whatever broke the
+    # client that morning. It is hygiene, not the fix for that incident.
     #
     # This is the CAP on threads bridget will hold open at once. It is enforced
     # at admission — every point where a thread enters the open set, whether by
@@ -1736,8 +1746,9 @@ def thread_cap_status() -> str:
     """
     if not MAX_LIVE_THREADS:
         return (f'{CONVERSATIONS.live_count()} open, UNBOUNDED '
-                f'(BRIDGET_MAX_LIVE_THREADS=0 — this is the mg-27e0 fault '
-                f'condition; a channel cannot render ~1000 open threads)')
+                f'(BRIDGET_MAX_LIVE_THREADS=0 — the mg-27e0 generator with no '
+                f'bound; it grows without limit, and a drained backlog enters '
+                f'as a burst)')
     live = CONVERSATIONS.live_count()
     pct = round(100 * live / MAX_LIVE_THREADS)
     line = f'{live}/{MAX_LIVE_THREADS} open ({pct}% of cap)'

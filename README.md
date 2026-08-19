@@ -289,11 +289,20 @@ anyway. Such a mail simply becomes a conversation of one. Nothing breaks.
 
 A conversation is cheap; an **open thread** is not, because your Discord client
 has to render every one of them in the channel they hang off. bridget used to
-open one per conversation and close none. 966 accumulated in a single channel,
-and past some point in the high hundreds the client stops rendering that channel
-at all: the notification still fires, and opening it fails, because the parent
-channel will not load. A channel list that never populates — "it says no text
-channels" — is the same failure one step earlier.
+open one per conversation and close none: 966 accumulated in a single channel,
+and the population only ever grew.
+
+An earlier version of this section said that past some point in the high
+hundreds a client stops rendering the channel. **That was wrong** — the count
+was 971 and still rising when the channel in question started rendering again,
+with nothing archived. The leading explanation is *rate*, not population: a
+71-hour network outage drained as a burst of 122 new threads in one hour. That
+is not proven either, and
+[`docs/thread-render-forensics.md`](docs/thread-render-forensics.md) says which
+part of it the evidence does not reach.
+
+The bound below is still worth having — an unbounded generator in one channel is
+a liability regardless — but it is hygiene, not a render limit.
 
 So the open population is **bounded**. `BRIDGET_MAX_LIVE_THREADS` (default 50)
 is the cap; past it, bridget archives the **least recently used** open thread to

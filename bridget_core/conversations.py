@@ -40,8 +40,9 @@ truncated JSON file behind.
 The store also records, per conversation, whether its thread is believed *live*
 on the presentation side — see `thread_live`. Conversations are cheap and the
 map holds thousands; live threads are not, because a chat client has to render
-every one of them in the channel they hang off. 966 of them in one Discord
-channel stopped the client rendering that channel at all (mg-27e0). The core
+every one of them in the channel they hang off. 966 of them accumulated in one
+Discord channel (mg-27e0) — a population worth bounding, though mg-2ab2 later
+established it was NOT what stopped the client rendering. The core
 does not archive anything — that is the adapter's call, against its own API —
 but it owns the *bookkeeping* the adapter's bound is enforced against, because a
 bound whose count lives only in memory is re-inflated by the next restart.
