@@ -91,6 +91,11 @@ from bridget_core.mgshim import FLAG_JSON, parse_sent_message_id  # noqa: E402
 from bridget_core.ratelimit import claims_ancestry, isoformat  # noqa: E402
 from bridget_core.relaylog import RelayLedger, isostamp  # noqa: E402
 from bridget_core.settings import DEFAULT_DM_POLICY, DM_POLICIES  # noqa: E402
+from bridget_core.wedgewatch import (  # noqa: E402
+    EXIT_SELFHEAL,
+    RestartBudget,
+    WedgeWatch,
+)
 from bridget_core.statefile import (  # noqa: E402
     STATE_FILE_MODE,
     secure_parent,
@@ -134,6 +139,13 @@ TASK_STATES_FILE = HOME / '.pogo' / 'bridget.task-states.json'
 #: the two id-views never clobber each other (mg-4fc0).
 TASK_STATES_FULL_FILE = HOME / '.pogo' / 'bridget.task-states-full.json'
 IDEA_CLAIMS_FILE = HOME / '.pogo' / 'bridget.idea-claims.json'
+#: Epoch stamps of the delivery self-heals bridget has taken lately (mg-3f08).
+#: The one piece of this fix's state that CANNOT live in the process, because
+#: the process is what the self-heal restarts: an in-memory cap on restarts is
+#: reset by the restart, which is a flap wearing a rate limiter's clothes. Lost
+#: state costs extra restarts, so an unwritable file REFUSES the self-heal
+#: rather than granting an unaccounted one — see bridget_core.wedgewatch.
+WEDGE_BUDGET_FILE = HOME / '.pogo' / 'bridget.selfheal.json'
 AGENT_STATUS_DIR = HOME / '.pogo' / 'agent-status'
 AGENT_STATUS_STALE = datetime.timedelta(minutes=30)
 
@@ -423,6 +435,45 @@ def load_config() -> dict:
     # told apart from a dead relay.
     relay_heartbeat = positive_int('BRIDGET_RELAY_HEARTBEAT', 3600, allow_zero=True)
 
+    # When a delivery outage stops being bridget's problem (mg-3f08). The
+    # resolver wedge this ticket is named for failed 100% of sends for eight
+    # minutes while the host resolved discord.com 5/5, and produced no alert,
+    # no mail, no event and no change in any health surface — the message stuck
+    # in its retry loop was pogod's own "AGENTS ARE FAILING EVERY TURN"
+    # escalation to the human. See bridget_core.wedgewatch for why these are
+    # two knobs and not one.
+    #
+    #   ESCALATE — seconds of unbroken delivery failure before the outage is
+    #   reported OUT OF BAND (a `pogo events` record and a mail to the mayor's
+    #   maildir; never through the transport that is broken). 0 switches it off
+    #   and restores the state this ticket is about: an outage nobody hears.
+    #   A self-heal still forces one, because a silent restart is the same defect.
+    wedge_escalate_after = positive_int('BRIDGET_WEDGE_ESCALATE_AFTER', 120,
+                                        allow_zero=True)
+    #   SELF-HEAL — seconds before bridget exits EXIT_SELFHEAL and lets
+    #   bridget-supervise respawn it. Cheap: the supervisor restarts in 5s and a
+    #   mail is only committed once it has landed, so nothing is lost. 0 off.
+    wedge_selfheal_after = positive_int('BRIDGET_WEDGE_SELFHEAL_AFTER', 300,
+                                        allow_zero=True)
+    #   REPEAT — how often a still-unresolved outage re-escalates, so the 71.6h
+    #   one of mg-879c is not a single mail three days stale.
+    wedge_repeat = positive_int('BRIDGET_WEDGE_REPEAT', 3600)
+    #   BUDGET — restarts allowed per window, counted in a FILE so the count
+    #   survives the restarts it is counting. 0 disables the self-heal entirely.
+    wedge_restart_budget = positive_int('BRIDGET_WEDGE_RESTART_BUDGET', 3,
+                                        allow_zero=True)
+    wedge_budget_window = positive_int('BRIDGET_WEDGE_BUDGET_WINDOW', 3600)
+    if (wedge_escalate_after and wedge_selfheal_after
+            and wedge_selfheal_after < wedge_escalate_after):
+        # Not fatal — wedgewatch forces the escalation out ahead of the restart
+        # either way — but the ordering is load-bearing enough to say out loud,
+        # because the forced one is a single alarm where the operator asked for
+        # a threshold and a repeat.
+        print(f"warning: BRIDGET_WEDGE_SELFHEAL_AFTER ({wedge_selfheal_after}) is "
+              f"below BRIDGET_WEDGE_ESCALATE_AFTER ({wedge_escalate_after}); "
+              f"every outage will escalate once, at the restart.",
+              file=sys.stderr)
+
     quiet_respects_outbound_raw = (lookup('BRIDGET_QUIET_RESPECTS_OUTBOUND') or 'false').strip().lower()
     quiet_respects_outbound = quiet_respects_outbound_raw in ('true', '1', 'yes', 'on')
 
@@ -515,6 +566,11 @@ def load_config() -> dict:
         'dedup_max_window': dedup_max_window,
         'dedup_ttl': dedup_ttl,
         'relay_heartbeat': relay_heartbeat,
+        'wedge_escalate_after': wedge_escalate_after,
+        'wedge_selfheal_after': wedge_selfheal_after,
+        'wedge_repeat': wedge_repeat,
+        'wedge_restart_budget': wedge_restart_budget,
+        'wedge_budget_window': wedge_budget_window,
         'quiet_respects_outbound': quiet_respects_outbound,
         'approval_re': approval_re,
         'restart_cmd': restart_cmd,
@@ -785,6 +841,26 @@ DEDUP = DuplicateLimiter(
 #: gate matters more than the cadence — bridget already owns one heartbeat that
 #: ticked all the way through a 70h delivery wedge.
 RELAY = RelayLedger(interval=CONFIG['relay_heartbeat'])
+
+#: When a delivery outage stops being bridget's problem (mg-3f08). RELAY makes
+#: an outage legible to a reader of bridget.log; this makes it legible to
+#: someone who is not reading it, and then acts. It watches the same cycles the
+#: ledger does, from the same place in the same loop.
+WEDGE = WedgeWatch(
+    escalate_after=CONFIG['wedge_escalate_after'],
+    selfheal_after=CONFIG['wedge_selfheal_after'],
+    repeat_interval=CONFIG['wedge_repeat'],
+    budget=RestartBudget(WEDGE_BUDGET_FILE,
+                         limit=CONFIG['wedge_restart_budget'],
+                         window=CONFIG['wedge_budget_window']),
+)
+
+#: The last exception the delivery path raised, and how many mail were waiting
+#: when it did. Carried into the escalation because "delivery is failing" is not
+#: actionable and `Cannot connect to host discord.com:443 ... [nodename nor
+#: servname provided]` is: it names the resolver, which is what told the mayor
+#: to test the host resolver and find it answering 5/5. Reset by a healthy cycle.
+DELIVERY_LAST_ERROR = ''
 
 
 def _probe_mg_help() -> str:
@@ -1757,6 +1833,227 @@ def log_relay_stall() -> None:
         print(format_relay_stall(stall), flush=True)
 
 
+#: The host bridget's outbound sends resolve. Probed from INSIDE this process
+#: when an outage escalates, because that probe is the discriminator the mayor
+#: reached for by hand on 2026-08-19 and the one fact that separates the two
+#: stories: the host resolved `discord.com` 5/5 from a shell while every send
+#: from this process failed with `[nodename nor servname provided]`. Whichever
+#: way it comes out it belongs in the report, and it is NOT used to gate the
+#: restart — see `wedge_resolver_probe`.
+DELIVERY_PROBE_HOST = 'discord.com'
+
+
+def wedge_resolver_probe(host: str = DELIVERY_PROBE_HOST) -> str:
+    """Can THIS process resolve `host` right now? Returns a short verdict.
+
+    Deliberately evidence and not a gate. It is tempting to make the self-heal
+    conditional on this — "restart only if the OS resolver answers, since then
+    the wedge must be ours" — and it is wrong in both directions:
+
+    * A wedge in this process's own resolver state fails the probe too, and
+      that is precisely the case a fresh process fixes. Gating on success would
+      refuse to restart the failure this ticket is named for if it happens to
+      be process-wide rather than session-local.
+    * A genuine host-wide DNS outage also fails the probe, and there a restart
+      does not help — but what bounds that is the restart BUDGET, which is
+      bounded whatever the cause. A probe cannot tell the two apart; three
+      restarts an hour makes it not matter.
+
+    So it is recorded, never branched on. Run it off the event loop: getaddrinfo
+    blocks, and blocking the loop is how mg-e5b8 wedged delivery for 70 hours.
+    """
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        return f'{host} does NOT resolve from this process ({e})'
+    addrs = sorted({i[4][0] for i in infos})
+    return f'{host} resolves fine from this process ({", ".join(addrs[:3])})'
+
+
+def wedge_waiting_count() -> str:
+    """How many mail are stuck behind the wedge, as a string ('unknown' if the
+    maildir cannot be read). The number is what makes the alarm actionable: 1
+    stuck mail and 164 stuck mail are the same log line and very different
+    mornings."""
+    try:
+        return str(sum(1 for f in MAIL_DIR.iterdir() if f.is_file()))
+    except OSError:
+        return 'unknown'
+
+
+def format_wedge_alarm(esc, action: str) -> str:
+    """The one-line record in the file people grep.
+
+        delivery-wedge: 8 mail undelivered for 302s (61 cycles) since
+        2026-08-19T07:30:00Z — alarm #2 — restarting (self-heal 1/3)
+
+    `delivery-wedge:` is a third grep token, sharing no prefix with `relay:` or
+    `relay-stall:` for the reason spelled out in `format_relay_stall`: a count
+    of deliveries must never be inflated by a count of outages. The stall line
+    still fires on its own hourly cadence beside this; the two say different
+    things — `relay-stall:` is "delivery is down", this is "and somebody has
+    been told".
+    """
+    return (f"delivery-wedge: {wedge_waiting_count()} mail undelivered for "
+            f"{round(esc.stalled_for)}s ({esc.cycles} cycles) since "
+            f"{isostamp(esc.since)} — alarm #{esc.escalations} — {action}")
+
+
+def wedge_report(esc, action: str, probe: str) -> str:
+    """The body of the out-of-band report. Prose, because its reader is a human
+    or the mayor, not a grep."""
+    return (
+        f"bridget has not delivered anything for {round(esc.stalled_for)}s "
+        f"({esc.cycles} consecutive failing poll cycles), since "
+        f"{isostamp(esc.since)}. This is alarm #{esc.escalations} for this "
+        f"outage.\n"
+        f"\n"
+        f"  mail waiting in {MAIL_DIR}: {wedge_waiting_count()}\n"
+        f"  last delivery error: {DELIVERY_LAST_ERROR or '(none recorded)'}\n"
+        f"  resolver probe: {probe}\n"
+        f"  action: {action}\n"
+        f"\n"
+        f"This report did NOT travel over Discord — bridget is the transport "
+        f"that is broken, so it went to the local event log and this maildir "
+        f"instead. On 2026-08-19 an identical eight-minute outage produced no "
+        f"alert of any kind, and the message stuck in its retry loop was "
+        f"pogod's own fleet-health escalation to the human (mg-3f08).\n"
+    )
+
+
+async def escalate_delivery_wedge(esc, action: str) -> None:
+    """Report an outage on surfaces that do not depend on the broken transport.
+
+    Two of them, and the redundancy is the point rather than belt-and-braces:
+    `pogo events` is the fleet's own record and is what a health surface reads,
+    while a mail to the mayor is what an agent reads. Either alone is a
+    single-recipient escalation whose path can break, which is drellem2/pogo#148
+    — the exact defect this outage demonstrated live.
+
+    **If BOTH fail there is a third line, and it is loud.** An escalation path
+    that can fail silently is the defect it was built to remove, one level up;
+    the failure of the report is itself reported, to stdout AND stderr, naming
+    what each surface said. That line is the only thing standing between this
+    fix and a wedge that is now escalated to nowhere in particular.
+
+    Both calls run off the event loop: they are `subprocess.run(..., timeout=30)`
+    and a hung one would starve delivery exactly as mg-e5b8's did.
+    """
+    loop = asyncio.get_running_loop()
+    probe = await loop.run_in_executor(None, wedge_resolver_probe)
+    body = wedge_report(esc, action, probe)
+    subject = (f"bridget delivery wedged: {round(esc.stalled_for)}s, "
+               f"{wedge_waiting_count()} mail undelivered")
+
+    print(format_wedge_alarm(esc, action), flush=True)
+
+    failures = []
+    rc, _, err = await loop.run_in_executor(None, run_pogo, [
+        'events', 'emit',
+        '--type=bridget_delivery_wedged',
+        '--agent=bridget',
+        f'--details={json.dumps({"stalled_for": round(esc.stalled_for), "cycles": esc.cycles, "since": isostamp(esc.since), "alarm": esc.escalations, "waiting": wedge_waiting_count(), "action": action, "probe": probe, "last_error": DELIVERY_LAST_ERROR})}',
+    ])
+    if rc != 0:
+        failures.append(f'pogo events: rc={rc} {err.strip() or "(no stderr)"}')
+
+    recipient = CONFIG['mail_recipient']
+    rc, _, err = await loop.run_in_executor(None, run_mg, build_send_args(
+        recipient, subject, body, sender='bridget'))
+    if rc != 0:
+        failures.append(f'mg mail send {recipient}: rc={rc} '
+                        f'{err.strip() or "(no stderr)"}')
+
+    if len(failures) == 2:
+        line = ("delivery-wedge-unreported: delivery has been down for "
+                f"{round(esc.stalled_for)}s and BOTH out-of-band surfaces "
+                f"refused it — {'; '.join(failures)}. Nothing outside this "
+                "log knows.")
+        print(line, flush=True)
+        print(line, file=sys.stderr, flush=True)
+
+
+def selfheal_delivery_wedge(heal) -> None:
+    """Exit so `bridget-supervise` respawns us. Does not return.
+
+    `os._exit` and not `sys.exit`, and that is not a style choice. This runs
+    inside an asyncio task; `sys.exit` raises SystemExit *in that task*, where
+    discord.py's own task handling decides what happens to it — which is a
+    self-heal that may quietly not heal, the defect class this whole change is
+    about, reintroduced by the remedy. `os._exit` cannot be intercepted, and
+    the cost of skipping interpreter cleanup is nil here: a mail is committed
+    to `bridget.seen` only once it has actually landed, so everything stuck
+    behind the wedge is still in the maildir for the next process to deliver.
+
+    Both streams are flushed by hand first, because `os._exit` does not do it
+    and an exit line that never reached the log would leave the restart looking
+    exactly like the unexplained disappearance it is meant to replace.
+    """
+    print(f"delivery-selfheal: exiting {EXIT_SELFHEAL} after "
+          f"{round(heal.stalled_for)}s of failed delivery "
+          f"({heal.cycles} cycles since {isostamp(heal.since)}); "
+          f"self-heal {heal.spent}/{heal.budget} in the last "
+          f"{WEDGE.budget.window}s. bridget-supervise will respawn.",
+          flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(EXIT_SELFHEAL)
+
+
+def wedge_action_note() -> str:
+    """What the escalation should say bridget is about to do, when it is NOT
+    restarting. A report that says only "delivery is broken" leaves the reader
+    to guess whether anything is being done about it; the two silences that
+    matter here are "the self-heal is switched off" and "the budget is spent",
+    and they call for different actions from whoever reads this."""
+    if not WEDGE.selfheal_enabled:
+        return ('not restarting (self-heal is off: '
+                'BRIDGET_WEDGE_SELFHEAL_AFTER=0 or restart budget 0)')
+    refusal = WEDGE.refusal
+    if refusal:
+        return f'not restarting ({refusal}) — this outage needs a human'
+    return (f'still retrying; will restart after '
+            f'{WEDGE.selfheal_after}s of continuous failure')
+
+
+def wedge_status_line() -> str:
+    """Whether an outage will be escalated, and after how long.
+
+    Startup says it for the same reason `relay_status_line` does: a reader who
+    has never seen a `delivery-wedge:` line cannot tell "there has been no
+    outage" from "escalation is switched off", and this file already made that
+    mistake once at one level down.
+
+    Its scope is the human-DM watcher, the same loop that owns the ledger and
+    raises `relay-stall:`. A send failure inside a per-agent channel watcher
+    does NOT raise a wedge alarm — that path has its own `agent-mail:` record —
+    and a delivery loop that has stopped ITERATING raises nothing here either,
+    because nothing is counting cycles that do not happen. The instrument for
+    that is `bridget.delivery.heartbeat`, whose mtime freezes (mg-e5b8). Stated
+    rather than left to be discovered: "no `delivery-wedge:`" must not be read
+    as "no outage anywhere", which is the same misreading this whole chain of
+    tickets keeps producing, one level in each time.
+    """
+    if not WEDGE.escalation_enabled and not WEDGE.selfheal_enabled:
+        return ("OFF — an outage will be recorded in this log by `relay-stall:` "
+                "and reported to nobody, which is the mg-3f08 state")
+    parts = []
+    if WEDGE.escalation_enabled:
+        parts.append(f"escalate out of band after {WEDGE.escalate_after}s of "
+                     f"continuous failure, repeating every "
+                     f"{WEDGE.repeat_interval}s")
+    else:
+        parts.append("escalation OFF (a self-heal still forces one)")
+    if WEDGE.selfheal_enabled:
+        parts.append(f"self-heal (exit {EXIT_SELFHEAL}) after "
+                     f"{WEDGE.selfheal_after}s, at most "
+                     f"{WEDGE.budget.limit} per {WEDGE.budget.window}s")
+    else:
+        parts.append("self-heal OFF")
+    return '; '.join(parts)
+
+
 async def deliver_mail(user: discord.User, filename: str, mail: dict) -> bool:
     """Route one new mail to the surfaces it belongs on.
 
@@ -1950,8 +2247,20 @@ async def send_startup_dm(user: discord.User, first_run: bool) -> None:
             f"🔔 bridget online.\n\n{summary}\n\n"
             f"Send `help` for a list of commands."
         )
-    except discord.HTTPException as e:
-        print(f"startup DM failed: {e}", file=sys.stderr)
+    except Exception as e:
+        # `except discord.HTTPException` until mg-3f08, and that was too narrow
+        # in exactly the case this greeting is most likely to fail: aiohttp
+        # raises ClientConnectorDNSError — an OSError, not an HTTPException —
+        # when the resolver is wedged, and an uncaught one here propagates out
+        # of `watch_mailbox`, killing the delivery watcher outright.
+        #
+        # It matters more now than it did. The self-heal below RESTARTS bridget
+        # during a delivery outage, so it multiplies the number of startups
+        # that happen while the resolver is broken; without this widening, a
+        # remedy for the wedge would reliably produce a live bridget with no
+        # delivery loop at all — the wedge's own silent-failure shape, created
+        # by the fix for it. A greeting is not worth a watcher.
+        print(f"startup DM failed: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 async def watch_mailbox(user: discord.User):
@@ -1959,7 +2268,7 @@ async def watch_mailbox(user: discord.User):
     reads `new/` and never moves anything out of it — `mg mail read` owns that,
     and the `dismiss`/`read` commands are the only things here that mark mail
     read, because the human asked them to."""
-    global GREETED
+    global GREETED, DELIVERY_LAST_ERROR
     watcher = MaildirWatcher(MAIL_DIR, SEEN_FILE)
     first_run = not watcher.primed
     if first_run:
@@ -1999,13 +2308,20 @@ async def watch_mailbox(user: discord.User):
                             # stays uncommitted for retry — and this cycle did NOT
                             # prove delivery works, so it must not tick the beat.
                             delivery_ok = False
+                            DELIVERY_LAST_ERROR = f'send refused for {filename}'
                     except Exception as e:
                         print(f"deliver failed for {filename}, will retry: {e}",
                               file=sys.stderr)
                         delivery_ok = False
+                        # This is the line the ticket is named for. It goes to
+                        # bridget.err.log, which nobody reads; keeping a copy
+                        # here is what lets the escalation carry the cause
+                        # rather than just the fact (mg-3f08).
+                        DELIVERY_LAST_ERROR = f'{type(e).__name__}: {e}'
         except Exception as e:
             print(f"watch_mailbox loop error: {e}", file=sys.stderr)
             delivery_ok = False
+            DELIVERY_LAST_ERROR = f'loop error — {type(e).__name__}: {e}'
         # Delivery-liveness heartbeat: touched only on a cycle that delivered (or
         # had nothing to deliver) without a send failure. Unlike bridget.heartbeat
         # — which the task-transition loop ticks even while delivery is dead —
@@ -2020,6 +2336,8 @@ async def watch_mailbox(user: discord.User):
             # to stat it; the log line answers it to everyone reading the log,
             # and answers it about the past, which an mtime cannot.
             log_relay_beat()
+            DELIVERY_LAST_ERROR = ''
+            WEDGE.healthy()
         else:
             # The heartbeat file is deliberately NOT touched here — a stale
             # mtime is what a reaper watches for. But the log needs the
@@ -2027,6 +2345,30 @@ async def watch_mailbox(user: discord.User):
             # nothing left a 71.6h outage looking like a quiet weekend
             # (mg-879c). So the wedge writes itself down.
             log_relay_stall()
+            # ...and past a threshold it stops being something bridget writes
+            # down and becomes something bridget reports and acts on (mg-3f08).
+            # All three records key off the same `delivery_ok` this loop already
+            # computed: the mtime a reaper stats, the line a human greps, and
+            # now the alarm that reaches someone who is doing neither.
+            verdict = WEDGE.failing()
+            if verdict.escalate is not None:
+                action = ('restarting now' if verdict.selfheal is not None
+                          else wedge_action_note())
+                try:
+                    await escalate_delivery_wedge(verdict.escalate, action)
+                except Exception as e:
+                    # An escalation that raises must not take the delivery loop
+                    # down with it: the mail behind the wedge still has to be
+                    # retried, and a crash here would convert a recoverable
+                    # outage into a dead watcher. Loud, and not fatal.
+                    print(f"delivery-wedge-unreported: escalation itself "
+                          f"failed: {type(e).__name__}: {e}",
+                          file=sys.stderr, flush=True)
+            if verdict.selfheal is not None:
+                # Ordered after the escalation and not before it: the report is
+                # written by a process that is still running, because an
+                # escalation racing its own exit is a report that may not exist.
+                selfheal_delivery_wedge(verdict.selfheal)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -3546,6 +3888,7 @@ async def on_ready():
     print(f"correlation IDs (mg --in-reply-to): {MG_CAPS.describe()}", flush=True)
     print(f"per-channel routing: {channels_status_line()}", flush=True)
     print(f"delivery record: {relay_status_line()}", flush=True)
+    print(f"delivery wedge watch: {wedge_status_line()}", flush=True)
     print(f"approval scan: {approvals_status_line()}", flush=True)
 
     # Auto-create + auto-wire any configured channel that has no live snowflake

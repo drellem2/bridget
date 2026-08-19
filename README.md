@@ -139,6 +139,11 @@ See [The duplication limit](#the-duplication-limit).
 | `BRIDGET_DEDUP_MAX_WINDOW` | `14400` | Ceiling on that doubling. Must be >= `BRIDGET_DEDUP_WINDOW`. |
 | `BRIDGET_DEDUP_TTL` | `86400` | Quiet time after which a condition counts as new again. Must be >= `BRIDGET_DEDUP_WINDOW`. |
 | `BRIDGET_RELAY_HEARTBEAT` | `3600` | Seconds between `relay: N delivered …` lines in `bridget.log` when idle — the delivery path's positive record. `0` switches it off, restoring a log whose silence means nothing. |
+| `BRIDGET_WEDGE_ESCALATE_AFTER` | `120` | Seconds of unbroken delivery failure before the outage is escalated **out of band** — a `pogo events` record and a mail to the mayor's maildir, never over Discord. `0` switches it off, restoring an outage nobody hears. |
+| `BRIDGET_WEDGE_SELFHEAL_AFTER` | `300` | Seconds before bridget exits `75` and lets `bridget-supervise` respawn it. `0` switches the self-heal off. |
+| `BRIDGET_WEDGE_REPEAT` | `3600` | How often a still-unresolved outage re-escalates. |
+| `BRIDGET_WEDGE_RESTART_BUDGET` | `3` | Self-heals allowed per `BRIDGET_WEDGE_BUDGET_WINDOW`, counted in `~/.pogo/bridget.selfheal.json` so the count survives the restarts it counts. `0` switches the self-heal off. |
+| `BRIDGET_WEDGE_BUDGET_WINDOW` | `3600` | The window that budget is measured over. |
 
 Process environment variables override values in the env file, so a
 launchd/systemd unit can inject overrides without editing the file.
@@ -907,7 +912,10 @@ Read it like this:
   ~70h wedge went unseen.
 - **The exception lines are in the other file.** `bridget.log` is
   `StandardOutPath`; `will retry`/`send failed` go to stderr, so they land in
-  `~/.pogo/bridget.err.log`. In `bridget.log` the *stop* is the signal.
+  `~/.pogo/bridget.err.log`. The *stop* was once documented here as the signal;
+  that was measured false over a 71.6-hour outage whose reader filed it as "a
+  3-day hole nobody has explained", so an unhealthy cycle now writes its own
+  `relay-stall:` line on the same hourly cadence (mg-879c).
 - **`grep -c 'relay:'` returning 0 now means something** — either bridget has
   not started since the upgrade, delivery has never completed a healthy cycle,
   or the record is switched off. The last of those would be a new ambiguity, so
@@ -934,6 +942,72 @@ for another.
 **It takes effect on the next start of the bridget process**, like the log
 stamps below — a bridget that is already up writes no `relay:` lines until it
 restarts, so on a running install the first one dates the upgrade.
+
+#### When an outage stops being bridget's problem
+
+The record above makes an outage legible to someone reading `bridget.log`. On
+2026-08-19 nobody was. Delivery failed 100% for eight minutes — the same aiohttp
+DNS failure on `discord.com:443` that had already happened three times that
+fortnight, most recently for 71.6 hours — while the host resolved `discord.com`
+5/5 from a shell. It produced no alert, no mail, no event and no change in any
+health surface, and `supervise` recorded the eventual exit as `rc=143 after
+639957s (healthy run)`. The message stuck in the retry loop was pogod's own
+`AGENTS ARE FAILING EVERY TURN` escalation, whose only recipient is the human —
+so the fleet-health alarm and the only transport that alarm has failed together.
+He found out by noticing that nothing had reacted (mg-3f08).
+
+So past a threshold bridget stops writing the outage down and starts reporting
+it, on surfaces that do not depend on the transport that is broken:
+
+```bash
+grep 'delivery-wedge' ~/.pogo/bridget.log
+[2026-08-19T07:32:00Z] delivery-wedge: 8 mail undelivered for 120s (24 cycles) \
+  since 2026-08-19T07:30:00Z — alarm #1 — still retrying; will restart after 300s
+[2026-08-19T07:35:00Z] delivery-selfheal: exiting 75 after 300s of failed \
+  delivery (60 cycles since 2026-08-19T07:30:00Z); self-heal 1/3 in the last 3600s
+```
+
+- **Two surfaces, and the redundancy is the point.** `pogo events emit
+  --type=bridget_delivery_wedged` is what a health surface reads; a mail to the
+  mayor is what an agent reads. Either alone is a single-recipient escalation
+  whose path can break, which is the defect this outage demonstrated live
+  (drellem2/pogo#148). **If both refuse, a `delivery-wedge-unreported:` line
+  goes to stdout *and* stderr naming what each said** — an escalation path that
+  can fail silently is the defect it was built to remove, one level up.
+- **The report carries the cause, not just the fact.** The last delivery error
+  verbatim, the number of mail waiting, and an in-process resolver probe of
+  `discord.com`. That probe is the discriminator the mayor reached for by hand:
+  the host resolving fine while this process cannot is what makes it resolver
+  state *inside* bridget. It is recorded and never branched on — see
+  `bridget_core/wedgewatch.py` for why gating a restart on it is wrong in both
+  directions.
+- **Then it restarts itself**, exiting `75` for `bridget-supervise`, which names
+  that code rather than logging it as a crash. Restarting is cheap and it is the
+  only remedy with a measured success rate: all four occurrences ended in one,
+  none ended any other way, the supervisor respawns in 5s, and a mail is
+  committed to `bridget.seen` only once it has actually landed — so nothing
+  behind the wedge is lost.
+- **At most three restarts an hour, counted in a file.** An in-memory cap on
+  restarts is reset by the restart, which is a flap wearing a rate limiter's
+  clothes, so the ledger is `~/.pogo/bridget.selfheal.json`. A genuine network
+  outage therefore costs three respawns and then stops, leaving a live bridget
+  escalating rather than a flapping one. **A restart that cannot be recorded is
+  refused, not taken** — a budget that fails open is not a budget.
+- **A refused restart alarms exactly like a granted one.** The moment bridget
+  decides it will *not* act is the moment worth reporting; without that, the
+  first alarm's "will restart after 300s" would be a promise quietly broken.
+- **No self-heal is ever silent**, whatever the knobs say: a restart forces an
+  escalation out even with `BRIDGET_WEDGE_ESCALATE_AFTER=0`. A process that
+  vanishes and returns with fresh counters leaves the same nothing-happened
+  trace as the wedge itself.
+- **Grep `delivery wedge watch:` at startup** before reading anything into an
+  absence of `delivery-wedge:` lines — the same rule as `delivery record:`, and
+  for the same reason.
+- **It watches the human-DM loop only.** A per-agent channel watcher failing has
+  its own `agent-mail:` record, and a delivery loop that has stopped *iterating*
+  raises nothing here — nothing counts cycles that do not happen. That one is
+  `~/.pogo/bridget.delivery.heartbeat` going stale. So "no `delivery-wedge:`"
+  does not mean "no outage anywhere".
 
 (`~/.pogo/bridget.task-states.json` also advances on a normal poll, but it is
 *not* a reliable heartbeat: on an `mg list` timeout the watcher skips the write

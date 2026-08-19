@@ -621,9 +621,25 @@ while true; do
 
     ran=$((SECONDS - started))
 
+    # bridget_core.wedgewatch.EXIT_SELFHEAL. A delivery outage past the
+    # threshold makes bridget exit on purpose so this loop gives it a fresh
+    # process — the only remedy with a measured success rate against the DNS
+    # wedge of mg-3f08, which recurred four times in fifteen days and was
+    # cleared by a restart every time and by nothing else.
+    #
+    # Naming it here is not decoration. Without this branch the line reads
+    # `bridget exited rc=75 after 312s (too fast)`, which is the same sentence
+    # a bad token produces, and this file's whole job during an incident is to
+    # be the thing a human reads first. The `rc=143 after 639957s (healthy run)`
+    # that supervise logged over the 2026-08-19 outage is exactly that failure
+    # one incident earlier: true, and it told nobody anything.
     if (( ran >= HEALTHY_RUNTIME )); then
         # It held a gateway connection for a while; treat this as a blip.
         backoff="$MIN_BACKOFF"
+    fi
+    if (( rc == 75 )); then
+        log "bridget self-healed a wedged delivery path (rc=$rc) after ${ran}s; restarting in ${backoff}s"
+    elif (( ran >= HEALTHY_RUNTIME )); then
         log "bridget exited rc=$rc after ${ran}s (healthy run); restarting in ${backoff}s"
     else
         log "bridget exited rc=$rc after ${ran}s (too fast); restarting in ${backoff}s"

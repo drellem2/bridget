@@ -84,6 +84,16 @@ python3 tests/test_delivery_liveness.py
 # Carries a pre-fix control that reproduces the byte-identical zero. Greps a real
 # file with real grep; stubs discord.
 python3 tests/test_relay_record.py
+# When a delivery outage stops being bridget's problem (mg-3f08). The 2026-08-19
+# resolver wedge failed 100% of sends for eight minutes while the host resolved
+# discord.com 5/5, and produced no alert, no mail, no event and no change in any
+# health surface — the message stuck in its retry loop was pogod's own
+# "AGENTS ARE FAILING EVERY TURN" escalation to the human. Proves the outage
+# reaches TWO surfaces that are not Discord (the circularity is the whole
+# point), that the escalation's own failure is itself reported, that bridget
+# exits 75 for the supervisor to respawn, and that the restart budget survives
+# the restarts it counts and fails CLOSED. Stubs discord, mg and pogo.
+python3 tests/test_delivery_escalation.py
 # The duplicate-watcher fix (mg-dc94): `on_ready` fires on every gateway
 # RECONNECT, and used to spawn a fresh watcher set each time with no teardown —
 # seven sets accumulated and each delivered the same mail, so one mail became

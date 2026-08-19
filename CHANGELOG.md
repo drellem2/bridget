@@ -12,6 +12,66 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Fixed
 
+- **A delivery outage now escalates off this transport and restarts the process,
+  instead of retrying forever into a log nobody reads (mg-3f08).** On 2026-08-19
+  every send failed for eight minutes with the same line every ~35s:
+
+  ```
+  deliver failed for <msg-id>, will retry: Cannot connect to host
+  discord.com:443 ssl:default [nodename nor servname provided, or not known]
+  ```
+
+  The host resolved `discord.com` 5/5 from a shell throughout, so this was
+  resolver state *inside* the process. mg-879c then dated every failure line
+  across 2026-08-04..19 and found the same aiohttp DNS failure **four times** —
+  51 mail stuck over 08-04..10, 10 over 08-14, 164 over a 71.6-hour outage on
+  08-16..19, and this one. Every occurrence ended in a process restart; none
+  ended any other way.
+
+  The resolver wedge is not the defect this fixes. **Nothing noticed.** Eight
+  minutes of 100% delivery failure produced no alert, no mail to the mayor, no
+  event, and no change in any health surface; `supervise` recorded the eventual
+  exit as `rc=143 after 639957s (healthy run)`. The message stuck in the retry
+  loop was pogod's own `AGENTS ARE FAILING EVERY TURN` escalation, whose only
+  recipient is the human — so the fleet-health alarm and the only transport that
+  alarm has failed together, and he found out by noticing that nothing had
+  reacted. Inbound failed silently in the same window: a work instruction he
+  sent never reached any mailbox and produced no bounce.
+
+  Past `BRIDGET_WEDGE_ESCALATE_AFTER` (default 120s) of unbroken failure the
+  outage is now reported to **two surfaces that are not Discord** — a
+  `pogo events emit --type=bridget_delivery_wedged` record and a mail to the
+  mayor's maildir — carrying the last error verbatim, the number of mail
+  waiting, and an in-process resolver probe. Past
+  `BRIDGET_WEDGE_SELFHEAL_AFTER` (300s) bridget exits `75`, which
+  `bridget-supervise` names rather than logging as a crash, and respawns in 5s.
+  Nothing is lost: a mail is committed to `bridget.seen` only once it has landed.
+
+  The remedy is an artifact of the same kind as the defect, so:
+
+  - **If both out-of-band surfaces refuse, that failure is itself reported** —
+    `delivery-wedge-unreported:` to stdout *and* stderr, naming what each said.
+    An escalation path that can fail silently is the defect one level up.
+  - **The restart budget is a file** (`~/.pogo/bridget.selfheal.json`, 3 per
+    hour). An in-memory cap on restarts is reset by the restart, which is a flap
+    wearing a rate limiter's clothes. A restart that cannot be *recorded* is
+    refused rather than taken — a budget that fails open is not a budget.
+  - **A refused restart alarms exactly like a granted one**, so the first
+    alarm's "will restart after 300s" cannot become a promise quietly broken.
+  - **No self-heal is silent**, even with escalation switched off: a process
+    that vanishes and returns with fresh counters leaves the same
+    nothing-happened trace as the wedge.
+  - **`send_startup_dm` no longer catches only `discord.HTTPException`.**
+    aiohttp's `ClientConnectorDNSError` is an `OSError`, so a greeting sent into
+    a wedged resolver raised out of `watch_mailbox` and killed the delivery
+    watcher outright. The self-heal multiplies startups during exactly that
+    outage, so without this the fix for the wedge would reliably produce a live
+    bridget with no delivery loop.
+
+  Off with `BRIDGET_WEDGE_ESCALATE_AFTER=0` and `BRIDGET_WEDGE_SELFHEAL_AFTER=0`,
+  which restores the behaviour above; the setting is stated at every startup as
+  `delivery wedge watch:` so an absence of `delivery-wedge:` lines is readable.
+
 - **A delivery outage now writes itself down, instead of leaving a hole in
   `bridget.log` (mg-879c).** The `relay:` beat is gated on a delivery-healthy
   cycle — correctly, since a positive printed while sends are failing is the

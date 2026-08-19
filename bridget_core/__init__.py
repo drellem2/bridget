@@ -75,8 +75,16 @@ from .ratelimit import (
     claims_ancestry,
     normalize_subject,
 )
-from .relaylog import RelayBeat, RelayLedger
+from .relaylog import RelayBeat, RelayLedger, RelayStall
 from .settings import SettingsStore
+from .wedgewatch import (
+    EXIT_SELFHEAL,
+    Escalation,
+    RestartBudget,
+    SelfHeal,
+    Verdict,
+    WedgeWatch,
+)
 
 __all__ = [
     'Ack',
@@ -84,12 +92,19 @@ __all__ = [
     'ConversationStore',
     'Decision',
     'DuplicateLimiter',
+    'EXIT_SELFHEAL',
+    'Escalation',
     'MG_SUBJECT_LIMIT',
     'MaildirWatcher',
     'MgCapabilities',
     'RelayBeat',
     'RelayLedger',
+    'RelayStall',
+    'RestartBudget',
+    'SelfHeal',
     'SettingsStore',
+    'Verdict',
+    'WedgeWatch',
     'alert_key',
     'ambiguous',
     'build_send_args',
