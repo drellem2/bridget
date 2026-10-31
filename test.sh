@@ -165,6 +165,14 @@ python3 tests/test_launchd.py
 # as loud rather than silent. Builds real git checkouts; no network, no launchctl.
 python3 tests/test_activation.py
 python3 tests/test_secrets.py
+# bridget-prune (mg-eb78f): the daily prune of the log channel. Drives the real
+# script against a stub Discord on 127.0.0.1 — deletes only old messages in the
+# one configured channel, honours 429 retry_after, dry-run deletes nothing,
+# threads are pruned only when Manage Threads is present (skipped, not failed,
+# otherwise), the self-test positive control, and the token never reaches
+# stdout or the log. No live Discord.
+python3 -m py_compile bridget-prune
+python3 tests/test_prune.py
 # Drives the real script under a venv that provably lacks discord.py, so the
 # re-exec into ~/.pogo/venv-bridget is exercised, not just described.
 python3 tests/test_venv_reexec.py

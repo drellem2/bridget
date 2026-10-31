@@ -800,6 +800,32 @@ modifies the `restart` command must be done manually on the host (since the
 running bridge is still on the old code). After that, `restart` keeps you in
 sync.
 
+## Pruning the log channel
+
+`bridget-prune` deletes messages older than 7 days from the log channel
+(`BRIDGET_LOG_CHANNEL_ID`) and from no other channel — there is no flag to name
+one. It is a standalone stdlib-only script with its own daily LaunchAgent,
+`com.pogo.bridget-prune` (04:41 local), not a bridget command: it shares
+bridget's env file and bot token and nothing else, so it runs whether or not
+bridget is up.
+
+    bash install.sh --prune-launchd        # install the daily job (nothing runs at load)
+    ~/.pogo/bin/bridget-prune --dry-run    # count what would go; delete nothing
+    ~/.pogo/bin/bridget-prune --self-test  # post one marker, delete it, verify 404
+    ~/.pogo/bin/bridget-prune --days 14    # a different retention (live runs need >= 1)
+
+Each run appends counts of listed / deleted / kept messages (and threads) to
+`~/.pogo/bridget-prune.log`. The token is never printed or logged. 429s are
+retried after `retry_after`.
+
+What it can delete follows the bot's permissions in that channel, recomputed
+every run: its own messages always; other authors' messages only with **Manage
+Messages**; old threads only with **Manage Threads** — without it the thread
+pass is logged as skipped and the run still succeeds, and granting the
+permission turns it on at the next run. Deletes are one at a time: bulk delete
+needs Manage Messages and only reaches messages under 14 days old, which none
+of these are.
+
 ## Running as a service
 
 bridget is a long-running Python process. None of the options below need to know

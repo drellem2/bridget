@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Daniel Miller
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Written for this fork of cloverross/bridget; not present upstream.
+#
+# bridget is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. bridget is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with
+# bridget. If not, see <https://www.gnu.org/licenses/>.
+
+"""bridget-prune — delete old messages from bridget's log channel (mg-eb78f).
+
+Usage:
+    bridget-prune [--days N] [--dry-run] [--log FILE] [--env FILE]
+    bridget-prune --self-test [--log FILE] [--env FILE]
+
+Deletes messages older than N days (default 7) from exactly ONE Discord
+channel: BRIDGET_LOG_CHANNEL_ID in ~/.pogo/bridget.env. There is no option to
+name another channel, by design. Before touching anything it checks that the
+channel belongs to DISCORD_SERVER_ID and refuses otherwise.
+
+A standalone utility rather than a bridget subcommand: it shares bridget's
+config file and bot credential, and nothing else. It needs no discord.py and no
+gateway connection (stdlib only, plain REST), so it runs under any python3 and
+does not depend on bridget being up — or restart it.
+
+What it can delete depends on the bot's permissions in that channel, which it
+computes on every run:
+
+  * Its OWN messages — always (Discord lets any author delete its own).
+  * Other authors' messages — only with Manage Messages. Without it they are
+    counted as "kept: not deletable", never an error.
+  * Threads whose last activity is older than the cutoff — only with Manage
+    Threads. Without it the thread pass is skipped and logged as skipped; the
+    run does NOT fail. Grant the permission and the next run picks it up.
+
+Deletion is one DELETE per message. Bulk delete would need Manage Messages and
+only reaches messages under 14 days old, i.e. none of the ones this prunes.
+
+Every run appends a human-readable summary to the log file (default
+~/.pogo/bridget-prune.log): the cutoff, and counts of listed / deleted / kept
+messages and threads. The bot token is read into memory and placed in one HTTP
+header; it is never printed, logged, or put on a command line.
+
+Rate limits: a 429 sleeps for the response's retry_after (or Retry-After
+header) and retries; a bucket that reports X-RateLimit-Remaining: 0 is waited
+out before the next request.
+
+--dry-run lists and counts but issues no DELETE.
+--self-test is the positive control: it posts one marker message, runs the
+same selection the prune uses against it (cutoff = now), deletes it, and
+verifies Discord then answers 404 for it. It touches no other message. If it
+says PASS, this credential CAN delete in this channel.
+
+Exit status: 0 ok; 1 some deletes failed or the self-test failed; 2 config or
+safety refusal (missing env key, channel not in the configured guild, another
+run holds the lock).
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get('HOME', str(Path.home())))
+DEFAULT_ENV = HOME / '.pogo' / 'bridget.env'
+DEFAULT_LOG = HOME / '.pogo' / 'bridget-prune.log'
+API_BASE = 'https://discord.com/api/v10'
+USER_AGENT = 'DiscordBot (https://github.com/drellem2/bridget, bridget-prune)'
+
+DISCORD_EPOCH_MS = 1420070400000
+
+# Permission bits (Discord docs, "Permissions").
+ADMINISTRATOR = 1 << 3
+VIEW_CHANNEL = 1 << 10
+MANAGE_MESSAGES = 1 << 13
+READ_MESSAGE_HISTORY = 1 << 16
+MANAGE_THREADS = 1 << 34
+
+MAX_PAGES = 2000          # 200k messages; a runaway-pagination backstop
+MAX_RETRIES = 8           # per request, across 429s and 5xx/network errors
+
+
+class Refusal(Exception):
+    """A config or safety condition under which the run must not proceed."""
+
+
+# ---------------------------------------------------------------- logging ----
+
+class Log:
+    """Append stamped lines to a file and echo them to stdout."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, msg: str) -> None:
+        stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        lines = [f'[{stamp}] {line}' for line in msg.splitlines() or ['']]
+        text = '\n'.join(lines) + '\n'
+        with open(self.path, 'a', encoding='utf-8') as f:
+            f.write(text)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+# ----------------------------------------------------------------- config ----
+
+def load_env_file(path: Path) -> dict:
+    """Parse `key=value` lines. Never logs a value (the file holds the token)."""
+    out = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        out[k.strip()] = v.strip().strip('"\'')
+    return out
+
+
+def api_base() -> str:
+    """The Discord API root. Overridable only to a loopback URL, for tests:
+    any other override would hand the real bot token to a third party."""
+    override = os.environ.get('BRIDGET_PRUNE_API_BASE')
+    if not override:
+        return API_BASE
+    host = urllib.parse.urlsplit(override).hostname
+    if host not in ('127.0.0.1', 'localhost', '::1'):
+        raise Refusal('BRIDGET_PRUNE_API_BASE may only point at a loopback '
+                      'address (it is a test hook)')
+    return override.rstrip('/')
+
+
+# ------------------------------------------------------------------- http ----
+
+class Discord:
+    def __init__(self, token: str, base: str, log: Log, sleep=time.sleep):
+        self._auth = 'Bot ' + token
+        self.base = base
+        self.log = log
+        self.sleep = sleep
+        self.rate_limited = 0       # 429s absorbed this run
+        self.requests = 0
+
+    def req(self, method: str, path: str, body=None):
+        """Return (status, parsed-json-or-None). Retries 429 and 5xx."""
+        data = json.dumps(body).encode() if body is not None else None
+        attempt = 0
+        while True:
+            attempt += 1
+            self.requests += 1
+            r = urllib.request.Request(
+                self.base + path, method=method, data=data,
+                headers={'Authorization': self._auth,
+                         'User-Agent': USER_AGENT,
+                         'Content-Type': 'application/json'})
+            try:
+                with urllib.request.urlopen(r, timeout=30) as resp:
+                    raw = resp.read()
+                    self._respect_bucket(resp.headers)
+                    return resp.status, (json.loads(raw) if raw else None)
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    payload = json.loads(raw) if raw else None
+                except ValueError:
+                    payload = None
+                if e.code == 429 and attempt <= MAX_RETRIES:
+                    wait = _retry_after(payload, e.headers)
+                    self.rate_limited += 1
+                    self.log(f'rate limited on {method} {_route(path)}; '
+                             f'retry_after={wait:.2f}s')
+                    self.sleep(wait + 0.1)
+                    continue
+                if 500 <= e.code < 600 and attempt <= MAX_RETRIES:
+                    self.sleep(min(2 ** attempt, 30))
+                    continue
+                return e.code, payload
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt <= MAX_RETRIES:
+                    self.sleep(min(2 ** attempt, 30))
+                    continue
+                # str(e) of a URLError carries no headers, so no token.
+                raise RuntimeError(f'{method} {_route(path)}: {e}') from None
+
+    def _respect_bucket(self, headers):
+        if headers.get('X-RateLimit-Remaining') == '0':
+            try:
+                wait = float(headers.get('X-RateLimit-Reset-After', '0'))
+            except ValueError:
+                wait = 0.0
+            if wait > 0:
+                self.sleep(min(wait, 60))
+
+
+def _retry_after(payload, headers) -> float:
+    for v in ((payload or {}).get('retry_after') if isinstance(payload, dict) else None,
+              headers.get('Retry-After') if headers else None):
+        try:
+            if v is not None:
+                return max(0.0, min(float(v), 300.0))
+        except (TypeError, ValueError):
+            pass
+    return 1.0
+
+
+def _route(path: str) -> str:
+    """The path without its query string, for log lines."""
+    return path.split('?', 1)[0]
+
+
+# ------------------------------------------------------------ permissions ----
+
+def compute_permissions(guild: dict, roles: list, member: dict,
+                        channel: dict, user_id: str) -> int:
+    """Discord's documented algorithm: base from roles, then channel
+    overwrites (@everyone, then role overwrites combined, then member)."""
+    if str(guild.get('owner_id')) == str(user_id):
+        return ~0
+    gid = str(guild['id'])
+    by_id = {str(r['id']): int(r['permissions']) for r in roles}
+    member_roles = [str(r) for r in member.get('roles', [])]
+    perms = by_id.get(gid, 0)
+    for r in member_roles:
+        perms |= by_id.get(r, 0)
+    if perms & ADMINISTRATOR:
+        return ~0
+    ow = {str(o['id']): o for o in channel.get('permission_overwrites') or []}
+    if gid in ow:
+        perms &= ~int(ow[gid]['deny'])
+        perms |= int(ow[gid]['allow'])
+    allow = deny = 0
+    for r in member_roles:
+        if r in ow:
+            allow |= int(ow[r]['allow'])
+            deny |= int(ow[r]['deny'])
+    perms = (perms & ~deny) | allow
+    if str(user_id) in ow:
+        perms &= ~int(ow[str(user_id)]['deny'])
+        perms |= int(ow[str(user_id)]['allow'])
+    return perms
+
+
+# -------------------------------------------------------------- selection ----
+
+def snowflake_time(sid) -> dt.datetime:
+    ms = (int(sid) >> 22) + DISCORD_EPOCH_MS
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+
+
+def message_time(m: dict) -> dt.datetime:
+    ts = m.get('timestamp')
+    if ts:
+        return dt.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    return snowflake_time(m['id'])
+
+
+def select_messages(msgs, cutoff, bot_id, can_manage):
+    """Split into (delete, kept_recent, kept_not_deletable)."""
+    delete, recent, foreign = [], [], []
+    for m in msgs:
+        if message_time(m) >= cutoff:
+            recent.append(m)
+        elif str(m.get('author', {}).get('id')) == str(bot_id) or can_manage:
+            delete.append(m)
+        else:
+            foreign.append(m)
+    return delete, recent, foreign
+
+
+def thread_last_activity(t: dict) -> dt.datetime:
+    last = snowflake_time(t['id'])
+    if t.get('last_message_id'):
+        last = max(last, snowflake_time(t['last_message_id']))
+    meta = t.get('thread_metadata') or {}
+    if meta.get('archive_timestamp'):
+        last = max(last, dt.datetime.fromisoformat(
+            meta['archive_timestamp'].replace('Z', '+00:00')))
+    return last
+
+
+# -------------------------------------------------------------------- run ----
+
+def list_messages(api: Discord, channel_id: str) -> list:
+    out, before = [], None
+    for _ in range(MAX_PAGES):
+        q = '?limit=100' + (f'&before={before}' if before else '')
+        s, page = api.req('GET', f'/channels/{channel_id}/messages{q}')
+        if s != 200:
+            raise RuntimeError(f'listing messages failed: HTTP {s}')
+        if not page:
+            return out
+        out.extend(page)
+        before = page[-1]['id']
+    raise RuntimeError(f'listing stopped at the {MAX_PAGES}-page backstop')
+
+
+def list_threads(api: Discord, guild_id: str, channel_id: str) -> list:
+    threads = {}
+    s, active = api.req('GET', f'/guilds/{guild_id}/threads/active')
+    if s == 200:
+        for t in active.get('threads', []):
+            if str(t.get('parent_id')) == str(channel_id):
+                threads[t['id']] = t
+    for kind in ('public', 'private'):
+        before = None
+        for _ in range(MAX_PAGES):
+            q = '?limit=100' + (f'&before={urllib.parse.quote(before)}' if before else '')
+            s, page = api.req('GET', f'/channels/{channel_id}/threads/archived/{kind}{q}')
+            if s != 200 or not page:
+                break
+            for t in page.get('threads', []):
+                threads[t['id']] = t
+            if not page.get('has_more') or not page.get('threads'):
+                break
+            before = page['threads'][-1]['thread_metadata']['archive_timestamp']
+    return list(threads.values())
+
+
+def preflight(api: Discord, env: dict):
+    """Resolve and check the one channel. Returns (channel, me, perms)."""
+    for k in ('DISCORD_BOT_TOKEN', 'BRIDGET_LOG_CHANNEL_ID', 'DISCORD_SERVER_ID'):
+        if not env.get(k):
+            raise Refusal(f'{k} is not set in the env file')
+    channel_id = env['BRIDGET_LOG_CHANNEL_ID']
+    guild_id = env['DISCORD_SERVER_ID']
+    s, me = api.req('GET', '/users/@me')
+    if s != 200:
+        raise Refusal(f'GET /users/@me failed: HTTP {s} (bad token?)')
+    s, channel = api.req('GET', f'/channels/{channel_id}')
+    if s != 200:
+        raise Refusal(f'channel {channel_id} not readable: HTTP {s}')
+    if str(channel.get('guild_id')) != str(guild_id):
+        raise Refusal(f'channel {channel_id} is not in guild {guild_id} '
+                      f'(it is in {channel.get("guild_id")}); refusing')
+    perms = 0
+    try:
+        sg, guild = api.req('GET', f'/guilds/{guild_id}')
+        sr, roles = api.req('GET', f'/guilds/{guild_id}/roles')
+        sm, member = api.req('GET', f'/guilds/{guild_id}/members/{me["id"]}')
+        if 200 == sg == sr == sm:
+            perms = compute_permissions(guild, roles, member, channel, me['id'])
+        else:
+            api.log(f'permissions: could not read (HTTP {sg}/{sr}/{sm}); '
+                    'assuming own-messages-only')
+    except RuntimeError as e:
+        api.log(f'permissions: could not read ({e}); assuming own-messages-only')
+    return channel, me, perms
+
+
+def prune(api: Discord, env: dict, days: float, dry_run: bool) -> int:
+    log = api.log
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(days=days)
+    channel, me, perms = preflight(api, env)
+    channel_id, guild_id = str(channel['id']), str(channel['guild_id'])
+    can_msgs = bool(perms & MANAGE_MESSAGES)
+    can_threads = bool(perms & MANAGE_THREADS)
+    mode = 'DRY RUN' if dry_run else 'live'
+    log(f'run start ({mode}): channel #{channel.get("name")} {channel_id} '
+        f'guild {guild_id}; keep {days:g} days, cutoff '
+        f'{cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")}; '
+        f'manage_messages={"yes" if can_msgs else "no"} '
+        f'manage_threads={"yes" if can_threads else "no"}')
+
+    t0 = time.monotonic()
+    msgs = list_messages(api, channel_id)
+    delete, recent, foreign = select_messages(msgs, cutoff, me['id'], can_msgs)
+    deleted = gone = failed = 0
+    fail_codes = {}
+    if not dry_run:
+        for m in delete:
+            s, _ = api.req('DELETE', f'/channels/{channel_id}/messages/{m["id"]}')
+            if s == 204:
+                deleted += 1
+            elif s == 404:
+                gone += 1
+            else:
+                failed += 1
+                fail_codes[s] = fail_codes.get(s, 0) + 1
+    verb = 'would delete' if dry_run else 'deleted'
+    n_del = len(delete) if dry_run else deleted
+    oldest = min((message_time(m) for m in msgs), default=None)
+    log(f'messages: listed {len(msgs)}; {verb} {n_del}; kept {len(recent) + len(foreign) + failed} '
+        f'(newer than cutoff {len(recent)}, not deletable {len(foreign)}, '
+        f'failed {failed}{" " + json.dumps(fail_codes) if fail_codes else ""}); '
+        f'already gone {gone}; oldest listed '
+        f'{oldest.strftime("%Y-%m-%dT%H:%M:%SZ") if oldest else "-"}')
+
+    t_failed = 0
+    if not can_threads:
+        log('threads: skipped (bot lacks Manage Threads in this channel; '
+            'grant it and the next run prunes threads too)')
+    else:
+        threads = list_threads(api, guild_id, channel_id)
+        old = [t for t in threads if thread_last_activity(t) < cutoff]
+        t_deleted = 0
+        if not dry_run:
+            for t in old:
+                s, _ = api.req('DELETE', f'/channels/{t["id"]}')
+                if s in (200, 204, 404):
+                    t_deleted += 1
+                else:
+                    t_failed += 1
+        log(f'threads: listed {len(threads)}; {verb} '
+            f'{len(old) if dry_run else t_deleted}; kept '
+            f'{len(threads) - len(old) + t_failed} (failed {t_failed})')
+
+    log(f'run end ({mode}): {time.monotonic() - t0:.1f}s, {api.requests} requests, '
+        f'{api.rate_limited} rate-limited')
+    return 1 if (failed or t_failed) else 0
+
+
+def self_test(api: Discord, env: dict) -> int:
+    """Positive control: post a marker, prune exactly it, prove it is gone."""
+    log = api.log
+    channel, me, _ = preflight(api, env)
+    channel_id = str(channel['id'])
+    marker = (f'bridget-prune self-test {dt.datetime.now(dt.timezone.utc).isoformat()} '
+              '(posted and deleted automatically)')
+    s, msg = api.req('POST', f'/channels/{channel_id}/messages', {'content': marker})
+    if s != 200:
+        log(f'self-test: FAIL could not post marker: HTTP {s}')
+        return 1
+    mid = msg['id']
+    try:
+        time.sleep(1)
+        s, fresh = api.req('GET', f'/channels/{channel_id}/messages/{mid}')
+        if s != 200:
+            log(f'self-test: FAIL marker {mid} not readable back: HTTP {s}')
+            return 1
+        cutoff = dt.datetime.now(dt.timezone.utc)
+        delete, recent, foreign = select_messages([fresh], cutoff, me['id'], False)
+        if [m['id'] for m in delete] != [mid]:
+            log(f'self-test: FAIL selection did not pick marker {mid} '
+                f'(recent={len(recent)} foreign={len(foreign)})')
+            return 1
+        s, _ = api.req('DELETE', f'/channels/{channel_id}/messages/{mid}')
+        if s != 204:
+            log(f'self-test: FAIL DELETE marker {mid}: HTTP {s}')
+            return 1
+        s, _ = api.req('GET', f'/channels/{channel_id}/messages/{mid}')
+        if s != 404:
+            log(f'self-test: FAIL marker {mid} still readable after delete: HTTP {s}')
+            return 1
+        mid = None
+        log(f'self-test: PASS posted marker {msg["id"]} to #{channel.get("name")}, '
+            'selected it, deleted it (204), verified 404')
+        return 0
+    finally:
+        if mid is not None:  # best effort: never leave the marker behind
+            api.req('DELETE', f'/channels/{channel_id}/messages/{mid}')
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog='bridget-prune',
+        description='Delete messages older than N days from bridget\'s log '
+                    'channel (BRIDGET_LOG_CHANNEL_ID) and nowhere else.')
+    ap.add_argument('--days', type=float, default=7.0,
+                    help='keep messages newer than this many days (default 7)')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='list and count, delete nothing')
+    ap.add_argument('--self-test', action='store_true',
+                    help='positive control: post one marker message, prune it, '
+                         'verify it is gone; touches nothing else')
+    ap.add_argument('--log', type=Path, default=DEFAULT_LOG,
+                    help=f'append the run summary here (default {DEFAULT_LOG})')
+    ap.add_argument('--env', type=Path, default=DEFAULT_ENV,
+                    help=f'bridget env file (default {DEFAULT_ENV})')
+    args = ap.parse_args(argv)
+
+    log = Log(args.log)
+    lock_path = args.log.with_suffix('.lock')
+    lock = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log('refused: another bridget-prune run holds the lock')
+        return 2
+    try:
+        if args.days < 0 or (args.days < 1 and not args.dry_run
+                             and not args.self_test):
+            raise Refusal('--days must be >= 1 for a live run '
+                          '(any value >= 0 is allowed with --dry-run)')
+        if not args.env.exists():
+            raise Refusal(f'env file not found: {args.env}')
+        env = load_env_file(args.env)
+        if not env.get('DISCORD_BOT_TOKEN'):
+            raise Refusal('DISCORD_BOT_TOKEN is not set in the env file')
+        api = Discord(env['DISCORD_BOT_TOKEN'], api_base(), log)
+        if args.self_test:
+            return self_test(api, env)
+        return prune(api, env, args.days, args.dry_run)
+    except Refusal as e:
+        log(f'refused: {e}')
+        return 2
+    except RuntimeError as e:
+        log(f'error: {e}')
+        return 1
+    finally:
+        lock.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -379,6 +379,18 @@ opt-in: with no new keys set, bridget behaves exactly as v1.x did.
 
 ### Added
 
+- **`bridget-prune`: a daily prune of the log channel (mg-eb78f).** Daniel,
+  after the one-off cleanup of 1842 messages (mg-34438): "this is worth doing
+  automatically". A standalone script plus its own LaunchAgent
+  (`com.pogo.bridget-prune`, daily 04:41, `install.sh --prune-launchd`) rather
+  than a bridget subcommand. It deletes messages older than 7 days from
+  `BRIDGET_LOG_CHANNEL_ID` only, after checking that channel is in
+  `DISCORD_SERVER_ID`. It logs deleted/kept counts to `~/.pogo/bridget-prune.log`,
+  honours 429 `retry_after`, and has `--dry-run` plus a `--self-test` positive
+  control (post a marker, prune it, verify 404). Thread pruning turns on by
+  itself once the bot holds Manage Threads, and is skipped, not failed, until
+  then.
+
 - **A rate limit on thread CREATION, and coalescing for a drained backlog
   (mg-7dda).** mg-27e0 bounded how many threads bridget holds **open**. Nothing
   bounded how fast it opens them, and mg-2ab2 established that the rate — not

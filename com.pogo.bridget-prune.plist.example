@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.pogo.bridget-prune: daily prune of bridget's log channel (mg-eb78f).
+
+  Runs bridget-prune once a day. It deletes messages older than 7 days from
+  BRIDGET_LOG_CHANNEL_ID and nowhere else, and appends a summary of what it
+  deleted and kept to __HOME__/.pogo/bridget-prune.log. See bridget-prune's
+  header for what it can and cannot delete.
+
+  `install.sh` with the `prune-launchd` flag renders this (substituting
+  __HOME__), installs it to ~/Library/LaunchAgents/ and bootstraps it. By hand:
+  replace __HOME__ throughout, copy it there, then
+
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pogo.bridget-prune.plist
+
+  A job of its own, not part of bridget: it is a separate unix utility with
+  its own schedule, so it does not depend on bridget being up, and a prune
+  never restarts or blocks the relay.
+
+  To change the retention, add `<string>-days</string><string>N</string>`
+  style arguments to ProgramArguments below (the real flag is the double-dash
+  form; XML forbids a double hyphen inside this comment).
+
+  StartCalendarInterval coalesces fires missed during sleep into one on wake,
+  which is the right replay for a prune. No RunAtLoad: loading the job should
+  not delete anything; run `bridget-prune` with the dry-run flag first.
+
+  No secrets in this file (LaunchAgents is world-readable): the token is read
+  from __HOME__/.pogo/bridget.env (mode 600) by the script itself.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pogo.bridget-prune</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>__HOME__/.pogo/bin/bridget-prune</string>
+        <string>--days</string>
+        <string>7</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- Daily at 04:41 local, when the channel is quietest. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>41</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- The human-readable record is bridget-prune.log, written by the
+         script. These catch anything it could not log itself (a traceback). -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.pogo/bridget-prune.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.pogo/bridget-prune.stdout.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>

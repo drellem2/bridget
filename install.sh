@@ -33,13 +33,15 @@ set -euo pipefail
 SETUP=0
 NO_VENV=0
 LAUNCHD=0
+PRUNE_LAUNCHD=0
 for arg in "$@"; do
     case "$arg" in
         --setup) SETUP=1 ;;
         --no-venv) NO_VENV=1 ;;
         --launchd) LAUNCHD=1 ;;
+        --prune-launchd) PRUNE_LAUNCHD=1 ;;
         -h|--help)
-            printf 'usage: install.sh [--setup] [--no-venv] [--launchd]\n\n'
+            printf 'usage: install.sh [--setup] [--no-venv] [--launchd] [--prune-launchd]\n\n'
             printf '  --setup     prompt for Discord credentials (token entry is masked)\n'
             printf '  --no-venv   skip venv creation and dependency install. Everything\n'
             printf '              else still runs. This is the only step that needs the\n'
@@ -48,6 +50,10 @@ for arg in "$@"; do
             printf '  --launchd   (macOS) install, bootstrap and kickstart the\n'
             printf '              com.pogo.bridget LaunchAgent so bridget runs at login\n'
             printf '              and restarts when it crashes.\n'
+            printf '  --prune-launchd  (macOS) install and bootstrap the\n'
+            printf '              com.pogo.bridget-prune LaunchAgent: a daily run of\n'
+            printf '              bridget-prune, deleting log-channel messages older\n'
+            printf '              than 7 days. Nothing runs at load.\n'
             exit 0 ;;
         *) printf 'install.sh: unknown argument %s\n' "$arg" >&2; exit 2 ;;
     esac
@@ -58,10 +64,15 @@ VENV_DIR="$HOME/.pogo/venv-bridget"
 BIN_DIR="$HOME/.pogo/bin"
 BIN_LINK="$BIN_DIR/bridget"
 SUPERVISE_LINK="$BIN_DIR/bridget-supervise"
+PRUNE_LINK="$BIN_DIR/bridget-prune"
 ENV_FILE="$HOME/.pogo/bridget.env"
 ENV_EXAMPLE="$REPO_DIR/bridget.env.example"
 SCRIPT="$REPO_DIR/bridget"
 SUPERVISE_SCRIPT="$REPO_DIR/bridget-supervise"
+PRUNE_SCRIPT="$REPO_DIR/bridget-prune"
+PRUNE_LABEL="com.pogo.bridget-prune"
+PRUNE_PLIST_EXAMPLE="$REPO_DIR/$PRUNE_LABEL.plist.example"
+PRUNE_PLIST_DEST="$HOME/Library/LaunchAgents/$PRUNE_LABEL.plist"
 PLIST_LABEL="com.pogo.bridget"
 PLIST_EXAMPLE="$REPO_DIR/$PLIST_LABEL.plist.example"
 PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
@@ -129,6 +140,7 @@ link_bin() {
 mkdir -p "$BIN_DIR"
 link_bin "$SCRIPT" "$BIN_LINK"
 link_bin "$SUPERVISE_SCRIPT" "$SUPERVISE_LINK"
+[[ -f "$PRUNE_SCRIPT" ]] && link_bin "$PRUNE_SCRIPT" "$PRUNE_LINK"
 
 # 3. seed env file (never overwrite a populated one)
 if [[ ! -e "$ENV_FILE" ]]; then
@@ -282,6 +294,24 @@ if (( LAUNCHD )); then
         warn "inspect with: launchctl print gui/$(id -u)/$PLIST_LABEL"
         warn "logs: $HOME/.pogo/bridget.log and $HOME/.pogo/bridget.err.log"
     fi
+fi
+
+# 6. the daily log-channel prune (opt-in, macOS only; mg-eb78f)
+#
+# Bootstrapped but NOT kickstarted: a kickstart would run a live prune at
+# install time. The first prune is the next 04:41; dry-run it by hand first.
+if (( PRUNE_LAUNCHD )); then
+    [[ "$(uname -s)" == "Darwin" ]] || die "--prune-launchd is macOS-only (this is $(uname -s))"
+    [[ -f "$PRUNE_PLIST_EXAMPLE" ]] || die "missing plist template at $PRUNE_PLIST_EXAMPLE"
+    log "rendering $PRUNE_PLIST_EXAMPLE → $PRUNE_PLIST_DEST"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed "s|__HOME__|$HOME|g" "$PRUNE_PLIST_EXAMPLE" > "$PRUNE_PLIST_DEST"
+    plutil -lint "$PRUNE_PLIST_DEST" >/dev/null || die "rendered plist is malformed: $PRUNE_PLIST_DEST"
+    launchctl bootout "gui/$(id -u)/$PRUNE_LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PRUNE_PLIST_DEST" \
+        || die "launchctl bootstrap failed for $PRUNE_PLIST_DEST"
+    log "$PRUNE_LABEL loaded; runs daily at 04:41. Try it first with:"
+    log "    $PRUNE_LINK --dry-run"
 fi
 
 cat <<EOF
